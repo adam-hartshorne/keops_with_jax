@@ -13,9 +13,21 @@ class LinkCompile:
     """
 
     def __init__(self):
+        # --- JAX MULTI-GPU PATCH START ---
+        # If the JAX-specific flag is set, we force the CMake backend.
+        # This prevents the GIL serialization and Context crashes inherent to NVRTC.
+        self.jax_mode = os.environ.get("PYKEOPS_JAX_MODE") == "1"
+        if self.jax_mode:
+            config.use_nvrtc = False
+            KeOps_Message("JAX mode enabled: forcing CMake backend for multi-GPU support")
+        # --- JAX MULTI-GPU PATCH END ---
+
         # N.B. Here self is assumed to be populated by the __init__ of one of the MapReduce classes
 
-        # we create the hash string id corresponding to all parameters, e.g. 7b9a611f7e
+        # Recalculate flags in case config.use_nvrtc changed above
+        current_cpp_flags = config.get_cpp_flags()
+
+        # we create the hash string id corresponding to all parameters
         self.gencode_filename = get_hash_name(
             type(self),
             self.red_formula,
@@ -31,24 +43,28 @@ class LinkCompile:
             self.use_half,
             self.use_fast_math,
             self.device_id,
-            cpp_flags,
+            current_cpp_flags, # Use updated flags
         )
 
-        # info_file is the name of the file that will contain some meta-information required by the bindings, e.g. 7b9a611f7e.nfo
+        # --- JAX MULTI-GPU PATCH START ---
+        # Append suffix to ensure we don't accidentally load a PyTorch NVRTC cache file
+        if self.jax_mode:
+            self.gencode_filename += "_jax"
+        # --- JAX MULTI-GPU PATCH END ---
+
+        # info_file is the name of the file that will contain some meta-information
         self.info_file = os.path.join(
             get_build_folder(), self.gencode_filename + ".nfo"
         )
 
-        # gencode_file is the name of the source file to be created and then compiled, e.g. 7b9a611f7e.cpp or 7b9a611f7e.cu
+        # gencode_file is the name of the source file to be created
         self.gencode_file = os.path.join(
             get_build_folder(),
             self.gencode_filename + "." + self.source_code_extension,
         )
 
     def save_info(self):
-        # create info_file to save some parameters : dim (dimension of output vectors),
-        #                                            tagI (O or 1, reduction over i or j indices),
-        #                                            dimy (sum of dimensions of j-indexed vectors)
+        # create info_file to save some parameters
         f = open(self.info_file, "w")
         f.write(
             f"red_formula={self.red_formula_string}\ndim={self.dim}\ntagI={self.tagI}\ndimy={self.dimy}"
@@ -82,7 +98,7 @@ class LinkCompile:
         self.dimy = eval(tmp_dimy[1])
 
     def write_code(self):
-        # write the generated code in the source file ; this is used as a subfunction of compile_code
+        # write the generated code in the source file
         f = open(self.gencode_file, "w")
         f.write(self.code)
         f.close()
@@ -91,9 +107,7 @@ class LinkCompile:
         pass
 
     def get_dll_and_params(self):
-        # main method of the class : it generates - if needed - the code and returns the name of the dll to be run for
-        # performing the reduction, e.g. 7b9a611f7e.so, or in the case of JIT compilation, the name of the main KeOps dll,
-        # and the name of the assembly code file.
+        # main method of the class : it generates - if needed - the code
         if not os.path.exists(self.file_to_check):
             KeOps_Message(
                 "Generating code for " + self.red_formula.__str__() + " ... ",

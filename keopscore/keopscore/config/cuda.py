@@ -212,7 +212,7 @@ class CUDAConfig:
         """Set the default build folder name."""
         uname = platform.uname()
         self.default_build_folder_name = (
-            "_".join(uname[:3]) + f"_p{sys.version.split(' ')[0]}"
+                "_".join(uname[:3]) + f"_p{sys.version.split(' ')[0]}"
         )
 
     def set_build_folder(self):
@@ -291,7 +291,7 @@ class CUDAConfig:
             if path:
                 include_path = Path(path) / "include"
                 if (include_path / "cuda.h").is_file() and (
-                    include_path / "nvrtc.h"
+                        include_path / "nvrtc.h"
                 ).is_file():
                     self.cuda_include_path = str(include_path)
                     return self.cuda_include_path
@@ -301,7 +301,7 @@ class CUDAConfig:
         if conda_prefix:
             include_path = Path(conda_prefix) / "include"
             if (include_path / "cuda.h").is_file() and (
-                include_path / "nvrtc.h"
+                    include_path / "nvrtc.h"
             ).is_file():
                 self.cuda_include_path = str(include_path)
                 return self.cuda_include_path
@@ -319,7 +319,7 @@ class CUDAConfig:
         for base_path in possible_paths:
             include_path = base_path / "include"
             if (include_path / "cuda.h").is_file() and (
-                include_path / "nvrtc.h"
+                    include_path / "nvrtc.h"
             ).is_file():
                 self.cuda_include_path = str(include_path)
                 return self.cuda_include_path
@@ -353,8 +353,8 @@ class CUDAConfig:
 
         # Set the NVRTC flags
         self.nvrtc_flags = (
-            compile_options
-            + f" -fpermissive -L{libcuda_folder} -L{libnvrtc_folder} -lcuda -lnvrtc"
+                compile_options
+                + f" -fpermissive -L{libcuda_folder} -L{libnvrtc_folder} -lcuda -lnvrtc"
         )
 
     def get_nvrtc_flags(self):
@@ -419,6 +419,45 @@ class CUDAConfig:
             self.gpu_compile_flags = ""
             return (self.n_gpus, self.gpu_compile_flags)
 
+        # Get GPU compute capability for -arch flag
+        arch_flags = []
+        for d in range(self.n_gpus):
+            device = ctypes.c_int()
+            result = libcuda.cuDeviceGet(ctypes.byref(device), d)
+            if result == self.CUDA_SUCCESS:
+                major = ctypes.c_int()
+                minor = ctypes.c_int()
+                # Get compute capability
+                # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
+                # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
+                result_major = libcuda.cuDeviceGetAttribute(
+                    byref(major), 75, device
+                )
+                result_minor = libcuda.cuDeviceGetAttribute(
+                    byref(minor), 76, device
+                )
+                if result_major == self.CUDA_SUCCESS and result_minor == self.CUDA_SUCCESS:
+                    arch = f"sm_{major.value}{minor.value}"
+                    if arch not in arch_flags:
+                        arch_flags.append(arch)
+                        print(f"[KeOps] Detected GPU {d}: compute capability {major.value}.{minor.value} (arch={arch})")
+
+        # Check environment variable override
+        env_arch = os.environ.get("CUDA_ARCH")
+        if env_arch:
+            arch_flags = [f"sm_{env_arch}"]
+            print(f"[KeOps] Using CUDA_ARCH from environment: {env_arch}")
+
+        # Add architecture flag(s) - CRITICAL FIX!
+        arch_compile_flag = ""
+        if arch_flags:
+            if len(arch_flags) == 1:
+                arch_compile_flag = f"-arch={arch_flags[0]} "
+            else:
+                # Multiple architectures - use gencode for each
+                arch_compile_flag = " ".join([f"-gencode arch=compute_{a[3:]},code={a} " for a in arch_flags])
+            print(f"[KeOps] GPU architecture flags: {arch_compile_flag.strip()}")
+
         # Query each GPU for properties
         MaxThreadsPerBlock = [0] * self.n_gpus
         SharedMemPerBlock = [0] * self.n_gpus
@@ -442,12 +481,12 @@ class CUDAConfig:
 
             output = ctypes.c_int()
             if not safe_call(
-                d,
-                libcuda.cuDeviceGetAttribute(
-                    byref(output),
-                    self.CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-                    device,
-                ),
+                    d,
+                    libcuda.cuDeviceGetAttribute(
+                        byref(output),
+                        self.CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                        device,
+                    ),
             ):
                 self.n_gpus = 0
                 self.gpu_compile_flags = ""
@@ -456,12 +495,12 @@ class CUDAConfig:
             MaxThreadsPerBlock[d] = output.value
 
             if not safe_call(
-                d,
-                libcuda.cuDeviceGetAttribute(
-                    byref(output),
-                    self.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-                    device,
-                ),
+                    d,
+                    libcuda.cuDeviceGetAttribute(
+                        byref(output),
+                        self.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+                        device,
+                    ),
             ):
                 self.n_gpus = 0
                 self.gpu_compile_flags = ""
@@ -470,7 +509,12 @@ class CUDAConfig:
             SharedMemPerBlock[d] = output.value
 
         # Build compile flags string
+        # NOTE: Don't include arch_compile_flag here - it's only for nvcc, not g++
+        # The arch flag will be added separately in Gpu_link_compile.py
         self.gpu_compile_flags = f"-DMAXIDGPU={self.n_gpus - 1} "
+
+        # Store arch flags separately for nvcc-only compilation
+        self.gpu_arch_flags = arch_compile_flag.strip() if arch_compile_flag else ""
         for d in range(self.n_gpus):
             self.gpu_compile_flags += (
                 f"-DMAXTHREADSPERBLOCK{d}={MaxThreadsPerBlock[d]} "
@@ -478,6 +522,10 @@ class CUDAConfig:
             self.gpu_compile_flags += f"-DSHAREDMEMPERBLOCK{d}={SharedMemPerBlock[d]} "
 
         return self.n_gpus, self.gpu_compile_flags
+
+    def get_gpu_arch_flags(self):
+        """Get GPU architecture flags (for nvcc only, not g++)."""
+        return getattr(self, 'gpu_arch_flags', '')
 
     def print_all(self):
         """

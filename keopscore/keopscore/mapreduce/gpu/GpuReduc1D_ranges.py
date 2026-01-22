@@ -1,4 +1,11 @@
-from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
+import os
+
+if os.environ.get("PYKEOPS_JAX_MODE") == "1":
+    from keopscore.binders.cpp.Gpu_link_compile import Gpu_link_compile
+else:
+    from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
+
+# from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
 from keopscore.mapreduce.gpu.GpuAssignZero import GpuAssignZero
 from keopscore.mapreduce.MapReduce import MapReduce
 from keopscore.utils.code_gen_utils import (
@@ -70,6 +77,8 @@ class GpuReduc1D_ranges(MapReduce, Gpu_link_compile):
 
         if dtype == "half2":
             self.headers += c_include("cuda_fp16.h")
+
+        print('GpuConv1DOnDevice_Ranges')
 
         self.code = f"""
                         {self.headers}

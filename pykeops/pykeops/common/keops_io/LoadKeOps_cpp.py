@@ -17,6 +17,10 @@ class LoadKeOps_cpp_class(LoadKeOps):
         super().__init__(*args, fast_init=fast_init)
 
     def init_phase1(self):
+        # In JAX mode, skip Python wrapper compilation - we use the kernel directly via FFI
+        if os.environ.get("PYKEOPS_JAX_MODE") == "1":
+            return  # Skip init_phase1 for JAX
+
         srcname = pykeops_cpp_name(tag=self.params.tag, extension=".cpp")
 
         dllname = pykeops_cpp_name(
@@ -37,6 +41,13 @@ class LoadKeOps_cpp_class(LoadKeOps):
             pyKeOps_Message("OK", use_tag=False, flush=True)
 
     def init_phase2(self):
+        # In JAX mode, skip Python wrapper loading
+        if os.environ.get("PYKEOPS_JAX_MODE") == "1":
+            # Store the .so path for JAX FFI to use
+            # The actual kernel .so file is at source_name.replace('.cpp', '.so')
+            self.kernel_so_path = self.params.source_name.replace('.cpp', '.so')
+            return  # Skip init_phase2 for JAX
+
         import importlib
 
         mylib = importlib.import_module(
@@ -117,8 +128,8 @@ int launch_pykeops_{self.params.tag}_cpu(signed long int dimY, signed long int n
     std::vector< signed long int > dimsy_v(py_dimsy.size());
     for (auto i = 0; i < py_dimsy.size(); i++)
         dimsy_v[i] = py::cast< signed long int >(py_dimsy[i]);
-        
-    
+
+
     std::vector< signed long int > dimsp_v(py_dimsp.size());
     for (auto i = 0; i < py_dimsp.size(); i++)
         dimsp_v[i] = py::cast< signed long int >(py_dimsp[i]);
@@ -129,19 +140,19 @@ int launch_pykeops_{self.params.tag}_cpu(signed long int dimY, signed long int n
     for (signed long int i = 0; i < py_ranges.size(); i++)
         ranges_v[i] = (signed long int*) py::cast< signed long int >(py_ranges[i]);
     signed long int **ranges = (signed long int**) ranges_v.data();
-    
+
     std::vector< signed long int > shapeout_v(py_shapeout.size());
     for (auto i = 0; i < py_shapeout.size(); i++)
         shapeout_v[i] = py::cast< signed long int >(py_shapeout[i]);
-    
+
     TYPE *out = (TYPE*) out_void;
     // std::cout << "out_ptr : " << (long) out << std::endl;
-    
+
     std::vector< TYPE* > arg_v(py_arg.size());
     for (int i = 0; i < py_arg.size(); i++)
         arg_v[i] = (TYPE*) py::cast< long >(py_arg[i]);
     TYPE **arg = (TYPE**) arg_v.data();
-    
+
     std::vector< std::vector< signed long int > > argshape_v(py_argshape.size());
     for (auto i = 0; i < py_argshape.size(); i++){{
         py::tuple tmp = py_argshape[i];

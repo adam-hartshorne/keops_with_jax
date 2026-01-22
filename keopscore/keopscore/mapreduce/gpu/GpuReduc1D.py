@@ -1,4 +1,11 @@
-from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
+import os
+
+# JAX multi-GPU patch: use CMake backend instead of NVRTC
+if os.environ.get("PYKEOPS_JAX_MODE") == "1":
+    from keopscore.binders.cpp.Gpu_link_compile import Gpu_link_compile
+else:
+    from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
+
 from keopscore.mapreduce.gpu.GpuAssignZero import GpuAssignZero
 from keopscore.mapreduce.MapReduce import MapReduce
 from keopscore.utils.code_gen_utils import (
@@ -40,12 +47,14 @@ class GpuReduc1D(MapReduce, Gpu_link_compile):
         table = varloader.table(self.xi, yjrel, self.param_loc)
         jreltile = c_variable("signed long int", "(jrel + tile * blockDim.x)")
 
+        print('GpuConv1DOnDevice')
+
         self.code = f"""
-                          
+
                         {self.headers}
-                        
+
                         extern "C" __global__ void GpuConv1DOnDevice(signed long int nx, signed long int ny, {dtype} *out, {dtype} **{arg.id}) {{
-    
+
                           // get the index of the current thread
                           signed long int i = blockIdx.x * blockDim.x + threadIdx.x;
 

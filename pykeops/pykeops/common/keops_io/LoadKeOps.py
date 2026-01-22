@@ -27,6 +27,9 @@ class LoadKeOps:
             from pykeops.numpy.utils import numpytools
 
             self.tools = numpytools
+        elif self.params.lang == "jax":
+            from pykeops.jax.utils import jaxtools
+            self.tools = jaxtools
 
         self.init_phase2()
 

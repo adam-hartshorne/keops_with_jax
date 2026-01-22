@@ -4,7 +4,6 @@ from collections import OrderedDict
 import pykeops
 import pykeops.config
 
-
 ############################################################
 #     define backend
 ############################################################
@@ -89,61 +88,41 @@ class SetBackend:
 
     @staticmethod
     def _find_mem(variables):
-        # Check for NumPy arrays first
-        if all([type(var) is np.ndarray for var in variables]):
-            return 0  # CPU
-
-        # Check for JAX arrays (before torch, so JAX takes priority)
-        try:
-            from jax import Array as JaxArray
-            from jax import core
-
-            # Check if all variables are JAX arrays or tracers
-            if all([isinstance(var, (JaxArray, core.Tracer)) for var in variables]):
-                # Handle tracers - assume GPU during tracing
-                if any(isinstance(var, core.Tracer) for var in variables):
-                    return 1  # Assume GPU for KeOps during tracing
-
-                # For concrete JAX arrays, check device
-                # .devices() returns a set, not a list
-                for var in variables:
-                    if isinstance(var, JaxArray):
-                        if hasattr(var, 'devices'):
-                            devs = var.devices()
-                            device = str(list(devs)[0]) if devs else 'cpu'
-                        elif hasattr(var, 'device'):
-                            device = str(var.device)
-                        else:
-                            device = 'cpu'
-
-                        if 'gpu' in device.lower() or 'cuda' in device.lower():
-                            return 1  # GPU
-                        else:
-                            return 0  # CPU
-        except ImportError:
-            pass
-
-        # Check for Torch tensors
-        if pykeops.config.torch_found:
+        if all(
+            [type(var) is np.ndarray for var in variables]
+        ):  # Infer if we're working with numpy arrays or torch tensors:
+            MemType = 0
+        elif pykeops.config.torch_found:
             import torch
 
-            if all([type(var) in [torch.Tensor, torch.nn.parameter.Parameter] for var in variables]):
+            if all(
+                [
+                    type(var) in [torch.Tensor, torch.nn.parameter.Parameter]
+                    for var in variables
+                ]
+            ):
                 from pykeops.torch.utils import is_on_device
 
                 VarsAreOnGpu = tuple(map(is_on_device, tuple(variables)))
 
                 if all(VarsAreOnGpu):
-                    return 1  # GPU
+                    MemType = 1
                 elif not any(VarsAreOnGpu):
-                    return 0  # CPU
+                    MemType = 0
                 else:
                     raise ValueError(
                         "At least two input variables have different memory locations (Cpu/Gpu)."
                     )
+            else:
+                raise TypeError(
+                    "All variables should either be numpy arrays or torch tensors."
+                )
+        else:
+            raise TypeError(
+                "All variables should either be numpy arrays or torch tensors."
+            )
 
-        raise TypeError(
-            "All variables should either be numpy arrays, torch tensors, or JAX arrays."
-        )
+        return MemType
 
     @staticmethod
     def _find_grid():
