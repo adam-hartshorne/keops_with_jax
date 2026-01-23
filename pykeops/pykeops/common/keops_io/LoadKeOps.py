@@ -144,6 +144,7 @@ class LoadKeOps:
             self.params.use_half,
             self.params.use_fast_math,
             device_id_request,
+            lang=self.params.lang,  # Pass lang for runtime backend selection
         )
 
         # now we switch indsi, indsj and dimsx, dimsy in case tagI=1.

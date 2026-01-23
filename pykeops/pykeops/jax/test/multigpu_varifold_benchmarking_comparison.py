@@ -3,7 +3,7 @@ import os
 # --- Configuration ---
 # Ensure we see all GPUs. Adjust indices if you have fewer than 8.
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 # os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false' # Optional: Use if hitting OOM
 
 import time

@@ -5,7 +5,6 @@ Tests both Genred API and LazyTensor API with various configurations
 """
 
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
 
 import jax
 import jax.numpy as jnp

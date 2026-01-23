@@ -4,7 +4,7 @@ Tests: forward pass, gradients, JIT, LazyTensor, and generic operations
 """
 
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 import jax
 import jax.numpy as jnp

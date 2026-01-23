@@ -12,8 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 from functools import partial
 
-# Ensure JAX mode is active
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 # Import KeOps JAX API
 try:

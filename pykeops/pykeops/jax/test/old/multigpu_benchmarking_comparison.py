@@ -3,7 +3,7 @@ import os
 # --- Configuration ---
 # Ensure we see all 4 GPUs (or however many you have)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7" 
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 import jax
 import jax.numpy as jnp

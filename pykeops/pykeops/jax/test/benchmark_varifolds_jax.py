@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import os
 
-os.environ['PYKEOPS_JAX_MODE'] = '1'
-
 import argparse
 import time
 import json

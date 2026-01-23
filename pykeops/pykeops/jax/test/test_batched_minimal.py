@@ -5,7 +5,7 @@ Minimal test to verify batched ranges are working correctly
 import sys
 import os
 
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 # Make sure we can find the test data
 test_dir = "/media/adam/shared_folder/PycharmProjects/keops/pykeops/pykeops/jax/test"

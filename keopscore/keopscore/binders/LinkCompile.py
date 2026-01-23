@@ -12,14 +12,16 @@ class LinkCompile:
     Base class for compiling the map_reduce schemes and providing the dll to KeOps bindings.
     """
 
-    def __init__(self):
+    def __init__(self, lang=None):
         # --- JAX MULTI-GPU PATCH START ---
         # If the JAX-specific flag is set, we force the CMake backend.
-        # This prevents the GIL serialization and Context crashes inherent to NVRTC.
-        self.jax_mode = os.environ.get("PYKEOPS_JAX_MODE") == "1"
+        self.jax_mode = (lang == "jax")
+
         if self.jax_mode:
-            config.use_nvrtc = False
-            KeOps_Message("JAX mode enabled: forcing CMake backend for multi-GPU support")
+            # Note: We no longer set config.use_nvrtc globally - backend selection
+            # is now done per-class in the GpuReduc* files based on lang parameter
+            KeOps_Message("JAX mode: using CMake backend for multi-GPU support")
+
         # --- JAX MULTI-GPU PATCH END ---
 
         # N.B. Here self is assumed to be populated by the __init__ of one of the MapReduce classes
@@ -44,6 +46,7 @@ class LinkCompile:
             self.use_fast_math,
             self.device_id,
             current_cpp_flags, # Use updated flags
+            lang,  # Include lang in hash for cache separation
         )
 
         # --- JAX MULTI-GPU PATCH START ---

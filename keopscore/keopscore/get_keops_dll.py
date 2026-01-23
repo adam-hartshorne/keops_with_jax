@@ -83,6 +83,7 @@ def get_keops_dll_impl(
     mul_var_highdim,
     aliases,
     *args,
+    lang=None,
 ):
     # detecting the need for special chunked computation modes :
     use_chunk_mode = 0
@@ -111,7 +112,11 @@ def get_keops_dll_impl(
     # Instantiation of
     map_reduce_class = map_reduce[map_reduce_id]
 
-    map_reduce_obj = map_reduce_class(red_formula_string, aliases, *args)
+    # map_reduce_obj = map_reduce_class(red_formula_string, aliases, *args)
+    if "Gpu" in map_reduce_id:
+        map_reduce_obj = map_reduce_class(red_formula_string, aliases, *args, lang=lang)
+    else:
+        map_reduce_obj = map_reduce_class(red_formula_string, aliases, *args)
 
     rf = map_reduce_obj.red_formula
 
@@ -123,11 +128,14 @@ def get_keops_dll_impl(
     # detecting the case of formula being equal to zero, to bypass reduction.
     rf = map_reduce_obj.red_formula
     if isinstance(rf, Zero_Reduction) or (
-        isinstance(rf.formula, Zero) and isinstance(rf, Sum_Reduction)
+            isinstance(rf.formula, Zero) and isinstance(rf, Sum_Reduction)
     ):
         if "Gpu" in map_reduce_id:
             map_reduce_class = map_reduce["GpuReduc1D"]
-        map_reduce_obj = map_reduce_class.AssignZero(red_formula_string, aliases, *args)
+        if "Gpu" in map_reduce_id:
+            map_reduce_obj = map_reduce_class.AssignZero(red_formula_string, aliases, *args, lang=lang)
+        else:
+            map_reduce_obj = map_reduce_class.AssignZero(red_formula_string, aliases, *args)
         tagZero = 1
     else:
         tagZero = 0

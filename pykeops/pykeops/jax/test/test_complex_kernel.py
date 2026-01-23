@@ -5,7 +5,6 @@ Similar to varifold kernels with positions, normals, and weights
 """
 import os
 
-os.environ['PYKEOPS_JAX_MODE'] = '1'
 
 import jax.numpy as jnp
 from pykeops.jax import Genred

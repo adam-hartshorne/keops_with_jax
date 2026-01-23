@@ -3,7 +3,7 @@
 FIXED: Test basic kernels - passes correct number of arguments
 """
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 import jax
 import jax.numpy as jnp

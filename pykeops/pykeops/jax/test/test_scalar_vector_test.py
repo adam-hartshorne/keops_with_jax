@@ -2,7 +2,6 @@
 Test if scalar * vector multiplication works in KeOps - WITH BATCHING
 """
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
 import sys
 sys.path.insert(0, '/media/adam/shared_folder/PycharmProjects/keops/pykeops')
 sys.path.insert(0, '/media/adam/shared_folder/PycharmProjects/keops/keopscore')

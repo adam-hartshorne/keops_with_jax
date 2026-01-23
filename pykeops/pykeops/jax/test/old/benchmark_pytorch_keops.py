@@ -3,7 +3,7 @@ KeOps PyTorch Backend Performance Benchmark
 Runs various problem sizes and saves results to file
 """
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '0'  # Ensure PyTorch mode
+
 
 import time
 import torch

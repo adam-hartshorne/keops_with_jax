@@ -33,13 +33,13 @@ class Cuda_link_compile(LinkCompile):
     source_code_extension = "cu"
     ngpu, gpu_props_compile_flags = get_gpu_props
 
-    def __init__(self):
+    def __init__(self, lang=None):
         if not (cuda_available and Cuda_link_compile.ngpu):
             KeOps_Error(
                 "Trying to compile cuda code... but we detected that the system has no properly configured cuda lib."
             )
 
-        LinkCompile.__init__(self)
+        LinkCompile.__init__(self, lang=None)
 
         self.low_level_code_file = "".encode("utf-8")
 

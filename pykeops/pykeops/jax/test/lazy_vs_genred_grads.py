@@ -1,5 +1,4 @@
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
 import sys
 import jax
 import jax.numpy as jnp

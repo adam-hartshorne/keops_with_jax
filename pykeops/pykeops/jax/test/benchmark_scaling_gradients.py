@@ -2,7 +2,7 @@ import os
 
 # --- Configuration ---
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 import jax
 import jax.numpy as jnp

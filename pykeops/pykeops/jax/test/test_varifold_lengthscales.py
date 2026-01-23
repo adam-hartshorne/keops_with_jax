@@ -5,8 +5,6 @@ Formula: wi * wj * exp(-|x-y|^2 / sigma_pos^2) * exp(-|nx-ny|^2 / sigma_norm^2)
 """
 import os
 
-os.environ['PYKEOPS_JAX_MODE'] = '0'
-
 import numpy as np
 import jax
 import jax.numpy as jnp

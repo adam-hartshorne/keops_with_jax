@@ -2,7 +2,7 @@
 Test gradient of Gaussian kernel with Pm parameter
 """
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 import jax
 import jax.numpy as jnp

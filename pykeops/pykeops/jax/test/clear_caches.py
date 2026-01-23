@@ -8,7 +8,7 @@ until you restart Python or clear the cache explicitly.
 """
 
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 
 import sys
 import jax

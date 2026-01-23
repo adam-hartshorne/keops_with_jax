@@ -27,10 +27,12 @@ class Cache:
 
             atexit.register(self.save_cache)
 
-    def __call__(self, *args):
-        str_id = "".join(list(str(arg) for arg in args)) + str(env_param())
+    def __call__(self, *args, **kwargs):
+        # Include kwargs in the cache key for proper cache separation
+        kwargs_str = "".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
+        str_id = "".join(list(str(arg) for arg in args)) + kwargs_str + str(env_param())
         if not str_id in self.library:
-            self.library[str_id] = self.fun(*args)
+            self.library[str_id] = self.fun(*args, **kwargs)
         return self.library[str_id]
 
     def reset(self, new_save_folder=None):
@@ -81,19 +83,21 @@ class Cache_partial:
 
             atexit.register(self.save_cache)
 
-    def __call__(self, *args):
-        str_id = "".join(list(str(arg) for arg in args)) + str(env_param)
+    def __call__(self, *args, **kwargs):
+        # Include kwargs in the cache key for proper cache separation
+        kwargs_str = "".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
+        str_id = "".join(list(str(arg) for arg in args)) + kwargs_str + str(env_param)
         if not str_id in self.library:
             if self.use_cache_file:
                 if str_id in self.library_params:
                     params = self.library_params[str_id]
                     self.library[str_id] = self.cls(params, fast_init=True)
                 else:
-                    obj = self.cls(*args)
+                    obj = self.cls(*args, **kwargs)
                     self.library_params[str_id] = obj.params
                     self.library[str_id] = obj
             else:
-                self.library[str_id] = self.cls(*args)
+                self.library[str_id] = self.cls(*args, **kwargs)
         return self.library[str_id]
 
     def reset(self, new_save_folder=None):

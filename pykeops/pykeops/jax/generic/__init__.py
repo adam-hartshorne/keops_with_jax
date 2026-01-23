@@ -1,27 +1,18 @@
 """
 KeOps JAX backend initialization
-Sets JAX mode to force CMake compilation backend
+
+This module provides JAX-compatible KeOps operations. The backend selection
+(CUDA/CMake vs NVRTC) is now handled automatically at runtime based on the
+array type, so no environment variable setup is required.
 """
 import os
 
 # =============================================================================
-# CRITICAL: Check that JAX mode is set BEFORE importing
+# Configuration
 # =============================================================================
 
 # Enable CUDA
 os.environ["USE_CUDA"] = "1"
-
-# Check that JAX mode was set by user
-if os.environ.get("PYKEOPS_JAX_MODE") != "1":
-    raise RuntimeError(
-        "PYKEOPS_JAX_MODE must be set to '1' BEFORE importing pykeops.jax!\n"
-        "Add this at the top of your script:\n"
-        "    import os\n"
-        "    os.environ['PYKEOPS_JAX_MODE'] = '1'\n"
-        "    # Then import pykeops.jax\n"
-    )
-
-print("[KeOps JAX] JAX mode confirmed (PYKEOPS_JAX_MODE=1)")
 
 # =============================================================================
 # Import pykeops to set config
@@ -30,14 +21,9 @@ print("[KeOps JAX] JAX mode confirmed (PYKEOPS_JAX_MODE=1)")
 import pykeops
 import pykeops.config
 
-# Ensure CMake backend is used
+# Ensure CMake backend is used for JAX
 pykeops.config.compile_engine = "cmake"
 pykeops.config.use_cuda = True
-
-print(f"[KeOps JAX] Backend configuration:")
-print(f"  Compile engine: {pykeops.config.compile_engine}")
-print(f"  CUDA enabled: {pykeops.config.use_cuda}")
-print(f"  PYKEOPS_JAX_MODE: {os.environ.get('PYKEOPS_JAX_MODE')}")
 
 # =============================================================================
 # Import JAX operations

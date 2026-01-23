@@ -18,12 +18,8 @@ class LoadKeOps_cpp_class(LoadKeOps):
 
     def init_phase1(self):
         # In JAX mode, skip Python wrapper compilation - we use the kernel directly via FFI
-        if os.environ.get("PYKEOPS_JAX_MODE") == "1":
-            return  # Skip init_phase1 for JAX
-
-        # if getattr(self.params, 'lang', None) == 'jax':
-        #     return  # Skip pybind11 wrapper for JAX
-
+        if getattr(self.params, 'lang', None) == 'jax':
+            return  # Skip pybind11 wrapper for JAX
 
         srcname = pykeops_cpp_name(tag=self.params.tag, extension=".cpp")
 
@@ -45,14 +41,10 @@ class LoadKeOps_cpp_class(LoadKeOps):
             pyKeOps_Message("OK", use_tag=False, flush=True)
 
     def init_phase2(self):
-        # In JAX mode, skip Python wrapper loading
-        if os.environ.get("PYKEOPS_JAX_MODE") == "1":
+        # In JAX mode, skip Python wrapper loading - use kernel directly via FFI
+        if getattr(self.params, 'lang', None) == 'jax':
             self.kernel_so_path = self.params.source_name.replace('.cpp', '.so')
-            return  # Skip init_phase2 for JAX
-
-        # if getattr(self.params, 'lang', None) == 'jax':
-        #     self.kernel_so_path = self.params.source_name.replace('.cpp', '.so')
-        #     return  # Skip pybind11 wrapper loading for JAX
+            return  # Skip pybind11 wrapper loading for JAX
 
         import importlib
 

@@ -2,7 +2,7 @@
 KeOps JAX Final Benchmark - Using Median for Fair Comparison
 """
 import os
-os.environ['PYKEOPS_JAX_MODE'] = '1'
+
 os.environ['JAX_KEOPS_DEBUG'] = '0'
 
 import time

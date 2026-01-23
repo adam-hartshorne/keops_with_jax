@@ -6,7 +6,6 @@ import jax.numpy as jnp
 
 import os
 
-os.environ['PYKEOPS_JAX_MODE'] = '1'
 
 # Very simple test case
 x = jnp.array([[1.0, 0.0], [2.0, 3.0]], dtype=jnp.float32)  # 2 points in 2D
