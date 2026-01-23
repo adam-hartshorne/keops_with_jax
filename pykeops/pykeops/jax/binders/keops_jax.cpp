@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -125,17 +126,38 @@ static const size_t MAX_KERNEL_CACHE_SIZE = 5000;
 // Used to detect when thread-local caches become stale
 static std::atomic<uint64_t> g_registry_version{0};
 
+// Helper to create composite key from kernel_id and device_id
+// This ensures kernels compiled for different GPUs don't conflict
+inline uint64_t make_registry_key(uint64_t kernel_id, int device_id) {
+    // Use upper 16 bits for device_id, lower 48 bits for kernel_id
+    // Supports up to 65535 devices and 281 trillion unique kernel IDs
+    return (static_cast<uint64_t>(device_id & 0xFFFF) << 48) | (kernel_id & 0x0000FFFFFFFFFFFF);
+}
+
+inline std::pair<uint64_t, int> split_registry_key(uint64_t key) {
+    int device_id = static_cast<int>((key >> 48) & 0xFFFF);
+    uint64_t kernel_id = key & 0x0000FFFFFFFFFFFF;
+    return {kernel_id, device_id};
+}
+
 // Thread-local kernel cache for fast repeated lookups
 // Avoids hash map overhead when the same kernel is called repeatedly
 struct ThreadLocalKernelCache {
     uint64_t kernel_id = 0;
+    int device_id = -1;
     uint64_t registry_version = 0;
     KeOpsKernelInfo* kernel_ptr = nullptr;
 
     void invalidate() {
         kernel_id = 0;
+        device_id = -1;
         registry_version = 0;
         kernel_ptr = nullptr;
+    }
+
+    bool is_valid(uint64_t kid, int dev_id, uint64_t version) const {
+        return kernel_id == kid && device_id == dev_id &&
+               registry_version == version && kernel_ptr != nullptr;
     }
 };
 
@@ -143,11 +165,41 @@ void cleanup_all_kernels() {
     g_kernel_registry.clear();
     g_registry_version++;  // Invalidate all thread-local caches
 }
-bool is_kernel_registered(uint64_t kernel_id) { return g_kernel_registry.find(kernel_id) != g_kernel_registry.end(); }
+
+// Check if kernel is registered for the CURRENT device
+bool is_kernel_registered(uint64_t kernel_id) {
+    int device_id;
+    cudaGetDevice(&device_id);
+    uint64_t key = make_registry_key(kernel_id, device_id);
+    return g_kernel_registry.find(key) != g_kernel_registry.end();
+}
+
+// Check if kernel is registered for a SPECIFIC device
+bool is_kernel_registered_on_device(uint64_t kernel_id, int device_id) {
+    uint64_t key = make_registry_key(kernel_id, device_id);
+    return g_kernel_registry.find(key) != g_kernel_registry.end();
+}
+
 size_t get_registry_size() { return g_kernel_registry.size(); }
 
+// Get number of unique kernels (across all devices)
+size_t get_unique_kernel_count() {
+    std::unordered_set<uint64_t> unique_kernels;
+    for (const auto& pair : g_kernel_registry) {
+        auto [kernel_id, device_id] = split_registry_key(pair.first);
+        unique_kernels.insert(kernel_id);
+    }
+    return unique_kernels.size();
+}
+
 void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
-    if (g_kernel_registry.find(kernel_id) != g_kernel_registry.end()) return;
+    // Get current device - kernel will be registered for THIS device
+    int device_id;
+    cudaGetDevice(&device_id);
+
+    uint64_t key = make_registry_key(kernel_id, device_id);
+
+    if (g_kernel_registry.find(key) != g_kernel_registry.end()) return;
     if (g_kernel_registry.size() >= MAX_KERNEL_CACHE_SIZE) {
         g_kernel_registry.clear();
         g_registry_version++;  // Invalidate all thread-local caches
@@ -188,7 +240,11 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
         if (info.kernel_lib) dlclose(info.kernel_lib);
         throw std::runtime_error("Python error during registration: " + std::string(e.what()));
     }
-    g_kernel_registry[kernel_id] = std::move(info);
+    g_kernel_registry[key] = std::move(info);
+
+    if (KEOPS_DEBUG) {
+        std::cout << "[KeOps] Registered kernel " << kernel_id << " for device " << device_id << std::endl;
+    }
 }
 
 // =============================================================================
@@ -206,26 +262,32 @@ ffi::Error KeOpsKernelImpl(
     // Thread-local kernel cache for fast repeated lookups
     static thread_local ThreadLocalKernelCache tls_kernel_cache;
 
+    // Get current device - REQUIRED for per-device registry lookup
+    int device_id;
+    cudaGetDevice(&device_id);
+
     uint64_t kid = static_cast<uint64_t>(kernel_id);
     uint64_t current_version = g_registry_version.load(std::memory_order_acquire);
     KeOpsKernelInfo* kernel_ptr = nullptr;
 
     // Fast path: check thread-local cache first
-    // Only valid if kernel_id matches AND registry version hasn't changed
-    if (tls_kernel_cache.kernel_id == kid &&
-        tls_kernel_cache.registry_version == current_version &&
-        tls_kernel_cache.kernel_ptr != nullptr) {
+    // Only valid if kernel_id AND device_id match AND registry version hasn't changed
+    if (tls_kernel_cache.is_valid(kid, device_id, current_version)) {
         kernel_ptr = tls_kernel_cache.kernel_ptr;
     } else {
-        // Slow path: hash map lookup
-        auto it = g_kernel_registry.find(kid);
+        // Slow path: hash map lookup with composite key
+        uint64_t key = make_registry_key(kid, device_id);
+        auto it = g_kernel_registry.find(key);
         if (it == g_kernel_registry.end()) {
-            return ffi::Error::InvalidArgument("Kernel not found");
+            return ffi::Error::InvalidArgument(
+                "Kernel " + std::to_string(kid) + " not found for device " + std::to_string(device_id)
+            );
         }
         kernel_ptr = &(it->second);
 
         // Update thread-local cache
         tls_kernel_cache.kernel_id = kid;
+        tls_kernel_cache.device_id = device_id;
         tls_kernel_cache.registry_version = current_version;
         tls_kernel_cache.kernel_ptr = kernel_ptr;
     }
@@ -233,32 +295,38 @@ ffi::Error KeOpsKernelImpl(
     KeOpsKernelInfo& kernel = *kernel_ptr;
     size_t num_inputs = inputs.size();
 
-    // Multi-GPU Safety
-    int device_id;
-    cudaGetDevice(&device_id);
+    // Fast path: use stack-allocated array for common case (most kernels have < 16 inputs)
+    // This avoids cudaGetDevice(), hash map lookup, and vector operations
+    constexpr size_t FAST_PATH_MAX_INPUTS = 16;
+    void* fixed_input_ptrs[FAST_PATH_MAX_INPUTS];
 
-    struct PerDeviceBuffers { std::vector<void*> input_ptrs; };
-    static thread_local std::unordered_map<int, PerDeviceBuffers> device_buffers;
-    auto& tls_input_ptrs = device_buffers[device_id].input_ptrs;
+    // Fallback for unusual kernels with many inputs
+    static thread_local std::vector<void*> dynamic_input_ptrs;
 
-    tls_input_ptrs.clear();
-    if (tls_input_ptrs.capacity() < num_inputs) tls_input_ptrs.reserve(num_inputs * 2);
+    void** input_ptrs;
+    if (num_inputs <= FAST_PATH_MAX_INPUTS) {
+        input_ptrs = fixed_input_ptrs;
+    } else {
+        dynamic_input_ptrs.resize(num_inputs);
+        input_ptrs = dynamic_input_ptrs.data();
+    }
 
+    // Populate input pointers
     for (size_t i = 0; i < num_inputs; ++i) {
-        tls_input_ptrs.push_back(const_cast<void*>(inputs.get<ffi::AnyBuffer>(i).value().untyped_data()));
+        input_ptrs[i] = const_cast<void*>(inputs.get<ffi::AnyBuffer>(i).value().untyped_data());
     }
     void* output_ptr = output->untyped_data();
 
     // Dimension extraction
     int nx = 1, ny = 1;
-    if (kernel.nvi_count > 0 && kernel.indsi[0] < num_inputs) {
+    if (kernel.nvi_count > 0 && kernel.indsi[0] < static_cast<int>(num_inputs)) {
         auto buf = inputs.get<ffi::AnyBuffer>(kernel.indsi[0]);
         if (buf.has_value()) {
             auto dims = buf->dimensions();
             nx = (dims.size() == 3) ? dims[1] : dims[0];
         }
     }
-    if (kernel.nvj_count > 0 && kernel.indsj[0] < num_inputs) {
+    if (kernel.nvj_count > 0 && kernel.indsj[0] < static_cast<int>(num_inputs)) {
         auto buf = inputs.get<ffi::AnyBuffer>(kernel.indsj[0]);
         if (buf.has_value()) {
             auto dims = buf->dimensions();
@@ -299,7 +367,7 @@ ffi::Error KeOpsKernelImpl(
         kernel.use_half, kernel.tag1D2D, kernel.dimred, kernel.cuda_block_size, kernel.use_chunk_mode,
         kernel.indsi.data(), kernel.indsj.data(), kernel.indsp.data(),
         kernel.dimout, kernel.dimsx.data(), kernel.dimsy.data(), kernel.dimsp.data(),
-        ranges_enc_ptr, nullptr, output_ptr, tls_input_ptrs.data(), argshapes_ptr,
+        ranges_enc_ptr, nullptr, output_ptr, input_ptrs, argshapes_ptr,
         (void*)stream, scratch_ptr
     );
 
@@ -325,10 +393,20 @@ template <typename T> nb::capsule EncapsulateFfiCall(T *fn) {
 }
 
 NB_MODULE(keops_jax_ext, m) {
-    m.def("register_keops_kernel", &register_keops_kernel);
-    m.def("is_kernel_registered", &is_kernel_registered);
-    m.def("cleanup_all_kernels", &cleanup_all_kernels);
-    m.def("get_registry_size", &get_registry_size);
-    m.def("get_registry_version", []() { return g_registry_version.load(); });
-    m.def("get_ffi_handler", []() { return EncapsulateFfiCall(KeOpsKernel); });
+    m.def("register_keops_kernel", &register_keops_kernel,
+          "Register a KeOps kernel for the current CUDA device");
+    m.def("is_kernel_registered", &is_kernel_registered,
+          "Check if kernel is registered for the current device");
+    m.def("is_kernel_registered_on_device", &is_kernel_registered_on_device,
+          "Check if kernel is registered for a specific device");
+    m.def("cleanup_all_kernels", &cleanup_all_kernels,
+          "Clear all registered kernels (all devices)");
+    m.def("get_registry_size", &get_registry_size,
+          "Get total number of registered kernel-device pairs");
+    m.def("get_unique_kernel_count", &get_unique_kernel_count,
+          "Get number of unique kernels (across all devices)");
+    m.def("get_registry_version", []() { return g_registry_version.load(); },
+          "Get current registry version (for cache invalidation)");
+    m.def("get_ffi_handler", []() { return EncapsulateFfiCall(KeOpsKernel); },
+          "Get the FFI handler capsule");
 }

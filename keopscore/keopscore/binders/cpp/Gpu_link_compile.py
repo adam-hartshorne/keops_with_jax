@@ -138,6 +138,45 @@ using std::min;
 
         if is_ranges:
             launcher_code = preamble + """
+// =============================================================================
+// Launch Parameter Cache - Avoids redundant CPU computation and GPU uploads
+// =============================================================================
+
+struct LaunchCache {
+    int nx = -1;
+    int ny = -1;
+    int batch_size = -1;
+    int cuda_block_size = -1;
+
+    // Cached GPU memory (persisted across calls)
+    void* cached_scratch = nullptr;
+    size_t cached_scratch_size = 0;
+
+    // Cached host buffer for args (still need to update args each call)
+    std::vector<char> host_args_buffer;
+
+    // Precomputed sizes
+    size_t offsets_size = 0;
+    size_t lookup_size = 0;
+    size_t slices_size = 0;
+    size_t ranges_size = 0;
+    size_t tables_total_size = 0;  // Everything except args
+
+    bool is_valid(int _nx, int _ny, int _batch_size, int _cuda_block_size) const {
+        return nx == _nx && ny == _ny && batch_size == _batch_size && 
+               cuda_block_size == _cuda_block_size && cached_scratch != nullptr;
+    }
+
+    void invalidate() {
+        nx = ny = batch_size = cuda_block_size = -1;
+        // Note: We don't free cached_scratch here - it's managed by XLA's scratch allocator
+        cached_scratch = nullptr;
+    }
+};
+
+// Thread-local cache per device
+static thread_local std::unordered_map<int, LaunchCache> g_launch_caches;
+
 extern "C" int launch_keops_kernel(
     int tagHostDevice,
     int dimy,
@@ -197,81 +236,103 @@ extern "C" int launch_keops_kernel(
     }
     int sparse_args_count = max_var_idx + 1;
 
+    // Get device-specific cache
+    int device_id;
+    cudaGetDevice(&device_id);
+    LaunchCache& cache = g_launch_caches[device_id];
+
     char* device_ptr = (char*)scratch_ptr;
 
-    // KERNEL EXPECTS 64-BIT POINTERS (signed long*)
+    // Size calculations
     size_t size_offsets = sizeof(signed long int) * nblocks * total_offsets;
     size_t size_lookup  = sizeof(signed long int) * 3 * nblocks;
     size_t size_slices  = sizeof(signed long int) * batch_size;
     size_t size_ranges  = sizeof(signed long int) * 2 * batch_size;
+    size_t size_args    = sizeof(float*) * sparse_args_count;
+    size_t tables_size  = size_offsets + size_lookup + size_slices + size_ranges;
 
-    // Cast to signed long* to match kernel signature
+    // Device pointers
     signed long int* offsets_d = (signed long int*)(device_ptr);
     signed long int* lookup_d  = (signed long int*)(device_ptr + size_offsets);
     signed long int* slices_x  = (signed long int*)(device_ptr + size_offsets + size_lookup);
     signed long int* ranges_y  = (signed long int*)(device_ptr + size_offsets + size_lookup + size_slices);
-    float** args_d             = (float**)(device_ptr + size_offsets + size_lookup + size_slices + size_ranges);
+    float** args_d             = (float**)(device_ptr + tables_size);
 
-    // Host staging buffer
-    struct PerDeviceHostBuffer { std::vector<char> buffer; };
-    static thread_local std::unordered_map<int, PerDeviceHostBuffer> device_host_buffers;
-    int device_id;
-    cudaGetDevice(&device_id);
-    auto& host_buffer = device_host_buffers[device_id].buffer;
+    // Check if we can use cached tables (dimensions unchanged)
+    bool cache_hit = cache.is_valid(nx, ny, batch_size, cuda_block_size) && 
+                     cache.cached_scratch == scratch_ptr;
 
-    size_t total_size = size_offsets + size_lookup + size_slices + size_ranges + (sizeof(float*) * sparse_args_count);
-    if (host_buffer.size() < total_size) host_buffer.resize(total_size * 2);
-    char* h_ptr = host_buffer.data();
+    if (!cache_hit) {
+        // Cache miss: need to rebuild and upload offset/lookup/slice/range tables
 
-    int blocks_per_batch = (nx + blockSize.x - 1) / blockSize.x;
-
-    // Build offsets table (using signed long int)
-    signed long int* h_offsets = (signed long int*)h_ptr;
-    for (int b = 0; b < batch_size; b++) {
-        for (int block_in_batch = 0; block_in_batch < blocks_per_batch; block_in_batch++) {
-            int block_id = b * blocks_per_batch + block_in_batch;
-            int offset_idx = total_offsets * block_id;
-
-            // CRITICAL FIX: Calculate the block's offset within the batch
-            int block_offset = block_in_batch * blockSize.x;
-
-            // For Vi (i-variables), we MUST add the block_offset because the kernel 
-            // uses threadIdx.x (0..BlockSize) relative to this pointer!
-            for (int i = 0; i < nvi; i++) h_offsets[offset_idx + i] = b * nx + block_offset;
-
-            // For Vj (j-variables), we scan the whole axis, so no block offset needed
-            for (int j = 0; j < nvj; j++) h_offsets[offset_idx + nvi + j] = b * ny;
-
-            // Parameters are constant
-            for (int p = 0; p < nvp; p++) h_offsets[offset_idx + nvi + nvj + p] = 0;
+        // Ensure host buffer is large enough for tables
+        static thread_local std::vector<char> host_tables_buffer;
+        if (host_tables_buffer.size() < tables_size) {
+            host_tables_buffer.resize(tables_size * 2);
         }
-    }
+        char* h_ptr = host_tables_buffer.data();
 
-    // Build lookup table
-    signed long int* h_lookup = (signed long int*)(h_ptr + size_offsets);
-    for (int b = 0; b < batch_size; b++) {
-        for (int block_in_batch = 0; block_in_batch < blocks_per_batch; block_in_batch++) {
-            int block_id = b * blocks_per_batch + block_in_batch;
-            h_lookup[3*block_id + 0] = b;
-            h_lookup[3*block_id + 1] = b * nx + block_in_batch * blockSize.x;
-            int end_within_batch = ((block_in_batch + 1) * blockSize.x < nx) ? 
-                                   ((block_in_batch + 1) * blockSize.x) : nx;
-            h_lookup[3*block_id + 2] = b * nx + end_within_batch;
+        int blocks_per_batch = (nx + blockSize.x - 1) / blockSize.x;
+
+        // Build offsets table
+        signed long int* h_offsets = (signed long int*)h_ptr;
+        for (int b = 0; b < batch_size; b++) {
+            for (int block_in_batch = 0; block_in_batch < blocks_per_batch; block_in_batch++) {
+                int block_id = b * blocks_per_batch + block_in_batch;
+                int offset_idx = total_offsets * block_id;
+                int block_offset = block_in_batch * blockSize.x;
+
+                for (int i = 0; i < nvi; i++) h_offsets[offset_idx + i] = b * nx + block_offset;
+                for (int j = 0; j < nvj; j++) h_offsets[offset_idx + nvi + j] = b * ny;
+                for (int p = 0; p < nvp; p++) h_offsets[offset_idx + nvi + nvj + p] = 0;
+            }
         }
+
+        // Build lookup table
+        signed long int* h_lookup = (signed long int*)(h_ptr + size_offsets);
+        for (int b = 0; b < batch_size; b++) {
+            for (int block_in_batch = 0; block_in_batch < blocks_per_batch; block_in_batch++) {
+                int block_id = b * blocks_per_batch + block_in_batch;
+                h_lookup[3*block_id + 0] = b;
+                h_lookup[3*block_id + 1] = b * nx + block_in_batch * blockSize.x;
+                int end_within_batch = ((block_in_batch + 1) * blockSize.x < nx) ? 
+                                       ((block_in_batch + 1) * blockSize.x) : nx;
+                h_lookup[3*block_id + 2] = b * nx + end_within_batch;
+            }
+        }
+
+        // Build slices
+        signed long int* h_slices = (signed long int*)(h_ptr + size_offsets + size_lookup);
+        for (int b = 0; b < batch_size; b++) { h_slices[b] = b + 1; }
+
+        // Build ranges
+        signed long int* h_ranges = (signed long int*)(h_ptr + size_offsets + size_lookup + size_slices);
+        for (int b = 0; b < batch_size; b++) { 
+            h_ranges[2*b + 0] = b * ny;
+            h_ranges[2*b + 1] = (b+1) * ny;
+        }
+
+        // Upload tables to GPU
+        cudaMemcpyAsync(device_ptr, h_ptr, tables_size, cudaMemcpyHostToDevice, stream);
+
+        // Update cache
+        cache.nx = nx;
+        cache.ny = ny;
+        cache.batch_size = batch_size;
+        cache.cuda_block_size = cuda_block_size;
+        cache.cached_scratch = scratch_ptr;
+        cache.tables_total_size = tables_size;
     }
+    // If cache_hit, tables are already on GPU at the right location - skip rebuild & upload!
 
-    // Build slices
-    signed long int* h_slices = (signed long int*)(h_ptr + size_offsets + size_lookup);
-    for (int b = 0; b < batch_size; b++) { h_slices[b] = b + 1; }
+    // Args ALWAYS need to be updated (data pointers change each call)
+    // But this is much smaller than the full tables
 
-    // Build ranges
-    signed long int* h_ranges = (signed long int*)(h_ptr + size_offsets + size_lookup + size_slices);
-    for (int b = 0; b < batch_size; b++) { 
-        h_ranges[2*b + 0] = b * ny;
-        h_ranges[2*b + 1] = (b+1) * ny;
+    // Ensure host args buffer is large enough
+    if (cache.host_args_buffer.size() < size_args) {
+        cache.host_args_buffer.resize(size_args * 2);
     }
-
-    float** h_args = (float**)(h_ptr + size_offsets + size_lookup + size_slices + size_ranges);
+    float** h_args = (float**)cache.host_args_buffer.data();
 
     // Handle sparse variable indices
     std::vector<int> all_var_indices;
@@ -289,10 +350,11 @@ extern "C" int launch_keops_kernel(
         sparse_args[all_var_indices[dense_idx]] = args[dense_idx];
     }
 
-    memcpy(h_args, sparse_args, sizeof(float*) * sparse_args_count);
+    memcpy(h_args, sparse_args, size_args);
     if (sparse_args_count > 256) delete[] sparse_args;
 
-    cudaMemcpyAsync(device_ptr, h_ptr, total_size, cudaMemcpyHostToDevice, stream);
+    // Upload only args (small, always needed)
+    cudaMemcpyAsync(args_d, h_args, size_args, cudaMemcpyHostToDevice, stream);
 
     size_t shared_mem = cuda_block_size * dimy * sizeof(float);
     GpuConv1DOnDevice_ranges<<<gridSize, blockSize, shared_mem, stream>>>(
@@ -339,18 +401,25 @@ extern "C" int launch_keops_kernel(
     int nvi = var_counts & 0xFF;
     int nvj = (var_counts >> 8) & 0xFF;
     int nvp = (var_counts >> 16) & 0xFF;
+    int total_args = nvi + nvj + nvp;
 
     size_t shared_mem = cuda_block_size * dimy * sizeof(float);
+    size_t args_size = sizeof(float*) * total_args;
 
-    struct PerDeviceHostBuffer { std::vector<char> buffer; };
-    static thread_local std::unordered_map<int, PerDeviceHostBuffer> device_host_buffers;
-    int device_id;
-    cudaGetDevice(&device_id);
-    auto& host_buffer = device_host_buffers[device_id].buffer;
-    size_t args_size = sizeof(float*) * (nvi + nvj + nvp);
-    if (host_buffer.size() < args_size) host_buffer.resize(args_size * 2);
+    // Fast path: use stack buffer for common case (most kernels have < 32 args)
+    constexpr size_t FAST_PATH_MAX_ARGS = 32;
+    float* fixed_args_buffer[FAST_PATH_MAX_ARGS];
 
-    float** h_args = (float**)host_buffer.data();
+    float** h_args;
+    if (total_args <= FAST_PATH_MAX_ARGS) {
+        h_args = fixed_args_buffer;
+    } else {
+        // Fallback for unusual kernels
+        static thread_local std::vector<float*> dynamic_args_buffer;
+        dynamic_args_buffer.resize(total_args);
+        h_args = dynamic_args_buffer.data();
+    }
+
     memcpy(h_args, args, args_size);
 
     char* device_ptr = (char*)scratch_ptr;
