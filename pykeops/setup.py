@@ -2,12 +2,12 @@
 """
 PyKeOps setup.py - builds JAX extension during install
 """
-print("[KeOps setup.py] *** SETUP.PY IS BEING EXECUTED ***")
+# print("[KeOps setup.py] *** SETUP.PY IS BEING EXECUTED ***")
 
 import sys
 
-print(f"[KeOps setup.py] Python: {sys.executable}")
-print(f"[KeOps setup.py] Args: {sys.argv}")
+# print(f"[KeOps setup.py] Python: {sys.executable}")
+# print(f"[KeOps setup.py] Args: {sys.argv}")
 
 
 # =============================================================================

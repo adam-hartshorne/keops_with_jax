@@ -85,7 +85,7 @@ def _generate_gpu_reduc1d_code(self):
     table = varloader.table(self.xi, yjrel, self.param_loc)
     jreltile = c_variable("signed long int", "(jrel + tile * blockDim.x)")
 
-    print('GpuConv1DOnDevice')
+    # print('GpuConv1DOnDevice')
 
     self.code = f"""
 

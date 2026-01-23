@@ -109,7 +109,7 @@ def _generate_gpu_reduc1d_ranges_code(self):
     if dtype == "half2":
         self.headers += c_include("cuda_fp16.h")
 
-    print('GpuConv1DOnDevice_Ranges')
+    # print('GpuConv1DOnDevice_Ranges')
 
     self.code = f"""
                     {self.headers}
