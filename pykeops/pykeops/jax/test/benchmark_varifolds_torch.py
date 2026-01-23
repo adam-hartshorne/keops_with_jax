@@ -48,7 +48,7 @@ Dict[str, torch.Tensor]:
 
     to_dev = lambda x: torch.from_numpy(x).to(device=device, dtype=dtype).requires_grad_(True)
 
-    sigma_spatial, sigma_normal = 0.5, 1.0
+    sigma_spatial, sigma_normal = 0.5, 0.75
     gamma_spatial = torch.tensor(1.0 / (2 * sigma_spatial ** 2), dtype=dtype, device=device)
     gamma_normal = torch.tensor(1.0 / (sigma_normal ** 2), dtype=dtype, device=device)
 
@@ -214,12 +214,9 @@ def main():
 
     standard_sizes = [(5000, 100, 3), (10000, 100, 3), (25000, 100, 3), (50000, 100, 3)]
 
-    rectangular_sizes = [
-        (2000, 2000, 3), (5000, 5000, 3), (10000, 10000, 3),
-        (10000, 20000, 3), (20000, 10000, 3)
-    ]
+    rectangular_sizes = [(2000, 2000, 3), (5000, 5000, 3), (10000, 10000, 3), (50000, 25000, 3), (100000, 50000, 3)]
 
-    batch_scaling = [1, 2, 4, 8, 16]
+    batch_scaling = [2, 10, 50]
 
     if not args.quick:
         standard_sizes.extend([(75000, 100, 3), (100000, 100, 3)])

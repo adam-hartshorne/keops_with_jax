@@ -78,7 +78,7 @@ Dict[str, jnp.ndarray]:
     v = jnp.array(v_np, dtype=dtype)
 
     sigma_spatial = 0.5
-    sigma_normal = 1.0
+    sigma_normal = 0.75
     gamma_spatial = jnp.array(1.0 / (2 * sigma_spatial ** 2), dtype=dtype)
     gamma_normal = jnp.array(1.0 / (sigma_normal ** 2), dtype=dtype)
 
@@ -332,8 +332,10 @@ def main():
     num_runs = 10 if args.quick else 20
 
     standard_sizes = [(5000, 100, 3), (10000, 100, 3), (25000, 100, 3), (50000, 100, 3)]
-    rectangular_sizes = [(2000, 2000, 3), (5000, 5000, 3), (10000, 10000, 3), (10000, 20000, 3), (20000, 10000, 3)]
-    batch_scaling = [1, 2, 4, 8, 16]
+
+    rectangular_sizes = [(2000, 2000, 3), (5000, 5000, 3), (10000, 10000, 3), (50000, 25000, 3), (100000, 50000, 3)]
+
+    batch_scaling = [2, 10, 50]
 
     if not args.quick:
         standard_sizes.extend([(75000, 100, 3), (100000, 100, 3)])

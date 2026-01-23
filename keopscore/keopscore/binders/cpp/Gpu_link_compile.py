@@ -18,11 +18,6 @@ class Gpu_link_compile(LinkCompile):
     CMake-based GPU compilation (alternative to NVRTC)
     Uses nvcc directly to compile .cu files to .so shared libraries
     Includes a launcher function for GIL-free execution from C++
-
-    XLA SCRATCH SPACE VERSION:
-    - Launcher accepts pre-allocated scratch buffer from XLA
-    - No more cudaMallocAsync overhead
-    - Fully compatible with multi-GPU (scratch is per-stream)
     """
     source_code_extension = "cu"
     ngpu, gpu_props_compile_flags = get_gpu_props
@@ -84,7 +79,7 @@ class Gpu_link_compile(LinkCompile):
             "-Xcompiler", "-fPIC",
             "-O3",
             "--use_fast_math",
-            "--ptxas-options=-v",  # OPTIMIZATION: Monitor register usage for debugging
+            "--ptxas-options=-v",
             f"-I{config.get_bindings_source_dir()}",
         ]
 
@@ -121,11 +116,6 @@ class Gpu_link_compile(LinkCompile):
     def add_launcher_wrapper(self, kernel_code):
         """
         Add a C-compatible launcher function that can be called from C++ via dlopen
-
-        XLA SCRATCH SPACE VERSION:
-        - Accepts scratch_ptr parameter from XLA FFI
-        - No internal memory allocation (uses pre-allocated buffer)
-        - MULTI-GPU SAFE: Scratch is managed per-stream by XLA
         """
         is_ranges = "GpuConv1DOnDevice_ranges" in kernel_code
 
@@ -173,7 +163,7 @@ extern "C" int launch_keops_kernel(
     void** args_ptr,
     void* argshapes,
     cudaStream_t stream,
-    void* scratch_ptr  // NEW: XLA-provided scratch buffer
+    void* scratch_ptr
 ) {
     float* out = (float*)out_ptr;
     float** args = (float**)args_ptr;
@@ -195,71 +185,64 @@ extern "C" int launch_keops_kernel(
     int total_offsets = nvi + nvj + nvp;
     if (total_offsets == 0) total_offsets = 2;
 
-    // Calculate max variable index for sparse args array
     int max_var_idx = -1;
     if (nvi > 0 && indsi) {
-        for (int i = 0; i < nvi; i++) {
-            if (indsi[i] > max_var_idx) max_var_idx = indsi[i];
-        }
+        for (int i = 0; i < nvi; i++) if (indsi[i] > max_var_idx) max_var_idx = indsi[i];
     }
     if (nvj > 0 && indsj) {
-        for (int j = 0; j < nvj; j++) {
-            if (indsj[j] > max_var_idx) max_var_idx = indsj[j];
-        }
+        for (int j = 0; j < nvj; j++) if (indsj[j] > max_var_idx) max_var_idx = indsj[j];
     }
     if (nvp > 0 && indsp) {
-        for (int p = 0; p < nvp; p++) {
-            if (indsp[p] > max_var_idx) max_var_idx = indsp[p];
-        }
+        for (int p = 0; p < nvp; p++) if (indsp[p] > max_var_idx) max_var_idx = indsp[p];
     }
     int sparse_args_count = max_var_idx + 1;
 
-    // NEW: Use XLA-provided scratch buffer instead of cudaMallocAsync
-    // No allocation overhead - just layout the buffer
     char* device_ptr = (char*)scratch_ptr;
 
+    // KERNEL EXPECTS 64-BIT POINTERS (signed long*)
     size_t size_offsets = sizeof(signed long int) * nblocks * total_offsets;
     size_t size_lookup  = sizeof(signed long int) * 3 * nblocks;
     size_t size_slices  = sizeof(signed long int) * batch_size;
     size_t size_ranges  = sizeof(signed long int) * 2 * batch_size;
 
+    // Cast to signed long* to match kernel signature
     signed long int* offsets_d = (signed long int*)(device_ptr);
     signed long int* lookup_d  = (signed long int*)(device_ptr + size_offsets);
     signed long int* slices_x  = (signed long int*)(device_ptr + size_offsets + size_lookup);
     signed long int* ranges_y  = (signed long int*)(device_ptr + size_offsets + size_lookup + size_slices);
-    float** args_d    = (float**)(device_ptr + size_offsets + size_lookup + size_slices + size_ranges);
+    float** args_d             = (float**)(device_ptr + size_offsets + size_lookup + size_slices + size_ranges);
 
-    // PRIORITY 3: Multi-GPU Safety - Device-specific host staging buffer
-    // With JAX sharding, same thread can execute on multiple devices
-    // Each device needs its own host staging buffer to prevent data races
-
-    struct PerDeviceHostBuffer {
-        std::vector<char> buffer;
-    };
+    // Host staging buffer
+    struct PerDeviceHostBuffer { std::vector<char> buffer; };
     static thread_local std::unordered_map<int, PerDeviceHostBuffer> device_host_buffers;
-
-    // Get current device
     int device_id;
     cudaGetDevice(&device_id);
-
-    // Get host buffer for this specific device
     auto& host_buffer = device_host_buffers[device_id].buffer;
 
-    size_t total_size = size_offsets + size_lookup + size_slices + size_ranges + 
-                        (sizeof(float*) * sparse_args_count);
+    size_t total_size = size_offsets + size_lookup + size_slices + size_ranges + (sizeof(float*) * sparse_args_count);
     if (host_buffer.size() < total_size) host_buffer.resize(total_size * 2);
     char* h_ptr = host_buffer.data();
 
     int blocks_per_batch = (nx + blockSize.x - 1) / blockSize.x;
 
-    // Build offsets table
+    // Build offsets table (using signed long int)
     signed long int* h_offsets = (signed long int*)h_ptr;
     for (int b = 0; b < batch_size; b++) {
         for (int block_in_batch = 0; block_in_batch < blocks_per_batch; block_in_batch++) {
             int block_id = b * blocks_per_batch + block_in_batch;
             int offset_idx = total_offsets * block_id;
-            for (int i = 0; i < nvi; i++) h_offsets[offset_idx + i] = b * nx;
+
+            // CRITICAL FIX: Calculate the block's offset within the batch
+            int block_offset = block_in_batch * blockSize.x;
+
+            // For Vi (i-variables), we MUST add the block_offset because the kernel 
+            // uses threadIdx.x (0..BlockSize) relative to this pointer!
+            for (int i = 0; i < nvi; i++) h_offsets[offset_idx + i] = b * nx + block_offset;
+
+            // For Vj (j-variables), we scan the whole axis, so no block offset needed
             for (int j = 0; j < nvj; j++) h_offsets[offset_idx + nvi + j] = b * ny;
+
+            // Parameters are constant
             for (int p = 0; p < nvp; p++) h_offsets[offset_idx + nvi + nvj + p] = 0;
         }
     }
@@ -298,7 +281,6 @@ extern "C" int launch_keops_kernel(
     for (int p = 0; p < nvp; p++) all_var_indices.push_back(indsp[p]);
     std::sort(all_var_indices.begin(), all_var_indices.end());
 
-    // Stack-based sparse array for speed (256 max)
     float* sparse_buffer[256];
     float** sparse_args = (sparse_args_count <= 256) ? sparse_buffer : new float*[sparse_args_count];
     for (int i = 0; i < sparse_args_count; i++) sparse_args[i] = nullptr;
@@ -310,32 +292,9 @@ extern "C" int launch_keops_kernel(
     memcpy(h_args, sparse_args, sizeof(float*) * sparse_args_count);
     if (sparse_args_count > 256) delete[] sparse_args;
 
-    // NEW: Single memcpy to XLA scratch buffer
     cudaMemcpyAsync(device_ptr, h_ptr, total_size, cudaMemcpyHostToDevice, stream);
 
-    // PRIORITY 2+3: Shared memory safety check (re-added per reviewer feedback)
     size_t shared_mem = cuda_block_size * dimy * sizeof(float);
-    const size_t MAX_SHARED_MEMORY = 49152;  // 48KB conservative limit
-
-    if (shared_mem > MAX_SHARED_MEMORY) {
-        // Reduce block size to fit within shared memory constraints
-        int safe_block_size = MAX_SHARED_MEMORY / (dimy * sizeof(float));
-        safe_block_size = (safe_block_size / 32) * 32;  // Round down to warp size
-
-        if (safe_block_size >= 32) {
-            // Adjust grid/block dimensions
-            blockSize.x = safe_block_size;
-            gridSize.x = ((nx + blockSize.x - 1) / blockSize.x) * batch_size;
-            nblocks = gridSize.x;
-            shared_mem = safe_block_size * dimy * sizeof(float);
-        } else {
-            // dimy is too large even for 32 threads - kernel will fail
-            printf("[ERROR] Shared memory required (%zu bytes) exceeds limit even with minimal block size\\n", 
-                   shared_mem);
-            return 1;
-        }
-    }
-
     GpuConv1DOnDevice_ranges<<<gridSize, blockSize, shared_mem, stream>>>(
         nx, ny, nbatchdims, offsets_d, lookup_d, slices_x, ranges_y, out, args_d);
 
@@ -369,64 +328,34 @@ extern "C" int launch_keops_kernel(
     void** args_ptr,
     void* argshapes,
     cudaStream_t stream,
-    void* scratch_ptr  // NEW: XLA-provided scratch buffer
+    void* scratch_ptr
 ) {
     float* out = (float*)out_ptr;
     float** args = (float**)args_ptr;
     dim3 blockSize(cuda_block_size);
     dim3 gridSize((nx + blockSize.x - 1) / blockSize.x);
 
-    // Unpack variable counts from argshapes
     int64_t var_counts = (int64_t)argshapes;
     int nvi = var_counts & 0xFF;
     int nvj = (var_counts >> 8) & 0xFF;
     int nvp = (var_counts >> 16) & 0xFF;
 
-    // PRIORITY 2+3: Shared memory safety check
     size_t shared_mem = cuda_block_size * dimy * sizeof(float);
-    const size_t MAX_SHARED_MEMORY = 49152;  // 48KB conservative limit
 
-    if (shared_mem > MAX_SHARED_MEMORY) {
-        // Reduce block size to fit within shared memory constraints
-        int safe_block_size = MAX_SHARED_MEMORY / (dimy * sizeof(float));
-        safe_block_size = (safe_block_size / 32) * 32;  // Round down to warp size
-
-        if (safe_block_size >= 32) {
-            // Adjust grid/block dimensions
-            blockSize.x = safe_block_size;
-            gridSize.x = (nx + blockSize.x - 1) / blockSize.x;
-            shared_mem = safe_block_size * dimy * sizeof(float);
-        } else {
-            // dimy is too large even for 32 threads - kernel will fail
-            printf("[ERROR] Shared memory required (%zu bytes) exceeds limit even with minimal block size\\n", 
-                   shared_mem);
-            return 1;
-        }
-    }
-
-    // FINAL POLISH: Device-specific host staging for perfect thread safety
-    // Use the same pattern as batched launcher for consistency
-    struct PerDeviceHostBuffer {
-        std::vector<char> buffer;
-    };
+    struct PerDeviceHostBuffer { std::vector<char> buffer; };
     static thread_local std::unordered_map<int, PerDeviceHostBuffer> device_host_buffers;
-
     int device_id;
     cudaGetDevice(&device_id);
-
     auto& host_buffer = device_host_buffers[device_id].buffer;
     size_t args_size = sizeof(float*) * (nvi + nvj + nvp);
     if (host_buffer.size() < args_size) host_buffer.resize(args_size * 2);
 
-    // Copy args to device-specific host buffer first
     float** h_args = (float**)host_buffer.data();
     memcpy(h_args, args, args_size);
 
-    // Use XLA scratch for device-side args array
     char* device_ptr = (char*)scratch_ptr;
     float** args_d = (float**)device_ptr;
 
-    // Now memcpy from our device-specific staging area
     cudaMemcpyAsync(args_d, h_args, args_size, cudaMemcpyHostToDevice, stream);
     GpuConv1DOnDevice<<<gridSize, blockSize, shared_mem, stream>>>(nx, ny, out, args_d);
 
