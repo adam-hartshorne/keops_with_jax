@@ -1,6 +1,6 @@
 /*
  * KeOps JAX C++ Extension (using nanobind) - FULLY OPTIMIZED
- *
+ * 
  * FIXES APPLIED:
  * 1. Thread-safe registry with std::shared_mutex (reader/writer locks)
  * 2. Safe pointer lifetime via std::shared_ptr in registry
@@ -103,7 +103,7 @@ struct KeOpsKernelInfo {
     KeOpsKernelInfo(KeOpsKernelInfo&& other) noexcept { *this = std::move(other); }
     KeOpsKernelInfo& operator=(KeOpsKernelInfo&& other) noexcept {
         if (this != &other) {
-            if (kernel_lib) dlclose(kernel_lib);
+            // Note: Don't dlclose here either - same safety concern as destructor
             kernel_lib = other.kernel_lib;
             launch_fn = other.launch_fn;
             tagHostDevice = other.tagHostDevice; dimy = other.dimy; tagI = other.tagI;
@@ -190,10 +190,28 @@ bool is_kernel_registered(uint64_t kernel_id) {
     if (err != cudaSuccess) {
         return false;  // CUDA not available or context issue
     }
-
+    
     std::shared_lock lock(g_registry_mutex);  // Reader lock
     uint64_t key = make_registry_key(kernel_id, device_id);
     return g_kernel_registry.find(key) != g_kernel_registry.end();
+}
+
+// Check if kernel is registered on ALL available devices
+bool is_kernel_registered_all_devices(uint64_t kernel_id) {
+    int num_devices;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if (err != cudaSuccess || num_devices == 0) {
+        return false;
+    }
+    
+    std::shared_lock lock(g_registry_mutex);
+    for (int dev = 0; dev < num_devices; dev++) {
+        uint64_t key = make_registry_key(kernel_id, dev);
+        if (g_kernel_registry.find(key) == g_kernel_registry.end()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Check if kernel is registered for a SPECIFIC device
@@ -224,7 +242,7 @@ int get_kernel_dimout(uint64_t kernel_id) {
     int device_id;
     cudaError_t err = cudaGetDevice(&device_id);
     if (err != cudaSuccess) return -1;
-
+    
     std::shared_lock lock(g_registry_mutex);
     uint64_t key = make_registry_key(kernel_id, device_id);
     auto it = g_kernel_registry.find(key);
@@ -235,32 +253,41 @@ int get_kernel_dimout(uint64_t kernel_id) {
 }
 
 void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
-    // Get current device - kernel will be registered for THIS device
-    int device_id;
-    cudaError_t cuda_err = cudaGetDevice(&device_id);
-    if (cuda_err != cudaSuccess) {
-        throw std::runtime_error("Failed to get CUDA device: " + std::string(cudaGetErrorString(cuda_err)));
+    // Get number of available devices
+    int num_devices;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if (err != cudaSuccess || num_devices == 0) {
+        throw std::runtime_error("No CUDA devices available");
     }
 
-    uint64_t key = make_registry_key(kernel_id, device_id);
+    // Save current device to restore later
+    int original_device;
+    cudaGetDevice(&original_device);
 
-    // Check if already registered (with reader lock first for fast path)
-    {
+    // Check if already registered on ALL devices
+    bool all_registered = true;
+    for (int dev = 0; dev < num_devices; dev++) {
+        uint64_t key = make_registry_key(kernel_id, dev);
         std::shared_lock read_lock(g_registry_mutex);
-        if (g_kernel_registry.find(key) != g_kernel_registry.end()) {
-            return;  // Already registered
+        if (g_kernel_registry.find(key) == g_kernel_registry.end()) {
+            all_registered = false;
+            break;
         }
     }
+    
+    if (all_registered) {
+        return;  // Already registered on all devices
+    }
 
-    // Need to register - prepare info outside the lock
+    // Need to register - prepare info (shared across all devices)
     auto info = std::make_shared<KeOpsKernelInfo>();
-
+    
     {
         nb::gil_scoped_acquire gil;
 
         try {
             std::string kernel_path = nb::cast<std::string>(myconv.attr("kernel_so_path"));
-
+            
             // Use RTLD_DEEPBIND for multi-GPU symbol isolation
             // Use RTLD_NODELETE to prevent unloading (GPU may reference code asynchronously)
             info->kernel_lib = dlopen(kernel_path.c_str(), RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND | RTLD_NODELETE);
@@ -302,30 +329,35 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
         }
     }
 
-    // Now acquire exclusive lock to insert
+    // Register on ALL devices (shared_ptr allows sharing the same info)
     {
         std::unique_lock write_lock(g_registry_mutex);
-
-        // Double-check (another thread may have registered while we prepared)
-        if (g_kernel_registry.find(key) != g_kernel_registry.end()) {
-            return;  // Another thread beat us
-        }
-
+        
         // Check cache size and evict if needed
         if (g_kernel_registry.size() >= MAX_KERNEL_CACHE_SIZE) {
             g_kernel_registry.clear();
+            g_registry_version.fetch_add(1, std::memory_order_release);
             if (KEOPS_DEBUG) {
                 std::cout << "[KeOps] Registry cache full, cleared all kernels" << std::endl;
             }
         }
-
-        g_kernel_registry[key] = std::move(info);
+        
+        // Register for each device
+        for (int dev = 0; dev < num_devices; dev++) {
+            uint64_t key = make_registry_key(kernel_id, dev);
+            if (g_kernel_registry.find(key) == g_kernel_registry.end()) {
+                g_kernel_registry[key] = info;  // Shared ptr - same info for all devices
+                if (KEOPS_DEBUG) {
+                    std::cout << "[KeOps] Registered kernel " << kernel_id << " for device " << dev << std::endl;
+                }
+            }
+        }
+        
         g_registry_version.fetch_add(1, std::memory_order_release);
     }
 
-    if (KEOPS_DEBUG) {
-        std::cout << "[KeOps] Registered kernel " << kernel_id << " for device " << device_id << std::endl;
-    }
+    // Restore original device
+    cudaSetDevice(original_device);
 }
 
 // =============================================================================
@@ -362,7 +394,7 @@ ffi::Error KeOpsKernelImpl(
     } else {
         // Slow path: hash map lookup with reader lock
         std::shared_lock lock(g_registry_mutex);
-
+        
         uint64_t key = make_registry_key(kid, device_id);
         auto it = g_kernel_registry.find(key);
         if (it == g_kernel_registry.end()) {
@@ -459,7 +491,7 @@ ffi::Error KeOpsKernelImpl(
     );
 
     if (result != 0) return ffi::Error::Internal("Kernel launch failed: " + std::to_string(result));
-
+    
     cuda_err = cudaGetLastError();
     if (cuda_err != cudaSuccess) {
         return ffi::Error::Internal("CUDA error: " + std::string(cudaGetErrorString(cuda_err)));
@@ -485,9 +517,11 @@ template <typename T> nb::capsule EncapsulateFfiCall(T *fn) {
 
 NB_MODULE(keops_jax_ext, m) {
     m.def("register_keops_kernel", &register_keops_kernel,
-          "Register a KeOps kernel for the current CUDA device");
+          "Register a KeOps kernel for ALL available CUDA devices");
     m.def("is_kernel_registered", &is_kernel_registered,
           "Check if kernel is registered for the current device");
+    m.def("is_kernel_registered_all_devices", &is_kernel_registered_all_devices,
+          "Check if kernel is registered on all available devices");
     m.def("is_kernel_registered_on_device", &is_kernel_registered_on_device,
           "Check if kernel is registered for a specific device");
     m.def("cleanup_all_kernels", &cleanup_all_kernels,
