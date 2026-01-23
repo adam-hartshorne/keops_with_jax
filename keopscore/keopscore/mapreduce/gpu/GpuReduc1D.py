@@ -2,7 +2,7 @@ import os
 
 # JAX multi-GPU patch: use CMake backend instead of NVRTC
 if os.environ.get("PYKEOPS_JAX_MODE") == "1":
-    from keopscore.binders.cpp.Gpu_link_compile import Gpu_link_compile
+    from keopscore.binders.cpp.Cuda_link_compile import Cuda_link_compile as Gpu_link_compile
 else:
     from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
 

@@ -21,6 +21,10 @@ class LoadKeOps_cpp_class(LoadKeOps):
         if os.environ.get("PYKEOPS_JAX_MODE") == "1":
             return  # Skip init_phase1 for JAX
 
+        # if getattr(self.params, 'lang', None) == 'jax':
+        #     return  # Skip pybind11 wrapper for JAX
+
+
         srcname = pykeops_cpp_name(tag=self.params.tag, extension=".cpp")
 
         dllname = pykeops_cpp_name(
@@ -43,10 +47,12 @@ class LoadKeOps_cpp_class(LoadKeOps):
     def init_phase2(self):
         # In JAX mode, skip Python wrapper loading
         if os.environ.get("PYKEOPS_JAX_MODE") == "1":
-            # Store the .so path for JAX FFI to use
-            # The actual kernel .so file is at source_name.replace('.cpp', '.so')
             self.kernel_so_path = self.params.source_name.replace('.cpp', '.so')
             return  # Skip init_phase2 for JAX
+
+        # if getattr(self.params, 'lang', None) == 'jax':
+        #     self.kernel_so_path = self.params.source_name.replace('.cpp', '.so')
+        #     return  # Skip pybind11 wrapper loading for JAX
 
         import importlib
 
