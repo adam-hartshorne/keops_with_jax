@@ -44,6 +44,7 @@ setup(
         "keopscore",
         "keopscore.binders",
         "keopscore.binders.cpp",
+        "keopscore.binders.cuda",
         "keopscore.binders.nvrtc",
         "keopscore.config",
         "keopscore.formulas",
