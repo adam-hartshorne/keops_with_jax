@@ -5,8 +5,6 @@ This module supports both NVRTC (for PyTorch/NumPy) and CMake/CUDA (for JAX)
 backends, selected at runtime based on the `lang` parameter.
 """
 
-import os
-
 # Import BOTH backends at module level for runtime selection
 from keopscore.binders.cuda.Cuda_link_compile import Cuda_link_compile
 from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile as Nvrtc_link_compile
@@ -18,19 +16,7 @@ from keopscore.utils.code_gen_utils import (
     c_array,
 )
 
-
-def _use_cuda_backend(lang):
-    """
-    Determine if we should use CUDA/CMake backend instead of NVRTC.
-
-    Args:
-        lang: Language/frontend being used ("torch", "numpy", "jax", or None)
-
-    Returns:
-        True if CUDA/CMake backend should be used (for JAX or when env var is set),
-        False for NVRTC backend (default for PyTorch/NumPy).
-    """
-    return (lang == "jax")
+from keopscore.mapreduce.gpu.gpu_utils import use_cuda_backend
 
 
 class GpuReduc1D_Cuda(MapReduce, Cuda_link_compile):
@@ -161,7 +147,7 @@ class GpuReduc1D:
             lang: Language/frontend being used ("torch", "numpy", "jax", or None).
                   JAX requires CMake backend instead of NVRTC for multi-GPU support.
         """
-        if _use_cuda_backend(lang):
+        if use_cuda_backend(lang):
             return GpuReduc1D_Cuda(*args, lang=lang)
         else:
             return GpuReduc1D_Nvrtc(*args, lang=lang)

@@ -26,7 +26,7 @@ class LinkCompile:
 
         # N.B. Here self is assumed to be populated by the __init__ of one of the MapReduce classes
 
-        # Recalculate flags in case config.use_nvrtc changed above
+        # # Get current cpp flags for hash calculation
         current_cpp_flags = config.get_cpp_flags()
 
         # we create the hash string id corresponding to all parameters
@@ -68,17 +68,16 @@ class LinkCompile:
 
     def save_info(self):
         # create info_file to save some parameters
-        f = open(self.info_file, "w")
-        f.write(
-            f"red_formula={self.red_formula_string}\ndim={self.dim}\ntagI={self.tagI}\ndimy={self.dimy}"
-        )
-        f.close()
+        with open(self.info_file, "w") as f:
+            f.write(
+                f"red_formula={self.red_formula_string}\ndim={self.dim}\ntagI={self.tagI}\ndimy={self.dimy}"
+            )
 
     def read_info(self):
         # read info_file to retreive dim, tagI, dimy
-        f = open(self.info_file, "r")
-        string = f.read()
-        f.close()
+        with open(self.info_file, "r") as f:
+            string = f.read()
+
         tmp = string.split("\n")
         if len(tmp) != 4:
             KeOps_Error("Incorrect info file")
@@ -102,9 +101,8 @@ class LinkCompile:
 
     def write_code(self):
         # write the generated code in the source file
-        f = open(self.gencode_file, "w")
-        f.write(self.code)
-        f.close()
+        with open(self.gencode_file, "w") as f:
+            f.write(self.code)
 
     def generate_code(self):
         pass

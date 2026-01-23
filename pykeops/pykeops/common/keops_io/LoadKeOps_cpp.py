@@ -28,9 +28,8 @@ class LoadKeOps_cpp_class(LoadKeOps):
         )
 
         if not os.path.exists(dllname):
-            f = open(srcname, "w")
-            f.write(self.get_pybind11_code())
-            f.close()
+            with open(srcname, "w") as f:
+                f.write(self.get_pybind11_code())
             compile_command = f"{pykeopsconfig.pykeops_base.get_cxx_compiler()} {pykeopsconfig.pykeops_base.get_cpp_flags()} {python_includes} {srcname} -o {dllname}"
             pyKeOps_Message(
                 "Compiling pykeops cpp " + self.params.tag + " module ... ",

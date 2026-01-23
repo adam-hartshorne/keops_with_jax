@@ -20,9 +20,8 @@ class Cache:
         if use_cache_file:
             self.cache_file = os.path.join(save_folder, fun.__name__ + "_cache.pkl")
             if os.path.isfile(self.cache_file) and os.path.getsize(self.cache_file) > 0:
-                f = open(self.cache_file, "rb")
-                self.library = pickle.load(f)
-                f.close()
+                with open(self.cache_file, "rb") as f:
+                    self.library = pickle.load(f)
             import atexit
 
             atexit.register(self.save_cache)
@@ -41,9 +40,8 @@ class Cache:
             self.save_folder = new_save_folder
 
     def save_cache(self):
-        f = open(self.cache_file, "wb")
-        pickle.dump(self.library, f)
-        f.close()
+        with open(self.cache_file, "wb") as f:
+            pickle.dump(self.library, f)
 
 
 class Cache_partial:
@@ -74,9 +72,8 @@ class Cache_partial:
         if self.use_cache_file:
             self.cache_file = os.path.join(save_folder, cls.__name__ + "_cache.pkl")
             if os.path.isfile(self.cache_file):
-                f = open(self.cache_file, "rb")
-                self.library_params = pickle.load(f)
-                f.close()
+                with open(self.cache_file, "rb") as f:
+                    self.library_params = pickle.load(f)
             else:
                 self.library_params = {}
             import atexit
@@ -108,6 +105,5 @@ class Cache_partial:
             self.save_folder = new_save_folder
 
     def save_cache(self):
-        f = open(self.cache_file, "wb")
-        pickle.dump(self.library_params, f)
-        f.close()
+        with open(self.cache_file, "wb") as f:
+            pickle.dump(self.library_params, f)

@@ -16,6 +16,8 @@ This is the main entry point for all binders. It takes as inputs :
   - use_half : 0 or 1, for Gpu mode only, enable special routines for half-precision data type
   - use_fast_math : 0 or 1, for Gpu mode only, enable -use_fast_math Cuda option (faster but less accurate)
   - device_id : integer, for Gpu mode only, id of Gpu device to build the code for
+  - lang : string or None, optional, specifies the frontend language ("torch", "numpy", "jax", or None).
+           JAX requires the CMake/CUDA backend instead of NVRTC for multi-GPU support.
 
 It returns
       - tag : string, hash code used as id for the input formula and parameters
