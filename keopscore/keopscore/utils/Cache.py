@@ -86,7 +86,7 @@ class Cache_partial:
     def __call__(self, *args, **kwargs):
         # Include kwargs in the cache key for proper cache separation
         kwargs_str = "".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
-        str_id = "".join(list(str(arg) for arg in args)) + kwargs_str + str(env_param)
+        str_id = "".join(list(str(arg) for arg in args)) + kwargs_str + str(env_param())
         if not str_id in self.library:
             if self.use_cache_file:
                 if str_id in self.library_params:
