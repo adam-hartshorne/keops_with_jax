@@ -1,2 +1,7 @@
 include readme.md
 include licence.txt
+include pykeops/keops_version
+
+# JAX extension sources
+include pykeops/jax/binders/CMakeLists.txt
+include pykeops/jax/binders/keops_jax.cpp
