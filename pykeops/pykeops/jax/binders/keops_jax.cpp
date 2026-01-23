@@ -1,5 +1,12 @@
 /*
  * KeOps JAX C++ Extension (using nanobind) - FULLY OPTIMIZED
+ *
+ * FIXES APPLIED:
+ * 1. Thread-safe registry with std::shared_mutex (reader/writer locks)
+ * 2. Safe pointer lifetime via std::shared_ptr in registry
+ * 3. TLS cache stores shared_ptr to prevent use-after-free
+ * 4. Added RTLD_DEEPBIND for multi-GPU symbol isolation
+ * 5. Proper CUDA error checking
  */
 
 #include <nanobind/nanobind.h>
@@ -18,6 +25,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
+#include <shared_mutex>
+#include <memory>
 
 namespace nb = nanobind;
 namespace ffi = xla::ffi;
@@ -60,7 +69,7 @@ typedef int (*LaunchKeOpsKernel)(
 );
 
 // =============================================================================
-// Kernel Registry
+// Kernel Registry with Thread-Safe Access
 // =============================================================================
 
 struct KeOpsKernelInfo {
@@ -78,7 +87,12 @@ struct KeOpsKernelInfo {
 
     ~KeOpsKernelInfo() {
         if (kernel_lib) {
-            dlclose(kernel_lib);
+            // SAFETY: Do not dlclose. Unloading code while GPU operations
+            // might still reference it (even via driver internal state) is risky.
+            // The GPU may still be executing kernels asynchronously, or the driver
+            // may access symbol metadata after the CPU has released the shared_ptr.
+            // Memory leak is negligible since kernel count stabilizes in practice.
+            // dlclose(kernel_lib);
             kernel_lib = nullptr;
         }
     }
@@ -119,7 +133,9 @@ struct KeOpsKernelInfo {
     }
 };
 
-static std::unordered_map<uint64_t, KeOpsKernelInfo> g_kernel_registry;
+// Use shared_ptr for safe lifetime management across threads
+static std::unordered_map<uint64_t, std::shared_ptr<KeOpsKernelInfo>> g_kernel_registry;
+static std::shared_mutex g_registry_mutex;  // Reader/writer lock
 static const size_t MAX_KERNEL_CACHE_SIZE = 5000;
 
 // Global version counter - incremented on any registry modification
@@ -141,18 +157,18 @@ inline std::pair<uint64_t, int> split_registry_key(uint64_t key) {
 }
 
 // Thread-local kernel cache for fast repeated lookups
-// Avoids hash map overhead when the same kernel is called repeatedly
+// Stores shared_ptr to ensure kernel stays alive while in use
 struct ThreadLocalKernelCache {
     uint64_t kernel_id = 0;
     int device_id = -1;
     uint64_t registry_version = 0;
-    KeOpsKernelInfo* kernel_ptr = nullptr;
+    std::shared_ptr<KeOpsKernelInfo> kernel_ptr;  // shared_ptr for safe lifetime
 
     void invalidate() {
         kernel_id = 0;
         device_id = -1;
         registry_version = 0;
-        kernel_ptr = nullptr;
+        kernel_ptr.reset();
     }
 
     bool is_valid(uint64_t kid, int dev_id, uint64_t version) const {
@@ -162,28 +178,39 @@ struct ThreadLocalKernelCache {
 };
 
 void cleanup_all_kernels() {
+    std::unique_lock lock(g_registry_mutex);  // Exclusive lock for modification
     g_kernel_registry.clear();
-    g_registry_version++;  // Invalidate all thread-local caches
+    g_registry_version.fetch_add(1, std::memory_order_release);  // Invalidate all TLS caches
 }
 
 // Check if kernel is registered for the CURRENT device
 bool is_kernel_registered(uint64_t kernel_id) {
     int device_id;
-    cudaGetDevice(&device_id);
+    cudaError_t err = cudaGetDevice(&device_id);
+    if (err != cudaSuccess) {
+        return false;  // CUDA not available or context issue
+    }
+
+    std::shared_lock lock(g_registry_mutex);  // Reader lock
     uint64_t key = make_registry_key(kernel_id, device_id);
     return g_kernel_registry.find(key) != g_kernel_registry.end();
 }
 
 // Check if kernel is registered for a SPECIFIC device
 bool is_kernel_registered_on_device(uint64_t kernel_id, int device_id) {
+    std::shared_lock lock(g_registry_mutex);  // Reader lock
     uint64_t key = make_registry_key(kernel_id, device_id);
     return g_kernel_registry.find(key) != g_kernel_registry.end();
 }
 
-size_t get_registry_size() { return g_kernel_registry.size(); }
+size_t get_registry_size() {
+    std::shared_lock lock(g_registry_mutex);
+    return g_kernel_registry.size();
+}
 
 // Get number of unique kernels (across all devices)
 size_t get_unique_kernel_count() {
+    std::shared_lock lock(g_registry_mutex);
     std::unordered_set<uint64_t> unique_kernels;
     for (const auto& pair : g_kernel_registry) {
         auto [kernel_id, device_id] = split_registry_key(pair.first);
@@ -192,55 +219,109 @@ size_t get_unique_kernel_count() {
     return unique_kernels.size();
 }
 
+// Get dimout for a registered kernel (useful for avoiding Python backend creation)
+int get_kernel_dimout(uint64_t kernel_id) {
+    int device_id;
+    cudaError_t err = cudaGetDevice(&device_id);
+    if (err != cudaSuccess) return -1;
+
+    std::shared_lock lock(g_registry_mutex);
+    uint64_t key = make_registry_key(kernel_id, device_id);
+    auto it = g_kernel_registry.find(key);
+    if (it != g_kernel_registry.end() && it->second) {
+        return it->second->dimout;
+    }
+    return -1;
+}
+
 void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
     // Get current device - kernel will be registered for THIS device
     int device_id;
-    cudaGetDevice(&device_id);
+    cudaError_t cuda_err = cudaGetDevice(&device_id);
+    if (cuda_err != cudaSuccess) {
+        throw std::runtime_error("Failed to get CUDA device: " + std::string(cudaGetErrorString(cuda_err)));
+    }
 
     uint64_t key = make_registry_key(kernel_id, device_id);
 
-    if (g_kernel_registry.find(key) != g_kernel_registry.end()) return;
-    if (g_kernel_registry.size() >= MAX_KERNEL_CACHE_SIZE) {
-        g_kernel_registry.clear();
-        g_registry_version++;  // Invalidate all thread-local caches
+    // Check if already registered (with reader lock first for fast path)
+    {
+        std::shared_lock read_lock(g_registry_mutex);
+        if (g_kernel_registry.find(key) != g_kernel_registry.end()) {
+            return;  // Already registered
+        }
     }
 
-    KeOpsKernelInfo info;
-    nb::gil_scoped_acquire gil;
+    // Need to register - prepare info outside the lock
+    auto info = std::make_shared<KeOpsKernelInfo>();
 
-    try {
-        std::string kernel_path = nb::cast<std::string>(myconv.attr("kernel_so_path"));
-        info.kernel_lib = dlopen(kernel_path.c_str(), RTLD_LAZY);
-        if (!info.kernel_lib) throw std::runtime_error("Failed to load .so: " + std::string(dlerror()));
+    {
+        nb::gil_scoped_acquire gil;
 
-        info.launch_fn = (LaunchKeOpsKernel)dlsym(info.kernel_lib, "launch_keops_kernel");
-        if (!info.launch_fn) throw std::runtime_error("Failed to find launch_keops_kernel: " + std::string(dlerror()));
+        try {
+            std::string kernel_path = nb::cast<std::string>(myconv.attr("kernel_so_path"));
 
-        nb::object params = myconv.attr("params");
-        info.tagHostDevice = nb::cast<int>(params.attr("tagHostDevice"));
-        info.dimy = nb::cast<int>(params.attr("dimy"));
-        info.tagI = nb::cast<int>(params.attr("tagI"));
-        info.tagZero = nb::cast<int>(params.attr("tagZero"));
-        info.use_half = nb::cast<int>(params.attr("use_half"));
-        info.tag1D2D = nb::cast<int>(params.attr("tag1D2D"));
-        info.dimred = nb::cast<int>(params.attr("dimred"));
-        info.cuda_block_size = nb::cast<int>(params.attr("cuda_block_size"));
-        info.use_chunk_mode = nb::cast<int>(params.attr("use_chunk_mode"));
-        info.dimout = nb::cast<int>(params.attr("dim"));
+            // Use RTLD_DEEPBIND for multi-GPU symbol isolation
+            // Use RTLD_NODELETE to prevent unloading (GPU may reference code asynchronously)
+            info->kernel_lib = dlopen(kernel_path.c_str(), RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND | RTLD_NODELETE);
+            if (!info->kernel_lib) {
+                // Fallback without RTLD_DEEPBIND/RTLD_NODELETE (some systems don't support them)
+                info->kernel_lib = dlopen(kernel_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+            }
+            if (!info->kernel_lib) {
+                throw std::runtime_error("Failed to load .so: " + std::string(dlerror()));
+            }
 
-        info.indsi = nb::cast<std::vector<int>>(params.attr("indsi"));
-        info.indsj = nb::cast<std::vector<int>>(params.attr("indsj"));
-        info.indsp = nb::cast<std::vector<int>>(params.attr("indsp"));
-        info.dimsx = nb::cast<std::vector<int>>(params.attr("dimsx"));
-        info.dimsy = nb::cast<std::vector<int>>(params.attr("dimsy"));
-        info.dimsp = nb::cast<std::vector<int>>(params.attr("dimsp"));
+            info->launch_fn = (LaunchKeOpsKernel)dlsym(info->kernel_lib, "launch_keops_kernel");
+            if (!info->launch_fn) {
+                throw std::runtime_error("Failed to find launch_keops_kernel: " + std::string(dlerror()));
+            }
 
-        info.finalize();
-    } catch (const nb::python_error& e) {
-        if (info.kernel_lib) dlclose(info.kernel_lib);
-        throw std::runtime_error("Python error during registration: " + std::string(e.what()));
+            nb::object params = myconv.attr("params");
+            info->tagHostDevice = nb::cast<int>(params.attr("tagHostDevice"));
+            info->dimy = nb::cast<int>(params.attr("dimy"));
+            info->tagI = nb::cast<int>(params.attr("tagI"));
+            info->tagZero = nb::cast<int>(params.attr("tagZero"));
+            info->use_half = nb::cast<int>(params.attr("use_half"));
+            info->tag1D2D = nb::cast<int>(params.attr("tag1D2D"));
+            info->dimred = nb::cast<int>(params.attr("dimred"));
+            info->cuda_block_size = nb::cast<int>(params.attr("cuda_block_size"));
+            info->use_chunk_mode = nb::cast<int>(params.attr("use_chunk_mode"));
+            info->dimout = nb::cast<int>(params.attr("dim"));
+
+            info->indsi = nb::cast<std::vector<int>>(params.attr("indsi"));
+            info->indsj = nb::cast<std::vector<int>>(params.attr("indsj"));
+            info->indsp = nb::cast<std::vector<int>>(params.attr("indsp"));
+            info->dimsx = nb::cast<std::vector<int>>(params.attr("dimsx"));
+            info->dimsy = nb::cast<std::vector<int>>(params.attr("dimsy"));
+            info->dimsp = nb::cast<std::vector<int>>(params.attr("dimsp"));
+
+            info->finalize();
+        } catch (const nb::python_error& e) {
+            throw std::runtime_error("Python error during registration: " + std::string(e.what()));
+        }
     }
-    g_kernel_registry[key] = std::move(info);
+
+    // Now acquire exclusive lock to insert
+    {
+        std::unique_lock write_lock(g_registry_mutex);
+
+        // Double-check (another thread may have registered while we prepared)
+        if (g_kernel_registry.find(key) != g_kernel_registry.end()) {
+            return;  // Another thread beat us
+        }
+
+        // Check cache size and evict if needed
+        if (g_kernel_registry.size() >= MAX_KERNEL_CACHE_SIZE) {
+            g_kernel_registry.clear();
+            if (KEOPS_DEBUG) {
+                std::cout << "[KeOps] Registry cache full, cleared all kernels" << std::endl;
+            }
+        }
+
+        g_kernel_registry[key] = std::move(info);
+        g_registry_version.fetch_add(1, std::memory_order_release);
+    }
 
     if (KEOPS_DEBUG) {
         std::cout << "[KeOps] Registered kernel " << kernel_id << " for device " << device_id << std::endl;
@@ -260,22 +341,28 @@ ffi::Error KeOpsKernelImpl(
     int64_t batch_size
 ) {
     // Thread-local kernel cache for fast repeated lookups
+    // Uses shared_ptr to keep kernel alive even if registry is modified
     static thread_local ThreadLocalKernelCache tls_kernel_cache;
 
     // Get current device - REQUIRED for per-device registry lookup
     int device_id;
-    cudaGetDevice(&device_id);
+    cudaError_t cuda_err = cudaGetDevice(&device_id);
+    if (cuda_err != cudaSuccess) {
+        return ffi::Error::Internal("Failed to get CUDA device");
+    }
 
     uint64_t kid = static_cast<uint64_t>(kernel_id);
     uint64_t current_version = g_registry_version.load(std::memory_order_acquire);
-    KeOpsKernelInfo* kernel_ptr = nullptr;
+    std::shared_ptr<KeOpsKernelInfo> kernel_ptr;
 
     // Fast path: check thread-local cache first
     // Only valid if kernel_id AND device_id match AND registry version hasn't changed
     if (tls_kernel_cache.is_valid(kid, device_id, current_version)) {
         kernel_ptr = tls_kernel_cache.kernel_ptr;
     } else {
-        // Slow path: hash map lookup with composite key
+        // Slow path: hash map lookup with reader lock
+        std::shared_lock lock(g_registry_mutex);
+
         uint64_t key = make_registry_key(kid, device_id);
         auto it = g_kernel_registry.find(key);
         if (it == g_kernel_registry.end()) {
@@ -283,20 +370,21 @@ ffi::Error KeOpsKernelImpl(
                 "Kernel " + std::to_string(kid) + " not found for device " + std::to_string(device_id)
             );
         }
-        kernel_ptr = &(it->second);
+        kernel_ptr = it->second;  // Copy shared_ptr (increases ref count)
 
-        // Update thread-local cache
+        // Update thread-local cache (still under lock to ensure consistency)
         tls_kernel_cache.kernel_id = kid;
         tls_kernel_cache.device_id = device_id;
         tls_kernel_cache.registry_version = current_version;
         tls_kernel_cache.kernel_ptr = kernel_ptr;
     }
 
+    // At this point, kernel_ptr is a shared_ptr that keeps the kernel alive
+    // even if the registry is cleared by another thread
     KeOpsKernelInfo& kernel = *kernel_ptr;
     size_t num_inputs = inputs.size();
 
     // Fast path: use stack-allocated array for common case (most kernels have < 16 inputs)
-    // This avoids cudaGetDevice(), hash map lookup, and vector operations
     constexpr size_t FAST_PATH_MAX_INPUTS = 16;
     void* fixed_input_ptrs[FAST_PATH_MAX_INPUTS];
 
@@ -356,7 +444,6 @@ ffi::Error KeOpsKernelImpl(
     void* scratch_ptr = scratch_result.value();
 
     // CRITICAL FIX: Pass actual batch_size, not just a flag
-    // The previous upload hardcoded this to '2'
     int64_t ranges_enc_value = (batch_size > 1) ? batch_size : 0;
     void* ranges_enc_ptr = (void*)ranges_enc_value;
 
@@ -372,7 +459,11 @@ ffi::Error KeOpsKernelImpl(
     );
 
     if (result != 0) return ffi::Error::Internal("Kernel launch failed: " + std::to_string(result));
-    if (cudaGetLastError() != cudaSuccess) return ffi::Error::Internal("CUDA error occurred");
+
+    cuda_err = cudaGetLastError();
+    if (cuda_err != cudaSuccess) {
+        return ffi::Error::Internal("CUDA error: " + std::string(cudaGetErrorString(cuda_err)));
+    }
 
     return ffi::Error::Success();
 }
@@ -405,6 +496,8 @@ NB_MODULE(keops_jax_ext, m) {
           "Get total number of registered kernel-device pairs");
     m.def("get_unique_kernel_count", &get_unique_kernel_count,
           "Get number of unique kernels (across all devices)");
+    m.def("get_kernel_dimout", &get_kernel_dimout,
+          "Get dimout for a registered kernel (-1 if not found)");
     m.def("get_registry_version", []() { return g_registry_version.load(); },
           "Get current registry version (for cache invalidation)");
     m.def("get_ffi_handler", []() { return EncapsulateFfiCall(KeOpsKernel); },

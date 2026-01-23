@@ -1,3 +1,14 @@
+"""
+KeOps GPU Link Compile - CMake-based GPU compilation
+Uses nvcc directly to compile .cu files to .so shared libraries
+
+FIXES APPLIED:
+1. Dtype-aware shared memory size calculation (float32/float64/float16)
+2. Pinned memory for truly async cudaMemcpyAsync
+3. Removed invalid scratch pointer cache assumption
+4. Better error handling
+"""
+
 import os
 import sysconfig
 from os.path import join
@@ -23,7 +34,6 @@ class Gpu_link_compile(LinkCompile):
     ngpu, gpu_props_compile_flags = get_gpu_props
 
     def __init__(self):
-        # checking that the system has a Gpu :
         if not (cuda_available and Gpu_link_compile.ngpu):
             KeOps_Error(
                 "Trying to compile cuda code... but we detected that the system has no properly configured cuda lib."
@@ -31,26 +41,18 @@ class Gpu_link_compile(LinkCompile):
 
         LinkCompile.__init__(self)
 
-        # For CMake compilation, we compile directly to a .so file
-        self.low_level_code_file = "".encode("utf-8")  # Not used in CMake mode
+        self.low_level_code_file = "".encode("utf-8")
 
-        # The actual .so file to be loaded
         self.so_file = os.path.join(
             build_folder,
             self.gencode_filename + sysconfig.get_config_var("SHLIB_SUFFIX"),
         )
 
-        # actual dll to be called
         self.true_dllname = self.so_file
-        # file to check for existence to detect compilation is needed
         self.file_to_check = self.so_file
 
     def save_info(self):
-        """
-        Override save_info to handle missing 'dim' attribute in JAX mode.
-        """
         red_formula = getattr(self, 'red_formula_string', "Unknown")
-        # Fallback logic for 'dim'
         dim = getattr(self, 'dim', getattr(self, 'dimout', getattr(self, 'dimy', 0)))
         tagI = getattr(self, 'tagI', 0)
         dimy = getattr(self, 'dimy', 0)
@@ -62,17 +64,16 @@ class Gpu_link_compile(LinkCompile):
             f.write(info_str)
 
     def generate_code(self):
-        # method to generate the code and compile it
         self.get_code()
-        self.code = self.add_launcher_wrapper(self.code)
+
+        dtype_bytes = self._detect_dtype_bytes(self.code)
+        self.code = self.add_launcher_wrapper(self.code, dtype_bytes=dtype_bytes)
         self.write_code()
 
-        # Compile using nvcc directly
         KeOps_Message("Compiling formula using CMake/nvcc ... ", flush=True, end="")
 
         cuda_include = cuda_config.get_cuda_include_path()
 
-        # Build compile flags
         compile_flags = [
             "nvcc",
             "-shared",
@@ -86,7 +87,6 @@ class Gpu_link_compile(LinkCompile):
         if cuda_include:
             compile_flags.append(f"-I{cuda_include}")
 
-        # Add GPU architecture flags
         gpu_arch_flags = cuda_config.get_gpu_arch_flags()
         if gpu_arch_flags:
             compile_flags.append(gpu_arch_flags)
@@ -94,7 +94,6 @@ class Gpu_link_compile(LinkCompile):
         if Gpu_link_compile.gpu_props_compile_flags:
             compile_flags.append(Gpu_link_compile.gpu_props_compile_flags)
 
-        # Add source and output
         compile_flags.extend([
             self.gencode_file,
             "-o", self.so_file
@@ -109,17 +108,52 @@ class Gpu_link_compile(LinkCompile):
 
         KeOps_Message("OK", use_tag=False, flush=True)
 
-        # retrieve parameters for info file
         self.tagI = getattr(self.red_formula, 'tagI', 0)
         self.dim = getattr(self.red_formula, 'dim', getattr(self.red_formula, 'dimout', 0))
 
-    def add_launcher_wrapper(self, kernel_code):
+    def _detect_dtype_bytes(self, kernel_code):
         """
-        Add a C-compatible launcher function that can be called from C++ via dlopen
+        Get dtype size in bytes for shared memory calculation.
+
+        Uses hybrid approach:
+        1. Try explicit attributes first (cleaner, more reliable if set)
+        2. Fall back to kernel code parsing (robust if attributes missing)
+
+        Returns: 4 (float32), 8 (float64), or 2 (float16)
         """
+        # Method 1: Use explicit attributes (preferred)
+        dtype = getattr(self, "dtype", None)
+        if dtype is not None:
+            dtype_lower = str(dtype).lower()
+            if dtype_lower in ("float64", "double"):
+                return 8
+            elif dtype_lower in ("float16", "half"):
+                return 2
+            elif dtype_lower == "float32":
+                return 4
+
+        # Check use_half flag
+        if getattr(self, "use_half", False):
+            return 2
+
+        # Check use_double flag (if exists)
+        if getattr(self, "use_double", False):
+            return 8
+
+        # Method 2: Fall back to kernel code parsing (robust)
+        if '__TYPEACC__ double' in kernel_code or 'typedef double __TYPE__' in kernel_code:
+            return 8
+        elif '__half' in kernel_code or 'typedef __half __TYPE__' in kernel_code:
+            return 2
+
+        # Default to float32
+        return 4
+
+    def add_launcher_wrapper(self, kernel_code, dtype_bytes=4):
+        """Add a C-compatible launcher function that can be called from C++ via dlopen."""
         is_ranges = "GpuConv1DOnDevice_ranges" in kernel_code
 
-        preamble = """
+        preamble = '''
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <vector>
@@ -129,53 +163,74 @@ class Gpu_link_compile(LinkCompile):
 
 using std::min;
 
+#define KEOPS_DTYPE_BYTES ''' + str(dtype_bytes) + '''
+
 #define CHECK_CUDA_LAUNCH(err) \\
     if (err != cudaSuccess) { \\
         printf("[LAUNCHER] CUDA Error: %s\\n", cudaGetErrorString(err)); \\
         return 1; \\
     }
-"""
+
+struct PinnedBuffer {
+    void* ptr = nullptr;
+    size_t capacity = 0;
+    
+    ~PinnedBuffer() {
+        if (ptr) {
+            cudaFreeHost(ptr);
+            ptr = nullptr;
+        }
+    }
+    
+    void* ensure(size_t needed) {
+        if (needed > capacity) {
+            if (ptr) cudaFreeHost(ptr);
+            // Optimization: Grow geometrically (2x) to avoid frequent re-allocs
+            // when sizes jitter slightly upwards between calls
+            size_t new_cap = needed * 2;
+            cudaError_t err = cudaMallocHost(&ptr, new_cap);
+            if (err != cudaSuccess) {
+                // Fallback to exact size if OOM on 2x allocation
+                new_cap = needed;
+                err = cudaMallocHost(&ptr, new_cap);
+                if (err != cudaSuccess) {
+                    // Last resort: use pageable memory (async becomes sync, but won't crash)
+                    ptr = malloc(needed);
+                    capacity = (ptr) ? needed : 0;
+                    return ptr;
+                }
+            }
+            capacity = new_cap;
+        }
+        return ptr;
+    }
+};
+'''
 
         if is_ranges:
-            launcher_code = preamble + """
-// =============================================================================
-// Launch Parameter Cache - Avoids redundant CPU computation and GPU uploads
-// =============================================================================
-
+            launcher_code = preamble + '''
 struct LaunchCache {
     int nx = -1;
     int ny = -1;
     int batch_size = -1;
     int cuda_block_size = -1;
-
-    // Cached GPU memory (persisted across calls)
-    void* cached_scratch = nullptr;
-    size_t cached_scratch_size = 0;
-
-    // Cached host buffer for args (still need to update args each call)
-    std::vector<char> host_args_buffer;
-
-    // Precomputed sizes
-    size_t offsets_size = 0;
-    size_t lookup_size = 0;
-    size_t slices_size = 0;
-    size_t ranges_size = 0;
-    size_t tables_total_size = 0;  // Everything except args
+    std::vector<char> cached_tables;
+    size_t tables_size = 0;
 
     bool is_valid(int _nx, int _ny, int _batch_size, int _cuda_block_size) const {
         return nx == _nx && ny == _ny && batch_size == _batch_size && 
-               cuda_block_size == _cuda_block_size && cached_scratch != nullptr;
+               cuda_block_size == _cuda_block_size && !cached_tables.empty();
     }
 
     void invalidate() {
         nx = ny = batch_size = cuda_block_size = -1;
-        // Note: We don't free cached_scratch here - it's managed by XLA's scratch allocator
-        cached_scratch = nullptr;
+        cached_tables.clear();
+        tables_size = 0;
     }
 };
 
-// Thread-local cache per device
 static thread_local std::unordered_map<int, LaunchCache> g_launch_caches;
+static thread_local PinnedBuffer g_pinned_buffer;
 
 extern "C" int launch_keops_kernel(
     int tagHostDevice,
@@ -210,7 +265,6 @@ extern "C" int launch_keops_kernel(
     int batch_size = (int)(long long)ranges;
     if (batch_size == 0) batch_size = 1;
 
-    // Unpack variable counts from argshapes parameter
     int64_t var_counts = (int64_t)argshapes;
     int nvi = var_counts & 0xFF;
     int nvj = (var_counts >> 8) & 0xFF;
@@ -236,45 +290,42 @@ extern "C" int launch_keops_kernel(
     }
     int sparse_args_count = max_var_idx + 1;
 
-    // Get device-specific cache
     int device_id;
-    cudaGetDevice(&device_id);
+    cudaError_t cuda_err = cudaGetDevice(&device_id);
+    if (cuda_err != cudaSuccess) {
+        printf("[LAUNCHER] Failed to get CUDA device: %s\\n", cudaGetErrorString(cuda_err));
+        return 1;
+    }
     LaunchCache& cache = g_launch_caches[device_id];
 
     char* device_ptr = (char*)scratch_ptr;
 
-    // Size calculations
     size_t size_offsets = sizeof(signed long int) * nblocks * total_offsets;
     size_t size_lookup  = sizeof(signed long int) * 3 * nblocks;
     size_t size_slices  = sizeof(signed long int) * batch_size;
     size_t size_ranges  = sizeof(signed long int) * 2 * batch_size;
     size_t size_args    = sizeof(float*) * sparse_args_count;
     size_t tables_size  = size_offsets + size_lookup + size_slices + size_ranges;
+    size_t total_upload_size = tables_size + size_args;
 
-    // Device pointers
     signed long int* offsets_d = (signed long int*)(device_ptr);
     signed long int* lookup_d  = (signed long int*)(device_ptr + size_offsets);
     signed long int* slices_x  = (signed long int*)(device_ptr + size_offsets + size_lookup);
     signed long int* ranges_y  = (signed long int*)(device_ptr + size_offsets + size_lookup + size_slices);
     float** args_d             = (float**)(device_ptr + tables_size);
 
-    // Check if we can use cached tables (dimensions unchanged)
-    bool cache_hit = cache.is_valid(nx, ny, batch_size, cuda_block_size) && 
-                     cache.cached_scratch == scratch_ptr;
+    bool cache_hit = cache.is_valid(nx, ny, batch_size, cuda_block_size);
+
+    void* pinned_ptr = g_pinned_buffer.ensure(total_upload_size);
+    if (!pinned_ptr) {
+        printf("[LAUNCHER] Failed to allocate pinned memory\\n");
+        return 1;
+    }
+    char* h_ptr = (char*)pinned_ptr;
 
     if (!cache_hit) {
-        // Cache miss: need to rebuild and upload offset/lookup/slice/range tables
-
-        // Ensure host buffer is large enough for tables
-        static thread_local std::vector<char> host_tables_buffer;
-        if (host_tables_buffer.size() < tables_size) {
-            host_tables_buffer.resize(tables_size * 2);
-        }
-        char* h_ptr = host_tables_buffer.data();
-
         int blocks_per_batch = (nx + blockSize.x - 1) / blockSize.x;
 
-        // Build offsets table
         signed long int* h_offsets = (signed long int*)h_ptr;
         for (int b = 0; b < batch_size; b++) {
             for (int block_in_batch = 0; block_in_batch < blocks_per_batch; block_in_batch++) {
@@ -288,7 +339,6 @@ extern "C" int launch_keops_kernel(
             }
         }
 
-        // Build lookup table
         signed long int* h_lookup = (signed long int*)(h_ptr + size_offsets);
         for (int b = 0; b < batch_size; b++) {
             for (int block_in_batch = 0; block_in_batch < blocks_per_batch; block_in_batch++) {
@@ -301,70 +351,66 @@ extern "C" int launch_keops_kernel(
             }
         }
 
-        // Build slices
         signed long int* h_slices = (signed long int*)(h_ptr + size_offsets + size_lookup);
         for (int b = 0; b < batch_size; b++) { h_slices[b] = b + 1; }
 
-        // Build ranges
         signed long int* h_ranges = (signed long int*)(h_ptr + size_offsets + size_lookup + size_slices);
         for (int b = 0; b < batch_size; b++) { 
             h_ranges[2*b + 0] = b * ny;
             h_ranges[2*b + 1] = (b+1) * ny;
         }
 
-        // Upload tables to GPU
-        cudaMemcpyAsync(device_ptr, h_ptr, tables_size, cudaMemcpyHostToDevice, stream);
-
-        // Update cache
         cache.nx = nx;
         cache.ny = ny;
         cache.batch_size = batch_size;
         cache.cuda_block_size = cuda_block_size;
-        cache.cached_scratch = scratch_ptr;
-        cache.tables_total_size = tables_size;
+        cache.tables_size = tables_size;
+        
+        cache.cached_tables.resize(tables_size);
+        memcpy(cache.cached_tables.data(), h_ptr, tables_size);
+    } else {
+        memcpy(h_ptr, cache.cached_tables.data(), tables_size);
     }
-    // If cache_hit, tables are already on GPU at the right location - skip rebuild & upload!
 
-    // Args ALWAYS need to be updated (data pointers change each call)
-    // But this is much smaller than the full tables
-
-    // Ensure host args buffer is large enough
-    if (cache.host_args_buffer.size() < size_args) {
-        cache.host_args_buffer.resize(size_args * 2);
-    }
-    float** h_args = (float**)cache.host_args_buffer.data();
-
-    // Handle sparse variable indices
-    std::vector<int> all_var_indices;
-    all_var_indices.reserve(nvi + nvj + nvp);
-    for (int i = 0; i < nvi; i++) all_var_indices.push_back(indsi[i]);
-    for (int j = 0; j < nvj; j++) all_var_indices.push_back(indsj[j]);
-    for (int p = 0; p < nvp; p++) all_var_indices.push_back(indsp[p]);
-    std::sort(all_var_indices.begin(), all_var_indices.end());
+    float** h_args = (float**)(h_ptr + tables_size);
 
     float* sparse_buffer[256];
     float** sparse_args = (sparse_args_count <= 256) ? sparse_buffer : new float*[sparse_args_count];
     for (int i = 0; i < sparse_args_count; i++) sparse_args[i] = nullptr;
 
-    for (size_t dense_idx = 0; dense_idx < all_var_indices.size(); dense_idx++) {
+    int all_var_indices[256];
+    int num_vars = nvi + nvj + nvp;
+    int idx = 0;
+    for (int i = 0; i < nvi; i++) all_var_indices[idx++] = indsi[i];
+    for (int j = 0; j < nvj; j++) all_var_indices[idx++] = indsj[j];
+    for (int p = 0; p < nvp; p++) all_var_indices[idx++] = indsp[p];
+    std::sort(all_var_indices, all_var_indices + num_vars);
+
+    for (int dense_idx = 0; dense_idx < num_vars; dense_idx++) {
         sparse_args[all_var_indices[dense_idx]] = args[dense_idx];
     }
 
     memcpy(h_args, sparse_args, size_args);
     if (sparse_args_count > 256) delete[] sparse_args;
 
-    // Upload only args (small, always needed)
-    cudaMemcpyAsync(args_d, h_args, size_args, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(device_ptr, h_ptr, total_upload_size, cudaMemcpyHostToDevice, stream);
 
-    size_t shared_mem = cuda_block_size * dimy * sizeof(float);
+    size_t shared_mem = cuda_block_size * dimy * KEOPS_DTYPE_BYTES;
     GpuConv1DOnDevice_ranges<<<gridSize, blockSize, shared_mem, stream>>>(
         nx, ny, nbatchdims, offsets_d, lookup_d, slices_x, ranges_y, out, args_d);
 
-    return (cudaGetLastError() == cudaSuccess) ? 0 : 1;
+    cuda_err = cudaGetLastError();
+    if (cuda_err != cudaSuccess) {
+        printf("[LAUNCHER] Kernel launch error: %s\\n", cudaGetErrorString(cuda_err));
+        return 1;
+    }
+    return 0;
 }
-"""
+'''
         else:
-            launcher_code = preamble + """
+            launcher_code = preamble + '''
+static thread_local PinnedBuffer g_pinned_buffer;
+
 extern "C" int launch_keops_kernel(
     int tagHostDevice,
     int dimy,
@@ -403,21 +449,24 @@ extern "C" int launch_keops_kernel(
     int nvp = (var_counts >> 16) & 0xFF;
     int total_args = nvi + nvj + nvp;
 
-    size_t shared_mem = cuda_block_size * dimy * sizeof(float);
+    size_t shared_mem = cuda_block_size * dimy * KEOPS_DTYPE_BYTES;
     size_t args_size = sizeof(float*) * total_args;
 
-    // Fast path: use stack buffer for common case (most kernels have < 32 args)
-    constexpr size_t FAST_PATH_MAX_ARGS = 32;
-    float* fixed_args_buffer[FAST_PATH_MAX_ARGS];
-
+    void* pinned_ptr = g_pinned_buffer.ensure(args_size);
     float** h_args;
-    if (total_args <= FAST_PATH_MAX_ARGS) {
-        h_args = fixed_args_buffer;
+    
+    if (pinned_ptr) {
+        h_args = (float**)pinned_ptr;
     } else {
-        // Fallback for unusual kernels
-        static thread_local std::vector<float*> dynamic_args_buffer;
-        dynamic_args_buffer.resize(total_args);
-        h_args = dynamic_args_buffer.data();
+        constexpr size_t FAST_PATH_MAX_ARGS = 32;
+        static thread_local float* fallback_buffer[FAST_PATH_MAX_ARGS];
+        if (total_args <= FAST_PATH_MAX_ARGS) {
+            h_args = fallback_buffer;
+        } else {
+            static thread_local std::vector<float*> dynamic_args_buffer;
+            dynamic_args_buffer.resize(total_args);
+            h_args = dynamic_args_buffer.data();
+        }
     }
 
     memcpy(h_args, args, args_size);
@@ -428,7 +477,12 @@ extern "C" int launch_keops_kernel(
     cudaMemcpyAsync(args_d, h_args, args_size, cudaMemcpyHostToDevice, stream);
     GpuConv1DOnDevice<<<gridSize, blockSize, shared_mem, stream>>>(nx, ny, out, args_d);
 
-    return (cudaGetLastError() == cudaSuccess) ? 0 : 1;
+    cudaError_t cuda_err = cudaGetLastError();
+    if (cuda_err != cudaSuccess) {
+        printf("[LAUNCHER] Kernel launch error: %s\\n", cudaGetErrorString(cuda_err));
+        return 1;
+    }
+    return 0;
 }
-"""
+'''
         return kernel_code + launcher_code

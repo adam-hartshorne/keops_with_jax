@@ -56,9 +56,6 @@ class Genred:
             rec_multVar_highdim: Recursive multVar highdim (for compatibility)
             use_fast_math: Use fast math (for compatibility)
         """
-        # if reduction_op != 'Sum':
-        #     raise NotImplementedError("KeOps JAX: Only 'Sum' reduction currently supported.")
-
         self.formula = formula
         self.aliases = aliases
         self.reduction_op = reduction_op

@@ -1,8 +1,30 @@
+"""
+KeOps JAX LazyTensor implementation
+
+FIXES APPLIED:
+1. Use monotonic counter instead of id() for variable uniqueness
+   (id() can be reused when objects are deallocated)
+"""
+
 import jax.numpy as jnp
+import threading
 
 from pykeops.common.lazy_tensor import GenericLazyTensor, ComplexGenericLazyTensor
 from pykeops.jax.utils import jaxtools
 from pykeops.jax.generic import Genred
+
+# Thread-safe monotonic counter for unique variable IDs
+_var_counter = 0
+_var_counter_lock = threading.Lock()
+
+
+def _get_unique_var_id():
+    """Get a unique variable ID that won't be reused."""
+    global _var_counter
+    with _var_counter_lock:
+        _var_counter += 1
+        # Use a large offset to distinguish from actual indices
+        return _var_counter + 1000000
 
 
 class SafeTools:
@@ -78,7 +100,6 @@ class LazyTensor(GenericLazyTensor):
         return object.__new__(self)
 
     def __init__(self, x=None, axis=None, is_complex=False):
-        # PRIORITY 1: Removed debug prints for cleaner output and tiny perf gain
         self.tools = safe_tools
         self.Genred = Genred
         self.KernelSolve = None
@@ -128,11 +149,14 @@ class LazyTensor(GenericLazyTensor):
                     elif dim_j == 1:
                         x = jnp.squeeze(x, axis=-2)
 
-                # Set basic attributes - CRITICAL: Use id(x) for uniqueness!
+                # Set basic attributes - Use monotonic counter for uniqueness!
                 self.variables = (x,)
                 self.ndim = x.shape[-1]
                 self.axis = axis if axis is not None else (2 if len(x.shape) == 1 else None)
-                self.formula = f"Var({id(x)},{self.ndim},{self.axis})"  # Use id(x) for uniqueness!
+
+                # FIX: Use monotonic counter instead of id(x) to avoid reuse issues
+                unique_id = _get_unique_var_id()
+                self.formula = f"Var({unique_id},{self.ndim},{self.axis})"
 
                 # Set ni/nj
                 if len(x.shape) >= 2:
@@ -156,37 +180,50 @@ class LazyTensor(GenericLazyTensor):
         Convert id-based variable names to index-based names.
 
         When we manually initialize LazyTensors (in except block), we use
-        Var(id(x), dim, cat) for uniqueness. But Genred needs Var(0, dim, cat),
+        Var(unique_id, dim, cat) for uniqueness. But Genred needs Var(0, dim, cat),
         Var(1, dim, cat), etc. This method does the conversion.
         """
         import re
 
         combined = (self.formula or "") + (self.formula2 or "")
 
-        # Build mapping from id(variable) to index
+        # Build mapping from unique_id to index based on variable order
         id_to_idx = {}
         for i, v in enumerate(self.variables):
-            id_to_idx[id(v)] = i
+            # Find the unique ID used for this variable in the formula
+            # We search for Var(large_number, dim, cat) patterns
+            pass  # Will be handled below
 
         # Find all Var IDs in formulas
         var_pattern = r'Var\((\d+),\s*(\d+),\s*(\d+|None)\)'
-        all_var_ids = set()
+
+        # Collect all unique IDs in order of appearance
+        seen_ids = []
         for match in re.finditer(var_pattern, combined):
             var_id = int(match.group(1))
-            all_var_ids.add(var_id)
+            if var_id not in seen_ids:
+                seen_ids.append(var_id)
 
-        # Replace Var(id, dim, cat) with Var(idx, dim, cat)
+        # Build mapping: large IDs (>1000000) are our unique IDs, map to indices
+        id_to_idx = {}
+        idx = 0
+        for var_id in seen_ids:
+            if var_id >= 1000000:  # Our unique IDs start at 1000001
+                id_to_idx[var_id] = idx
+                idx += 1
+
+        # Replace Var(unique_id, dim, cat) with Var(idx, dim, cat)
         def replace_var(match):
             var_id = int(match.group(1))
             dim = match.group(2)
             cat = match.group(3)
 
-            # If small number (<100), assume it's already an index
-            if var_id < 100:
+            # If small number (<1000000), assume it's already an index
+            if var_id < 1000000:
                 return match.group(0)
 
             # Look up index
-            idx = id_to_idx.get(var_id, var_id)
+            idx = id_to_idx.get(var_id, 0)
 
             # Convert None to 2 (Pm)
             if cat == "None":
@@ -210,8 +247,6 @@ class LazyTensor(GenericLazyTensor):
         It creates the Genred operation and executes it.
         """
         import re
-
-        # PRIORITY 1: Removed debug prints
 
         # Convert id-based formulas to index-based
         self.fixvariables()
@@ -256,10 +291,6 @@ class LazyTensor(GenericLazyTensor):
             opt_arg=self.opt_arg,
             formula2=self.formula2
         )
-
-        # CRITICAL: Pass variables directly, not wrapped in a list
-        # The variables are already stored in self.variables
-        # generic_red.py will handle unpacking if needed
 
         # Pass variables directly (not as a list)
         return op(*self.variables)

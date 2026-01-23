@@ -1,6 +1,10 @@
 """
 KeOps JAX generic operations - FULLY OPTIMIZED
-==============================================
+
+FIXES APPLIED:
+1. Use C++ get_kernel_dimout to avoid redundant Python backend creation
+2. Bounded gradient cache with LRU eviction
+3. Thread-safe registration with proper error handling
 """
 
 import os
@@ -16,6 +20,7 @@ import importlib
 import importlib.util
 from functools import lru_cache
 from typing import Tuple, List
+from collections import OrderedDict
 
 # Debug flag
 DEBUG = os.environ.get('JAX_KEOPS_DEBUG', '0') == '1'
@@ -38,6 +43,42 @@ _registration_lock = threading.Lock()
 # Module-level extension cache
 _keops_ext_cache = None
 _keops_ext_lock = threading.Lock()
+
+
+class BoundedLRUCache:
+    """Thread-safe LRU cache with bounded size for gradient ops."""
+
+    def __init__(self, maxsize=256):
+        self.maxsize = maxsize
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                # Move to end (most recently used)
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            return None
+
+    def set(self, key, value):
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            else:
+                if len(self.cache) >= self.maxsize:
+                    # Remove oldest item
+                    self.cache.popitem(last=False)
+                self.cache[key] = value
+
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+
+
+# Global gradient cache with bounded size
+_grad_cache = BoundedLRUCache(maxsize=512)
+
 
 def _get_keops_ext():
     """Get KeOps extension module with caching."""
@@ -88,6 +129,7 @@ def _get_keops_ext():
         _keops_ext_cache = keops_jax_ext
         return _keops_ext_cache
 
+
 # Set up KeOps variable factories
 def Vj_factory(*args):
     if len(args) == 2:
@@ -108,8 +150,10 @@ GetReductionModule.Vi = Vi_factory
 GetReductionModule.Vj = Vj_factory
 GetReductionModule.Pm = Pm_factory
 
+
 def _canon_alias(alias: str) -> str:
     return alias.replace(" ", "")
+
 
 def _parse_aliases(aliases: List[str]) -> Tuple[List[str], List[int], List[int]]:
     """Parse alias strings into variable names, dimensions, and categories."""
@@ -142,6 +186,7 @@ def _parse_aliases(aliases: List[str]) -> Tuple[List[str], List[int], List[int]]
 
     return var_names, var_dims, var_cats
 
+
 @lru_cache(maxsize=1024)
 def _compute_kernel_hash(formula: str, aliases: tuple, reduction_op: str,
                          axis: int, dtype_str: str, batch_key: str, is_grad: bool = False) -> Tuple[int, str]:
@@ -153,6 +198,7 @@ def _compute_kernel_hash(formula: str, aliases: tuple, reduction_op: str,
     target_prefix = "keops_jax_grad" if is_grad else "keops"
     target_name = f"{target_prefix}_{kernel_hash[:16]}"
     return kernel_id, target_name
+
 
 @lru_cache(maxsize=2048)
 def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
@@ -223,15 +269,15 @@ def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
                     return (args_shapes[i][0], dimout)
             return (args_shapes[0][0], dimout)
 
+
 def _compute_output_shape(args, var_cats, axis, dimout, target_cat=None):
     """Wrapper for cached shape computation."""
     args_shapes = tuple(tuple(arg.shape) for arg in args)
     return _compute_output_shape_cached(args_shapes, tuple(var_cats), axis, dimout, target_cat)
 
+
 def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dtype_str, input_dim, var_cat, enable_vjp=True):
-    """
-    Create gradient operator.
-    """
+    """Create gradient operator."""
 
     def grad_op_impl(*args):
         first_shape = args[0].shape
@@ -308,8 +354,10 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
 
     return grad_op_with_vjp
 
+
 def _patch_nvcc_flags():
     os.environ["PYKEOPS_JAX_MODE"] = "1"
+
 
 def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_args, apply_axis_flip=True, use_ranges=False):
     from pykeops.common.keops_io import keops_binder
@@ -328,17 +376,16 @@ def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_a
         reduction_formula_str, aliases, len(jax_args), dtype_str, "jax",
         {
             'dtype_acc': dtype_str,
-            'sum_scheme': 'block_sum',  # <--- CRITICAL FIX: direct_sum forces atomic adds
+            'sum_scheme': 'block_sum',
             'enable_chunks': False,
             'use_fast_math': True,
             'multVar_highdim': False
         }
     ).import_module()
 
+
 def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str, axis: int, dtype_str: str, enable_vjp: bool = True, max_order: int = 2):
-    """
-    Creates a JAX op for KeOps kernel with FULLY OPTIMIZED gradient computation.
-    """
+    """Creates a JAX op for KeOps kernel with FULLY OPTIMIZED gradient computation."""
     _patch_nvcc_flags()
     var_names, var_dims, var_cats = _parse_aliases(list(aliases))
 
@@ -386,7 +433,7 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                 'kernel_id': kernel_id,
                 'target_name': target_name,
                 'registered': False,
-                'dimout': None,  # Cached after first registration
+                'dimout': None,
             }
 
         ffi_state = kernel_cache[batch_key]
@@ -394,7 +441,6 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
         target_name = ffi_state['target_name']
 
         def ffi_wrapper(*jax_args):
-            # Fast path: use cached dimout if available
             dimout = ffi_state.get('dimout')
 
             if not ffi_state['registered']:
@@ -403,46 +449,49 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                         keops_jax_ext = _get_keops_ext()
                         is_batched_inner = len(jax_args[0].shape) == 3
 
-                        # Check if kernel already registered (e.g., from another thread)
                         already_registered = (
                             hasattr(keops_jax_ext, 'is_kernel_registered') and
                             keops_jax_ext.is_kernel_registered(kernel_id)
                         )
 
-                        # Create backend to get dimout (needed for output shape)
-                        # Note: This is required even if kernel is registered elsewhere,
-                        # because we need dimout to compute the output shape.
-                        # Future optimization: store dimout in C++ registry.
-                        myconv_orig = _create_keops_backend(
-                            formula, list(aliases), reduction_op, axis, dtype_str,
-                            jax_args, use_ranges=is_batched_inner
-                        )
+                        # OPTIMIZATION: Try to get dimout from C++ first
+                        if already_registered and hasattr(keops_jax_ext, 'get_kernel_dimout'):
+                            cached_dimout = keops_jax_ext.get_kernel_dimout(kernel_id)
+                            if cached_dimout > 0:
+                                dimout = cached_dimout
+                                ffi_state['dimout'] = dimout
+                                ffi_state['registered'] = True
+                                # Skip Python backend creation entirely!
 
-                        # Extract and cache dimout
-                        dimout = getattr(myconv_orig, 'dim', getattr(myconv_orig, 'dimout', 1))
-                        ffi_state['dimout'] = dimout
+                        if not ffi_state['registered']:
+                            # Need to create backend (either for registration or to get dimout)
+                            myconv_orig = _create_keops_backend(
+                                formula, list(aliases), reduction_op, axis, dtype_str,
+                                jax_args, use_ranges=is_batched_inner
+                            )
 
-                        # Register kernel if not already done
-                        if not already_registered:
-                            try:
-                                keops_jax_ext.register_keops_kernel(kernel_id, myconv_orig)
-                                jax.ffi.register_ffi_target(
-                                    target_name,
-                                    keops_jax_ext.get_ffi_handler(),
-                                    platform="CUDA"
-                                )
-                            except Exception as e:
-                                raise RuntimeError(
-                                    f"[KeOps JAX] Kernel registration failed.\n"
-                                    f"  Formula: {formula}\n"
-                                    f"  Aliases: {aliases}\n"
-                                    f"  Target: {target_name}\n"
-                                    f"  Original error: {e}"
-                                ) from e
+                            dimout = getattr(myconv_orig, 'dim', getattr(myconv_orig, 'dimout', 1))
+                            ffi_state['dimout'] = dimout
 
-                        ffi_state['registered'] = True
+                            if not already_registered:
+                                try:
+                                    keops_jax_ext.register_keops_kernel(kernel_id, myconv_orig)
+                                    jax.ffi.register_ffi_target(
+                                        target_name,
+                                        keops_jax_ext.get_ffi_handler(),
+                                        platform="CUDA"
+                                    )
+                                except Exception as e:
+                                    raise RuntimeError(
+                                        f"[KeOps JAX] Kernel registration failed.\n"
+                                        f"  Formula: {formula}\n"
+                                        f"  Aliases: {aliases}\n"
+                                        f"  Target: {target_name}\n"
+                                        f"  Original error: {e}"
+                                    ) from e
 
-            # Safety fallback: if dimout is still None (shouldn't happen, but be defensive)
+                            ffi_state['registered'] = True
+
             if dimout is None:
                 dimout = ffi_state.get('dimout', 1)
 
@@ -485,10 +534,10 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
         formula_key = id(keops_jax_op)
         cache_key = (formula_key, eta_dim, tuple(arg.shape for arg in args))
 
-        if not hasattr(keops_jax_op_bwd, '_grad_cache'):
-            keops_jax_op_bwd._grad_cache = {}
+        # Use bounded global cache instead of unbounded function attribute
+        cached = _grad_cache.get(cache_key)
 
-        if cache_key not in keops_jax_op_bwd._grad_cache:
+        if cached is None:
             compiled_grads = []
             for grad_info in precomputed_grads:
                 grad_aliases = grad_info['grad_aliases_base'].copy()
@@ -511,12 +560,12 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                     'var_cat': grad_info['var_cat']
                 })
 
-            keops_jax_op_bwd._grad_cache[cache_key] = compiled_grads
+            _grad_cache.set(cache_key, compiled_grads)
+            cached = compiled_grads
 
-        compiled_grads = keops_jax_op_bwd._grad_cache[cache_key]
         results = []
 
-        for i, grad_info in enumerate(compiled_grads):
+        for i, grad_info in enumerate(cached):
             grad_op = grad_info['grad_op']
             var_cat = grad_info['var_cat']
             raw_grad = grad_op(*args_with_eta)
@@ -545,23 +594,29 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
     keops_jax_op.defvjp(keops_jax_op_fwd, keops_jax_op_bwd)
     return keops_jax_op
 
+
 def keops_reduction(formula, aliases, reduction_op='Sum', axis=0, dtype='float32', enable_vjp=True):
     return make_keops_jax_op(formula, aliases, reduction_op, axis, dtype, enable_vjp)
+
 
 def cleanup_registry():
     try:
         keops_jax_ext = _get_keops_ext()
         keops_jax_ext.cleanup_all_kernels()
+        _grad_cache.clear()
     except Exception:
         pass
+
 
 def get_registry_info():
     try:
         keops_jax_ext = _get_keops_ext()
         return {
             'num_kernels': keops_jax_ext.get_registry_size(),
+            'unique_kernels': keops_jax_ext.get_unique_kernel_count() if hasattr(keops_jax_ext, 'get_unique_kernel_count') else 'N/A',
             'max_kernels': 5000,
-            'note': 'Fully optimized: C++ scratch calculation + pre-compiled gradients'
+            'grad_cache_size': len(_grad_cache.cache),
+            'note': 'Thread-safe registry with shared_ptr lifetime management'
         }
     except Exception:
         return {
