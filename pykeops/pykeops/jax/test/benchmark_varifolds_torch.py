@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-KeOps PyTorch Reference Tests & Benchmarks
-
-Tests KeOps operations using PyTorch and saves results for comparison with JAX.
-"""
-
 import argparse
 import time
 import json
@@ -13,7 +7,7 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 import torch
-from pykeops.torch import LazyTensor
+from pykeops.torch import LazyTensor, Genred
 
 
 @dataclass
@@ -34,9 +28,9 @@ class BenchmarkResult:
 
 def create_test_data(N: int, M: int, D: int, batch_size: int = 1, dtype=torch.float32, device='cuda:0', seed=42) -> \
 Dict[str, torch.Tensor]:
+    # CRITICAL: Reset seed every time so JAX and PyTorch generate identical numbers
     np.random.seed(seed)
 
-    # Generate numpy data
     if batch_size > 1:
         x_np = np.random.randn(batch_size, N, D).astype(np.float32)
         y_np = np.random.randn(batch_size, M, D).astype(np.float32)
@@ -52,7 +46,6 @@ Dict[str, torch.Tensor]:
         u_np /= np.linalg.norm(u_np, axis=-1, keepdims=True)
         v_np /= np.linalg.norm(v_np, axis=-1, keepdims=True)
 
-    # To Torch
     to_dev = lambda x: torch.from_numpy(x).to(device=device, dtype=dtype).requires_grad_(True)
 
     sigma_spatial, sigma_normal = 0.5, 1.0
@@ -65,44 +58,84 @@ Dict[str, torch.Tensor]:
     }
 
 
+# --- LazyTensor Implementations ---
+
 def varifold_kernel_lazytensor(xx, yy, uu, vv, gamma, gamma_1):
     if xx.dim() == 3:
+        # Batched (B, N, D)
         x, y = LazyTensor(xx[:, :, None, :]), LazyTensor(yy[:, None, :, :])
         u, v = LazyTensor(uu[:, :, None, :]), LazyTensor(vv[:, None, :, :])
+        # In KeOps LazyTensor with batches (B, N, M), reduction over M is axis=2
+        reduction_axis = 2
     else:
+        # Unbatched (N, D)
         x, y = LazyTensor(xx[:, None, :]), LazyTensor(yy[None, :, :])
         u, v = LazyTensor(uu[:, None, :]), LazyTensor(vv[None, :, :])
+        # In KeOps LazyTensor (N, M), reduction over M is axis=1
+        reduction_axis = 1
 
     D2 = x.sqdist(y)
     ss = (u * v).sum(-1)
-    return ((-D2 * gamma).exp() * (ss * gamma_1).exp()).sum(axis=1)
+    return ((-D2 * gamma).exp() * (ss * gamma_1).exp()).sum(axis=reduction_axis)
 
 
 def gaussian_kernel_lazytensor(x, y, gamma):
     if x.dim() == 3:
         x_i, y_j = LazyTensor(x[:, :, None, :]), LazyTensor(y[:, None, :, :])
+        reduction_axis = 2
     else:
         x_i, y_j = LazyTensor(x[:, None, :]), LazyTensor(y[None, :, :])
-    return ((-x_i.sqdist(y_j) * gamma).exp()).sum(axis=1)
+        reduction_axis = 1
+    return ((-x_i.sqdist(y_j) * gamma).exp()).sum(axis=reduction_axis)
+
+
+# --- Genred Implementations ---
+
+def varifold_kernel_genred(xx, yy, uu, vv, gamma, gamma_1):
+    D = xx.shape[-1]
+    formula = "Exp(-g * SqDist(x, y)) * Exp(g1 * (u | v))"
+    aliases = [
+        f"x = Vi({D})", f"y = Vj({D})",
+        f"u = Vi({D})", f"v = Vj({D})",
+        "g = Pm(1)", "g1 = Pm(1)"
+    ]
+    # axis=1 means sum over j
+    genred_fn = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    return genred_fn(xx, yy, uu, vv, gamma.view(1), gamma_1.view(1))
+
+
+def gaussian_kernel_genred(x, y, gamma):
+    D = x.shape[-1]
+    formula = "Exp(-g * SqDist(x, y))"
+    aliases = [f"x = Vi({D})", f"y = Vj({D})", "g = Pm(1)"]
+    genred_fn = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    return genred_fn(x, y, gamma.view(1))
 
 
 def benchmark_forward(kernel_fn, inputs, num_warmup=5, num_runs=20):
     device = next(iter(inputs.values())).device
 
-    # Warmup
     for _ in range(num_warmup):
         _ = kernel_fn(**inputs)
         if device.type == 'cuda': torch.cuda.synchronize()
 
-    # Benchmark
     times = []
     for _ in range(num_runs):
-        if device.type == 'cuda': torch.cuda.synchronize()  # Barrier before start
+        if device.type == 'cuda': torch.cuda.synchronize()
         start = time.perf_counter()
         result = kernel_fn(**inputs)
         if device.type == 'cuda': torch.cuda.synchronize()
         end = time.perf_counter()
         times.append((end - start) * 1000)
+
+    # Standardize result shape
+    # FIX: Use first available tensor to check dimension
+    first_input = next(iter(inputs.values()))
+
+    if result.dim() == 3 and result.shape[-1] == 1:
+        result = result.squeeze(-1)
+    elif result.dim() == 2 and result.shape[-1] == 1 and first_input.dim() == 2:
+        result = result.squeeze(-1)
 
     return result, np.mean(times), np.std(times)
 
@@ -123,7 +156,7 @@ def benchmark_gradient(kernel_fn, inputs, num_warmup=5, num_runs=20):
     times, grad_norm = [], 0.0
     for _ in range(num_runs):
         zero_grads()
-        if device.type == 'cuda': torch.cuda.synchronize()  # Barrier before start
+        if device.type == 'cuda': torch.cuda.synchronize()
         start = time.perf_counter()
         kernel_fn(**inputs).sum().backward()
         if device.type == 'cuda': torch.cuda.synchronize()
@@ -147,6 +180,13 @@ def run_benchmark(name, kernel_fn, N, M, D, batch_size=1, num_warmup=5, num_runs
         inputs = {'x': data['x'], 'y': data['y'], 'gamma': data['gamma_spatial']}
 
     result, fwd_ms, fwd_std = benchmark_forward(kernel_fn, inputs, num_warmup, num_runs)
+
+    # --- DEBUG FINGERPRINT ---
+    # Print mean and first element to console for easy comparison
+    res_flat = result.detach().cpu().flatten()
+    print(f"  > FINGERPRINT: Mean={res_flat.mean().item():.5f} | First={res_flat[0].item():.5f}")
+    # -------------------------
+
     print(f"  Forward: {fwd_ms:.3f} ± {fwd_std:.3f} ms")
 
     grad_ms, grad_std, grad_norm = benchmark_gradient(kernel_fn, inputs, num_warmup, num_runs)
@@ -172,17 +212,14 @@ def main():
     num_warmup = 3 if args.quick else 5
     num_runs = 10 if args.quick else 20
 
-    # 1. Standard Sizes
     standard_sizes = [(5000, 100, 3), (10000, 100, 3), (25000, 100, 3), (50000, 100, 3)]
 
-    # 2. Rectangular Sizes
     rectangular_sizes = [
         (2000, 2000, 3), (5000, 5000, 3), (10000, 10000, 3),
-        (50000, 10000, 3), (200000, 100000, 3)
+        (10000, 20000, 3), (20000, 10000, 3)
     ]
 
-    # 3. Batch Scaling
-    batch_scaling = [1, 10, 100]
+    batch_scaling = [1, 2, 4, 8, 16]
 
     if not args.quick:
         standard_sizes.extend([(75000, 100, 3), (100000, 100, 3)])
@@ -190,29 +227,47 @@ def main():
 
     all_results, all_outputs = {}, {}
 
-    # Run Standard
-    for N, M, D in standard_sizes:
-        res, out = run_benchmark(f"varifold_lazy_N{N}", varifold_kernel_lazytensor, N, M, D, num_warmup=num_warmup,
-                                 num_runs=num_runs, device=device)
-        all_results[res.name], all_outputs[res.name] = asdict(res), out
+    def run_suite(suite_name, sizes, is_batch=False):
+        print(f"\n{'=' * 60}\nSECTION: {suite_name}\n{'=' * 60}")
+        for param in sizes:
+            if is_batch:
+                B = param
+                N, M, D = 5000, 5000, 3
+                suffix = f"batch_B{B}"
+            else:
+                N, M, D = param
+                B = 4 if 'Rectangular' in suite_name else 1
+                suffix = f"rect_N{N}_M{M}" if 'Rectangular' in suite_name else f"N{N}"
 
-        res, out = run_benchmark(f"gaussian_lazy_N{N}", gaussian_kernel_lazytensor, N, M, D, num_warmup=num_warmup,
-                                 num_runs=num_runs, device=device)
-        all_results[res.name], all_outputs[res.name] = asdict(res), out
+            res, out = run_benchmark(f"varifold_lazy_{suffix}", varifold_kernel_lazytensor, N, M, D, batch_size=B,
+                                     num_warmup=num_warmup, num_runs=num_runs, device=device)
+            all_results[res.name], all_outputs[res.name] = asdict(res), out
 
-    # Run Batch Scaling
-    N_fix, M_fix = 5000, 5000
-    for B in batch_scaling:
-        name = f"varifold_batch_B{B}"
-        res, out = run_benchmark(name, varifold_kernel_lazytensor, N_fix, M_fix, 3, batch_size=B, num_warmup=num_warmup,
-                                 num_runs=num_runs, device=device)
-        all_results[res.name], all_outputs[res.name] = asdict(res), out
+            res, out = run_benchmark(f"varifold_genred_{suffix}", varifold_kernel_genred, N, M, D, batch_size=B,
+                                     num_warmup=num_warmup, num_runs=num_runs, device=device)
+            all_results[res.name], all_outputs[res.name] = asdict(res), out
 
-    # Run Rectangular
-    rect_batch = batch_scaling[-1]
+            if 'Rectangular' not in suite_name and not is_batch:
+                res, out = run_benchmark(f"gaussian_lazy_{suffix}", gaussian_kernel_lazytensor, N, M, D, batch_size=B,
+                                         num_warmup=num_warmup, num_runs=num_runs, device=device)
+                all_results[res.name], all_outputs[res.name] = asdict(res), out
+
+                res, out = run_benchmark(f"gaussian_genred_{suffix}", gaussian_kernel_genred, N, M, D, batch_size=B,
+                                         num_warmup=num_warmup, num_runs=num_runs, device=device)
+                all_results[res.name], all_outputs[res.name] = asdict(res), out
+
+    run_suite("Standard N-Scaling", standard_sizes)
+    run_suite("Batch Scaling", batch_scaling, is_batch=True)
+
+    rect_B = batch_scaling[-1]
+    print(f"\n{'=' * 60}\nSECTION: Rectangular (Batch={rect_B})\n{'=' * 60}")
     for N, M, D in rectangular_sizes:
-        name = f"varifold_rect_N{N}_M{M}"
-        res, out = run_benchmark(name, varifold_kernel_lazytensor, N, M, D, batch_size=rect_batch,
+        suffix = f"rect_N{N}_M{M}"
+        res, out = run_benchmark(f"varifold_lazy_{suffix}", varifold_kernel_lazytensor, N, M, D, batch_size=rect_B,
+                                 num_warmup=num_warmup, num_runs=num_runs, device=device)
+        all_results[res.name], all_outputs[res.name] = asdict(res), out
+
+        res, out = run_benchmark(f"varifold_genred_{suffix}", varifold_kernel_genred, N, M, D, batch_size=rect_B,
                                  num_warmup=num_warmup, num_runs=num_runs, device=device)
         all_results[res.name], all_outputs[res.name] = asdict(res), out
 

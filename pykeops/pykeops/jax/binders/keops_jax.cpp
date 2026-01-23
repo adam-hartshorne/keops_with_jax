@@ -1,5 +1,5 @@
 /*
- * KeOps JAX C++ Extension (using nanobind) - FULLY OPTIMIZED
+ * KeOps JAX C++ Extension (using nanobind) - FULLY OPTIMIZED + DEBUG
  *
  * Optimizations Applied:
  * 1. XLA Scratch Space API (eliminates allocation overhead)
@@ -263,7 +263,7 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
 }
 
 // =============================================================================
-// OPTIMIZED FFI Handler with C++ Scratch Calculation
+// OPTIMIZED FFI Handler with C++ Scratch Calculation + DEBUG
 // =============================================================================
 
 union RangesEncoding {
@@ -278,13 +278,21 @@ ffi::Error KeOpsKernelImpl(
     ffi::Result<ffi::AnyBuffer> output,
     int64_t kernel_id,
     int64_t batch_size
-    // REMOVED: int64_t max_scratch_bytes - now calculated in C++!
 ) {
+    // DEBUG: Function entry
+    std::cerr << "\n[KEOPS DEBUG] KeOpsKernelImpl called" << std::endl;
+    std::cerr << "  kernel_id: " << kernel_id << std::endl;
+    std::cerr << "  batch_size: " << batch_size << std::endl;
+    std::cerr.flush();
+
     auto it = g_kernel_registry.find(static_cast<uint64_t>(kernel_id));
     if (it == g_kernel_registry.end()) return ffi::Error::InvalidArgument("Kernel not found");
 
     KeOpsKernelInfo& kernel = it->second;
     size_t num_inputs = inputs.size();
+
+    std::cerr << "  num_inputs: " << num_inputs << std::endl;
+    std::cerr.flush();
 
     // PRIORITY 3: Multi-GPU Safety - Device-specific buffers
     // With JAX sharding, same thread can handle multiple devices on different streams
@@ -317,6 +325,22 @@ ffi::Error KeOpsKernelImpl(
 
     void* output_ptr = output->untyped_data();
 
+    // DEBUG: Input buffer dimensions
+    std::cerr << "\n[KEOPS DEBUG] Input buffer dimensions:" << std::endl;
+    for (size_t i = 0; i < std::min(num_inputs, size_t(4)); ++i) {
+        auto buf = inputs.get<ffi::AnyBuffer>(i);
+        if (buf.has_value()) {
+            auto dims = buf->dimensions();
+            std::cerr << "  input[" << i << "]: [";
+            for (size_t d = 0; d < dims.size(); ++d) {
+                std::cerr << dims[d];
+                if (d < dims.size() - 1) std::cerr << ", ";
+            }
+            std::cerr << "]" << std::endl;
+        }
+    }
+    std::cerr.flush();
+
     // OPTIMIZATION: Extract dimensions directly in C++ (saves 10-15μs)
     int nx = 1, ny = 1;
 
@@ -339,6 +363,16 @@ ffi::Error KeOpsKernelImpl(
     int nx_kernel = (kernel.tagI == 1) ? ny : nx;
     int ny_kernel = (kernel.tagI == 1) ? nx : ny;
 
+    // DEBUG: Dimension extraction
+    std::cerr << "\n[KEOPS DEBUG] Extracted dimensions:" << std::endl;
+    std::cerr << "  nx (from buffer): " << nx << std::endl;
+    std::cerr << "  ny (from buffer): " << ny << std::endl;
+    std::cerr << "  tagI: " << kernel.tagI << std::endl;
+    std::cerr << "  nx_kernel (passed to CUDA): " << nx_kernel << std::endl;
+    std::cerr << "  ny_kernel (passed to CUDA): " << ny_kernel << std::endl;
+    std::cerr << "  cuda_block_size: " << kernel.cuda_block_size << std::endl;
+    std::cerr.flush();
+
     // OPTIMIZATION: Calculate scratch size in C++ (eliminates Python overhead)
     int blocks_per_batch = (nx_kernel + kernel.cuda_block_size - 1) / kernel.cuda_block_size;
     size_t nblocks = blocks_per_batch * batch_size;
@@ -354,12 +388,28 @@ ffi::Error KeOpsKernelImpl(
 
     size_t needed_bytes = size_offsets + size_lookup + size_slices + size_ranges + size_args;
 
+    // DEBUG: Scratch buffer calculation
+    std::cerr << "\n[KEOPS DEBUG] Scratch buffer calculation:" << std::endl;
+    std::cerr << "  blocks_per_batch: " << blocks_per_batch << std::endl;
+    std::cerr << "  nblocks (total): " << nblocks << std::endl;
+    std::cerr << "  total_offsets: " << total_offsets << std::endl;
+    std::cerr << "  needed_bytes: " << needed_bytes << " (" << (needed_bytes/1024.0) << " KB)" << std::endl;
+    std::cerr << "    size_offsets: " << size_offsets << " bytes" << std::endl;
+    std::cerr << "    size_lookup:  " << size_lookup << " bytes" << std::endl;
+    std::cerr << "    size_slices:  " << size_slices << " bytes" << std::endl;
+    std::cerr << "    size_ranges:  " << size_ranges << " bytes" << std::endl;
+    std::cerr << "    size_args:    " << size_args << " bytes" << std::endl;
+    std::cerr.flush();
+
     // Request scratch buffer from XLA
     auto scratch_result = scratch.Allocate(needed_bytes);
     if (!scratch_result.has_value()) {
         return ffi::Error::Internal("Scratch allocation failed");
     }
     void* scratch_ptr = scratch_result.value();
+
+    std::cerr << "  scratch_ptr: " << scratch_ptr << std::endl;
+    std::cerr.flush();
 
     // Debug output (only when enabled)
     if (KEOPS_DEBUG) {
@@ -375,7 +425,17 @@ ffi::Error KeOpsKernelImpl(
     ranges_enc.as_int = (batch_size > 1) ? batch_size : 0;
     if (batch_size <= 1) ranges_enc.as_ptr = nullptr;
 
+    // DEBUG: Ranges encoding
+    std::cerr << "\n[KEOPS DEBUG] Ranges encoding:" << std::endl;
+    std::cerr << "  batch_size > 1: " << (batch_size > 1 ? "true" : "false") << std::endl;
+    std::cerr << "  ranges_enc.as_int: " << ranges_enc.as_int << std::endl;
+    std::cerr << "  ranges_enc.as_ptr: " << ranges_enc.as_ptr << std::endl;
+    std::cerr.flush();
+
     void* argshapes_ptr = (void*)kernel.var_counts_packed;
+
+    std::cerr << "\n[KEOPS DEBUG] Calling CUDA kernel..." << std::endl;
+    std::cerr.flush();
 
     int result = kernel.launch_fn(
         kernel.tagHostDevice, kernel.dimy, nx_kernel, ny_kernel, kernel.tagI, kernel.tagZero,
@@ -386,9 +446,17 @@ ffi::Error KeOpsKernelImpl(
         (void*)stream, scratch_ptr
     );
 
-    if (result != 0) return ffi::Error::Internal("Kernel launch failed: " + std::to_string(result));
+    // DEBUG: Kernel result
+    std::cerr << "\n[KEOPS DEBUG] Kernel result:" << std::endl;
+    std::cerr << "  result code: " << result << std::endl;
 
     cudaError_t err = cudaGetLastError();
+    std::cerr << "  CUDA error: " << cudaGetErrorString(err) << " (code " << err << ")" << std::endl;
+    std::cerr << "========================================\n" << std::endl;
+    std::cerr.flush();
+
+    if (result != 0) return ffi::Error::Internal("Kernel launch failed: " + std::to_string(result));
+
     if (err != cudaSuccess) return ffi::Error::Internal(std::string("CUDA error: ") + cudaGetErrorString(err));
 
     return ffi::Error::Success();
@@ -404,7 +472,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>()
         .Attr<int64_t>("kernel_id")
         .Attr<int64_t>("batch_size")
-        // REMOVED: max_scratch_bytes attribute
 );
 
 template <typename T> nb::capsule EncapsulateFfiCall(T *fn) {
