@@ -16,6 +16,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <atomic>
 
 namespace nb = nanobind;
 namespace ffi = xla::ffi;
@@ -120,13 +121,37 @@ struct KeOpsKernelInfo {
 static std::unordered_map<uint64_t, KeOpsKernelInfo> g_kernel_registry;
 static const size_t MAX_KERNEL_CACHE_SIZE = 5000;
 
-void cleanup_all_kernels() { g_kernel_registry.clear(); }
+// Global version counter - incremented on any registry modification
+// Used to detect when thread-local caches become stale
+static std::atomic<uint64_t> g_registry_version{0};
+
+// Thread-local kernel cache for fast repeated lookups
+// Avoids hash map overhead when the same kernel is called repeatedly
+struct ThreadLocalKernelCache {
+    uint64_t kernel_id = 0;
+    uint64_t registry_version = 0;
+    KeOpsKernelInfo* kernel_ptr = nullptr;
+
+    void invalidate() {
+        kernel_id = 0;
+        registry_version = 0;
+        kernel_ptr = nullptr;
+    }
+};
+
+void cleanup_all_kernels() {
+    g_kernel_registry.clear();
+    g_registry_version++;  // Invalidate all thread-local caches
+}
 bool is_kernel_registered(uint64_t kernel_id) { return g_kernel_registry.find(kernel_id) != g_kernel_registry.end(); }
 size_t get_registry_size() { return g_kernel_registry.size(); }
 
 void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
     if (g_kernel_registry.find(kernel_id) != g_kernel_registry.end()) return;
-    if (g_kernel_registry.size() >= MAX_KERNEL_CACHE_SIZE) g_kernel_registry.clear();
+    if (g_kernel_registry.size() >= MAX_KERNEL_CACHE_SIZE) {
+        g_kernel_registry.clear();
+        g_registry_version++;  // Invalidate all thread-local caches
+    }
 
     KeOpsKernelInfo info;
     nb::gil_scoped_acquire gil;
@@ -178,10 +203,34 @@ ffi::Error KeOpsKernelImpl(
     int64_t kernel_id,
     int64_t batch_size
 ) {
-    auto it = g_kernel_registry.find(static_cast<uint64_t>(kernel_id));
-    if (it == g_kernel_registry.end()) return ffi::Error::InvalidArgument("Kernel not found");
+    // Thread-local kernel cache for fast repeated lookups
+    static thread_local ThreadLocalKernelCache tls_kernel_cache;
 
-    KeOpsKernelInfo& kernel = it->second;
+    uint64_t kid = static_cast<uint64_t>(kernel_id);
+    uint64_t current_version = g_registry_version.load(std::memory_order_acquire);
+    KeOpsKernelInfo* kernel_ptr = nullptr;
+
+    // Fast path: check thread-local cache first
+    // Only valid if kernel_id matches AND registry version hasn't changed
+    if (tls_kernel_cache.kernel_id == kid &&
+        tls_kernel_cache.registry_version == current_version &&
+        tls_kernel_cache.kernel_ptr != nullptr) {
+        kernel_ptr = tls_kernel_cache.kernel_ptr;
+    } else {
+        // Slow path: hash map lookup
+        auto it = g_kernel_registry.find(kid);
+        if (it == g_kernel_registry.end()) {
+            return ffi::Error::InvalidArgument("Kernel not found");
+        }
+        kernel_ptr = &(it->second);
+
+        // Update thread-local cache
+        tls_kernel_cache.kernel_id = kid;
+        tls_kernel_cache.registry_version = current_version;
+        tls_kernel_cache.kernel_ptr = kernel_ptr;
+    }
+
+    KeOpsKernelInfo& kernel = *kernel_ptr;
     size_t num_inputs = inputs.size();
 
     // Multi-GPU Safety
@@ -280,5 +329,6 @@ NB_MODULE(keops_jax_ext, m) {
     m.def("is_kernel_registered", &is_kernel_registered);
     m.def("cleanup_all_kernels", &cleanup_all_kernels);
     m.def("get_registry_size", &get_registry_size);
+    m.def("get_registry_version", []() { return g_registry_version.load(); });
     m.def("get_ffi_handler", []() { return EncapsulateFfiCall(KeOpsKernel); });
 }

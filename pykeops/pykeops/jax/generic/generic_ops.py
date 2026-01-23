@@ -338,31 +338,14 @@ def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_a
 def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str, axis: int, dtype_str: str, enable_vjp: bool = True, max_order: int = 2):
     """
     Creates a JAX op for KeOps kernel with FULLY OPTIMIZED gradient computation.
-
-    Gradients are computed lazily - no work is done until jax.grad is actually called.
     """
     _patch_nvcc_flags()
     var_names, var_dims, var_cats = _parse_aliases(list(aliases))
 
     kernel_cache = {}
 
-    # Lazy gradient info - only computed on first backward pass
-    # This avoids overhead for inference-only workloads
-    grad_info_cache = {}
-
-    def _build_grad_info():
-        """
-        Build gradient formulas lazily on first backward pass.
-
-        Thread-safety note: This function is not strictly thread-safe on first call.
-        In highly parallel environments, multiple threads could build the grad_info
-        simultaneously. However, since the result is deterministic, the only cost
-        is redundant string construction (no correctness issues). We avoid locking
-        here to keep the common single-threaded path fast.
-        """
-        if 'grad_info' in grad_info_cache:
-            return grad_info_cache['grad_info']
-
+    precomputed_grads = []
+    if enable_vjp:
         forward_output_cat = 0 if axis == 1 else 1
         inner_formula = formula
         for red in ["Sum", "Max", "Min", "LogSumExp"]:
@@ -370,7 +353,6 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                 inner_formula = formula[len(red)+1:-1]
                 break
 
-        grad_info_list = []
         for i, var_cat in enumerate(var_cats):
             var_name = var_names[i]
             var_dim = var_dims[i]
@@ -380,7 +362,7 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
             grad_axis = 1 if var_cat != 1 else 0
             grad_eta_cat = forward_output_cat
 
-            grad_info_list.append({
+            precomputed_grads.append({
                 'grad_formula': grad_formula,
                 'grad_aliases_base': list(aliases),
                 'grad_axis': grad_axis,
@@ -389,9 +371,6 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                 'input_dim': var_dim,
                 'var_name': var_name
             })
-
-        grad_info_cache['grad_info'] = grad_info_list
-        return grad_info_list
 
     def keops_jax_op_impl(*args):
         first_shape = args[0].shape
@@ -510,11 +489,8 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
             keops_jax_op_bwd._grad_cache = {}
 
         if cache_key not in keops_jax_op_bwd._grad_cache:
-            # Lazily build gradient info on first backward pass
-            grad_info_list = _build_grad_info()
-
             compiled_grads = []
-            for grad_info in grad_info_list:
+            for grad_info in precomputed_grads:
                 grad_aliases = grad_info['grad_aliases_base'].copy()
                 cat_str = {0: "Vi", 1: "Vj", 2: "Pm"}[grad_info['grad_eta_cat']]
                 grad_aliases.append(f"eta={cat_str}({eta_dim})")
