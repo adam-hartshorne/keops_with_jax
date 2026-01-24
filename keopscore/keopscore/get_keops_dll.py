@@ -98,6 +98,14 @@ def get_keops_dll_impl(
         set_enable_finalchunk(enable_finalchunks)
         set_mult_var_highdim(mul_var_highdim)
         red_formula = GetReduction(red_formula_string, aliases)
+        
+        # Debug output for chunking decision (always print for JAX)
+        if lang == "jax":
+            print(f"[KeOps DEBUG] Chunking decision:")
+            print(f"  enable_chunks={enable_chunks}, get_enable_chunk()={get_enable_chunk()}")
+            chunked_formulas = red_formula.formula.chunked_formulas(dimchunk)
+            print(f"  len(chunked_formulas)={len(chunked_formulas)}")
+        
         if use_final_chunks(red_formula) and map_reduce_id != "GpuReduc2D":
             use_chunk_mode = 2
             map_reduce_id += "_finalchunks"
@@ -108,9 +116,17 @@ def get_keops_dll_impl(
                 )
 
                 chk = Chunk_Mode_Constants(red_formula)
+                if lang == "jax":
+                    print(f"  chk.chunk_postchunk_mix={chk.chunk_postchunk_mix}")
                 if not chk.chunk_postchunk_mix:
                     use_chunk_mode = 1
                     map_reduce_id += "_chunks"
+                    if lang == "jax":
+                        print(f"  -> Chunking ENABLED! map_reduce_id={map_reduce_id}")
+            elif lang == "jax":
+                print(f"  -> Chunking NOT enabled: formula has {len(red_formula.formula.chunked_formulas(dimchunk))} chunked representations")
+        elif lang == "jax":
+            print(f"  -> Chunking NOT enabled: get_enable_chunk()={get_enable_chunk()}")
     # Instantiation of
     map_reduce_class = map_reduce[map_reduce_id]
 
@@ -146,6 +162,22 @@ def get_keops_dll_impl(
 
     tag1D2D = 0 if tagZero == 1 else res["tag1D2D"]
 
+    # For chunked kernels, use blocksize_chunks instead of global cuda_block_size
+    # Chunked kernels compute a smaller block size based on shared memory constraints
+    actual_block_size = getattr(map_reduce_obj, 'blocksize_chunks', cuda_block_size)
+    
+    # Always print debug output for JAX
+    if lang == "jax":
+        print(f"[KeOps DEBUG] map_reduce_id={map_reduce_id}, use_chunk_mode={use_chunk_mode}")
+        print(f"[KeOps DEBUG] cuda_block_size={actual_block_size}, dimy={res['dimy']}, global_block_size={cuda_block_size}")
+        if hasattr(map_reduce_obj, 'chk'):
+            chk = map_reduce_obj.chk
+            print(f"[KeOps DEBUG] chk.dimy={chk.dimy}, chk.nchunks={chk.nchunks}")
+        if hasattr(map_reduce_obj, 'blocksize_chunks'):
+            print(f"[KeOps DEBUG] blocksize_chunks attribute found: {map_reduce_obj.blocksize_chunks}")
+        else:
+            print(f"[KeOps DEBUG] blocksize_chunks attribute NOT found, using global: {cuda_block_size}")
+
     return (
         res["tag"],
         res["source_file"],
@@ -154,7 +186,7 @@ def get_keops_dll_impl(
         tagZero,
         res["use_half"],
         res["use_fast_math"],
-        cuda_block_size,
+        actual_block_size,
         use_chunk_mode,
         tag1D2D,
         res["dimred"],

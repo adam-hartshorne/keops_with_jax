@@ -1,6 +1,12 @@
+"""
+GpuReduc1D_ranges_chunks - GPU 1D reduction with chunking, ranges support, and runtime backend selection.
+
+This module supports both NVRTC (for PyTorch/NumPy) and CMake/CUDA (for JAX)
+backends, selected at runtime based on the `lang` parameter.
+"""
+
 from keopscore import cuda_block_size
 from keopscore.config.chunks import dimchunk
-from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
 from keopscore.formulas.reductions.sum_schemes import *
 from keopscore.mapreduce.gpu.GpuAssignZero import GpuAssignZero
 from keopscore.mapreduce.MapReduce import MapReduce
@@ -16,6 +22,11 @@ from keopscore.utils.code_gen_utils import (
     use_pragma_unroll,
 )
 from keopscore.mapreduce.Chunk_Mode_Constants import Chunk_Mode_Constants
+
+# Import BOTH backends at module level for runtime selection
+from keopscore.binders.cuda.Cuda_link_compile import Cuda_link_compile
+from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile as Nvrtc_link_compile
+from keopscore.mapreduce.gpu.gpu_utils import use_cuda_backend
 
 
 def do_chunk_sub_ranges(
@@ -183,18 +194,19 @@ def do_chunk_sub_ranges(
             """
 
 
-class GpuReduc1D_ranges_chunks(MapReduce, Gpu_link_compile):
-    # class for generating the final C++ code, Gpu version
+class GpuReduc1D_ranges_chunks_Nvrtc(MapReduce, Nvrtc_link_compile):
+    """GpuReduc1D_ranges_chunks using NVRTC backend (for PyTorch/NumPy)."""
 
     AssignZero = GpuAssignZero
 
-    def __init__(self, *args):
+    def __init__(self, *args, lang=None):
         MapReduce.__init__(self, *args)
-        Gpu_link_compile.__init__(self)
+        Nvrtc_link_compile.__init__(self)
         self.chk = Chunk_Mode_Constants(self.red_formula)
         self.dimy = self.chk.dimy
+        # Use 48000 instead of 49152 to leave headroom for shared memory
         self.blocksize_chunks = min(
-            cuda_block_size, 1024, 49152 // max(1, self.dimy * sizeof(self.dtype))
+            cuda_block_size, 1024, 48000 // max(1, self.dimy * sizeof(self.dtype))
         )
 
     def get_code(self):
@@ -497,3 +509,47 @@ class GpuReduc1D_ranges_chunks(MapReduce, Gpu_link_compile):
                       }}
                   }}
                     """
+
+
+class GpuReduc1D_ranges_chunks_Cuda(MapReduce, Cuda_link_compile):
+    """GpuReduc1D_ranges_chunks using CUDA/CMake backend (for JAX)."""
+
+    AssignZero = GpuAssignZero
+
+    def __init__(self, *args, lang=None):
+        MapReduce.__init__(self, *args)
+        Cuda_link_compile.__init__(self, lang=lang)
+        self.chk = Chunk_Mode_Constants(self.red_formula)
+        self.dimy = self.chk.dimy
+        # Use 48000 instead of 49152 to leave headroom for shared memory
+        self.blocksize_chunks = min(
+            cuda_block_size, 1024, 48000 // max(1, self.dimy * sizeof(self.dtype))
+        )
+
+    def get_code(self):
+        # Reuse the same get_code implementation from the Nvrtc variant
+        GpuReduc1D_ranges_chunks_Nvrtc.get_code(self)
+
+
+class GpuReduc1D_ranges_chunks:
+    """
+    Factory class for GPU 1D reduction with chunking, ranges support, and runtime backend selection.
+
+    Returns either GpuReduc1D_ranges_chunks_Cuda or GpuReduc1D_ranges_chunks_Nvrtc based on lang parameter.
+    """
+
+    AssignZero = GpuAssignZero
+
+    def __new__(cls, *args, lang=None):
+        """
+        Create appropriate backend instance based on lang parameter.
+
+        Args:
+            *args: Standard arguments for MapReduce
+            lang: Language/frontend being used ("torch", "numpy", "jax", or None).
+                  JAX requires CMake backend instead of NVRTC for multi-GPU support.
+        """
+        if use_cuda_backend(lang):
+            return GpuReduc1D_ranges_chunks_Cuda(*args, lang=lang)
+        else:
+            return GpuReduc1D_ranges_chunks_Nvrtc(*args, lang=lang)

@@ -1,6 +1,12 @@
+"""
+GpuReduc1D_finalchunks - GPU 1D reduction with final chunking and runtime backend selection.
+
+This module supports both NVRTC (for PyTorch/NumPy) and CMake/CUDA (for JAX)
+backends, selected at runtime based on the `lang` parameter.
+"""
+
 from keopscore import cuda_block_size
 from keopscore.config.chunks import dimfinalchunk
-from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile
 from keopscore.formulas.reductions.Sum_Reduction import Sum_Reduction
 from keopscore.formulas.reductions.sum_schemes import *
 from keopscore.mapreduce.gpu.GpuAssignZero import GpuAssignZero
@@ -14,6 +20,11 @@ from keopscore.utils.code_gen_utils import (
     use_pragma_unroll,
 )
 from keopscore.utils.misc_utils import KeOps_Error
+
+# Import BOTH backends at module level for runtime selection
+from keopscore.binders.cuda.Cuda_link_compile import Cuda_link_compile
+from keopscore.binders.nvrtc.Gpu_link_compile import Gpu_link_compile as Nvrtc_link_compile
+from keopscore.mapreduce.gpu.gpu_utils import use_cuda_backend
 
 
 def do_finalchunk_sub(
@@ -69,157 +80,200 @@ def do_finalchunk_sub(
             """
 
 
-class GpuReduc1D_finalchunks(MapReduce, Gpu_link_compile):
-    # class for generating the final C++ code, Gpu version
+def _generate_gpu_reduc1d_finalchunks_code(self):
+    """Shared code generation logic for GpuReduc1D_finalchunks."""
+    dtype = self.dtype
+    dtypeacc = self.dtypeacc
+    i = self.i
+    j = self.j
+    nx = c_variable("signed long int", "nx")
+    ny = c_variable("signed long int", "ny")
+    jstart = c_variable("signed long int", "jstart")
+    chunk = c_variable("signed long int", "chunk")
+    arg = self.arg
+    args = self.args
+    yj = c_variable(pointer(dtype), "yj")
+    out = c_variable(pointer(dtype), "out")
+    ind_fun_internal = 0 if self.red_formula.formula.children[0].dim == 1 else 1
+    fun_internal = Sum_Reduction(
+        self.red_formula.formula.children[ind_fun_internal], self.red_formula.tagI
+    )
+    formula = fun_internal.formula
+    varfinal = self.red_formula.formula.children[1 - ind_fun_internal]
+    nchunks = 1 + (varfinal.dim - 1) // dimfinalchunk
+    dimlastfinalchunk = varfinal.dim - (nchunks - 1) * dimfinalchunk
+    varloader = Var_loader(fun_internal)
+    dimsx = varloader.dimsx
+    dimsy = varloader.dimsy
+    dimsp = varloader.dimsp
+    indsi = varloader.indsi
+    indsj = varloader.indsj
+    indsp = varloader.indsp
+    dimx = sum(dimsx)
+    dimy = sum(dimsy)
+    dimp = sum(dimsp)
+    dimout = varfinal.dim
+    dimfout = fun_internal.formula.dim
+    if dimfout != 1:
+        KeOps_Error("dimfout should be 1")
+    sum_scheme = self.sum_scheme
+
+    self.dimy = max(dimfinalchunk, dimy)
+    blocksize_chunks = min(
+        cuda_block_size, 1024, 49152 // max(1, self.dimy * sizeof(self.dtype))
+    )
+
+    if not isinstance(sum_scheme, block_sum):
+        KeOps_Error("only block_sum available")
+    param_loc = c_array(dtype, dimp, "param_loc")
+    fout = c_array(dtype, dimfout * blocksize_chunks, "fout")
+    xi = c_array(dtype, dimx, "xi")
+    acc = c_array(dtypeacc, dimfinalchunk, "acc")
+    yjloc = c_array(dtype, dimy, f"(yj + threadIdx.x * {dimy})")
+    foutjrel = c_array(dtype, dimfout, f"({fout.id}+jrel*{dimfout})")
+    yjrel = c_array(dtype, dimy, "yjrel")
+    table = self.varloader.table(xi, yjrel, param_loc)
+
+    last_chunk = c_variable("signed long int", f"{nchunks-1}")
+
+    chunk_sub_routine = do_finalchunk_sub(
+        dtype,
+        varfinal,
+        dimfinalchunk,
+        acc,
+        i,
+        j,
+        jstart,
+        chunk,
+        nx,
+        ny,
+        arg,
+        fout,
+        yj,
+        out,
+    )
+
+    chunk_sub_routine_last = do_finalchunk_sub(
+        dtype,
+        varfinal,
+        dimlastfinalchunk,
+        acc,
+        i,
+        j,
+        jstart,
+        last_chunk,
+        nx,
+        ny,
+        arg,
+        fout,
+        yj,
+        out,
+    )
+
+    self.code = f"""
+                      
+                    {self.headers}
+                    
+                    extern "C" __global__ void GpuConv1DOnDevice(signed long int nx, signed long int ny, {dtype} *out, {dtype} **{arg.id}) {{
+
+                      // get the index of the current thread
+                      signed long int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+                      // declare shared mem
+                      extern __shared__ {dtype} yj[];
+        
+                      // load parameter(s)
+                      {param_loc.declare()}
+                      {load_vars(dimsp, indsp, param_loc, args)}
+                      
+                      {fout.declare()}
+
+                      // get the value of variable (index with i)
+                      {xi.declare()}
+                      if (i < nx) {{
+                          {load_vars(dimsx, indsi, xi, args, row_index=i)} // load xi variables from global memory to local thread memory
+                          {use_pragma_unroll()}
+                          for (signed long int k=0; k<{dimout}; k++) {{
+                              out[i*{dimout}+k] = 0.0f;
+                          }}
+                      }}
+                      
+                      {acc.declare()}
+
+                      for (signed long int jstart = 0, tile = 0; jstart < ny; jstart += blockDim.x, tile++) {{
+
+                          // get the current column
+                          signed long int j = tile * blockDim.x + threadIdx.x;
+                          if (j < ny) {{ // we load yj from device global memory only if j<ny
+                              {load_vars(dimsy, indsj, yjloc, args, row_index=j)} // load yj variables from global memory to shared memory
+                          }}
+                          __syncthreads();
+
+                          if (i < nx) {{ // we compute x1i only if needed
+                              {dtype} * yjrel = yj; // Loop on the columns of the current block.
+                              for (signed long int jrel = 0; (jrel < {blocksize_chunks}) && (jrel < ny - jstart); jrel++, yjrel += {dimy}) {{
+                                  {formula(foutjrel, table)} // Call the function, which outputs results in fout
+                              }}
+                          }}
+
+                          __syncthreads();
+
+                          for (signed long int chunk=0; chunk<{nchunks-1}; chunk++) {{
+                              {chunk_sub_routine}
+                          }}
+                          {chunk_sub_routine_last}
+                      }}
+                    }}
+                """
+
+
+class GpuReduc1D_finalchunks_Cuda(MapReduce, Cuda_link_compile):
+    """GpuReduc1D_finalchunks using CUDA/CMake backend (for JAX)."""
 
     AssignZero = GpuAssignZero
 
-    def __init__(self, *args):
+    def __init__(self, *args, lang=None):
         MapReduce.__init__(self, *args)
-        Gpu_link_compile.__init__(self)
+        Cuda_link_compile.__init__(self, lang=lang)
 
     def get_code(self):
         super().get_code()
-        dtype = self.dtype
-        dtypeacc = self.dtypeacc
-        i = self.i
-        j = self.j
-        nx = c_variable("signed long int", "nx")
-        ny = c_variable("signed long int", "ny")
-        jstart = c_variable("signed long int", "jstart")
-        chunk = c_variable("signed long int", "chunk")
-        arg = self.arg
-        args = self.args
-        yj = c_variable(pointer(dtype), "yj")
-        out = c_variable(pointer(dtype), "out")
-        ind_fun_internal = 0 if self.red_formula.formula.children[0].dim == 1 else 1
-        fun_internal = Sum_Reduction(
-            self.red_formula.formula.children[ind_fun_internal], self.red_formula.tagI
-        )
-        formula = fun_internal.formula
-        varfinal = self.red_formula.formula.children[1 - ind_fun_internal]
-        nchunks = 1 + (varfinal.dim - 1) // dimfinalchunk
-        dimlastfinalchunk = varfinal.dim - (nchunks - 1) * dimfinalchunk
-        varloader = Var_loader(fun_internal)
-        dimsx = varloader.dimsx
-        dimsy = varloader.dimsy
-        dimsp = varloader.dimsp
-        indsi = varloader.indsi
-        indsj = varloader.indsj
-        indsp = varloader.indsp
-        dimx = sum(dimsx)
-        dimy = sum(dimsy)
-        dimp = sum(dimsp)
-        dimout = varfinal.dim
-        dimfout = fun_internal.formula.dim
-        if dimfout != 1:
-            KeOps_Error("dimfout should be 1")
-        sum_scheme = self.sum_scheme
+        _generate_gpu_reduc1d_finalchunks_code(self)
 
-        self.dimy = max(dimfinalchunk, dimy)
-        blocksize_chunks = min(
-            cuda_block_size, 1024, 49152 // max(1, self.dimy * sizeof(self.dtype))
-        )
 
-        if not isinstance(sum_scheme, block_sum):
-            KeOps_Error("only block_sum available")
-        param_loc = c_array(dtype, dimp, "param_loc")
-        fout = c_array(dtype, dimfout * blocksize_chunks, "fout")
-        xi = c_array(dtype, dimx, "xi")
-        acc = c_array(dtypeacc, dimfinalchunk, "acc")
-        yjloc = c_array(dtype, dimy, f"(yj + threadIdx.x * {dimy})")
-        foutjrel = c_array(dtype, dimfout, f"({fout.id}+jrel*{dimfout})")
-        yjrel = c_array(dtype, dimy, "yjrel")
-        table = self.varloader.table(xi, yjrel, param_loc)
+class GpuReduc1D_finalchunks_Nvrtc(MapReduce, Nvrtc_link_compile):
+    """GpuReduc1D_finalchunks using NVRTC backend (for PyTorch/NumPy)."""
 
-        last_chunk = c_variable("signed long int", f"{nchunks-1}")
+    AssignZero = GpuAssignZero
 
-        chunk_sub_routine = do_finalchunk_sub(
-            dtype,
-            varfinal,
-            dimfinalchunk,
-            acc,
-            i,
-            j,
-            jstart,
-            chunk,
-            nx,
-            ny,
-            arg,
-            fout,
-            yj,
-            out,
-        )
+    def __init__(self, *args, lang=None):
+        MapReduce.__init__(self, *args)
+        Nvrtc_link_compile.__init__(self)
 
-        chunk_sub_routine_last = do_finalchunk_sub(
-            dtype,
-            varfinal,
-            dimlastfinalchunk,
-            acc,
-            i,
-            j,
-            jstart,
-            last_chunk,
-            nx,
-            ny,
-            arg,
-            fout,
-            yj,
-            out,
-        )
+    def get_code(self):
+        super().get_code()
+        _generate_gpu_reduc1d_finalchunks_code(self)
 
-        self.code = f"""
-                          
-                        {self.headers}
-                        
-                        extern "C" __global__ void GpuConv1DOnDevice(signed long int nx, signed long int ny, {dtype} *out, {dtype} **{arg.id}) {{
-    
-                          // get the index of the current thread
-                          signed long int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-                          // declare shared mem
-                          extern __shared__ {dtype} yj[];
-            
-                          // load parameter(s)
-                          {param_loc.declare()}
-                          {load_vars(dimsp, indsp, param_loc, args)}
-                          
-                          {fout.declare()}
-    
-                          // get the value of variable (index with i)
-                          {xi.declare()}
-                          if (i < nx) {{
-                              {load_vars(dimsx, indsi, xi, args, row_index=i)} // load xi variables from global memory to local thread memory
-                              {use_pragma_unroll()}
-                              for (signed long int k=0; k<{dimout}; k++) {{
-                                  out[i*{dimout}+k] = 0.0f;
-                              }}
-                          }}
-                          
-                          {acc.declare()}
+class GpuReduc1D_finalchunks:
+    """
+    Factory class for GPU 1D reduction with final chunking and runtime backend selection.
 
-                          for (signed long int jstart = 0, tile = 0; jstart < ny; jstart += blockDim.x, tile++) {{
+    Returns either GpuReduc1D_finalchunks_Cuda or GpuReduc1D_finalchunks_Nvrtc based on lang parameter.
+    """
 
-                              // get the current column
-                              signed long int j = tile * blockDim.x + threadIdx.x;
-                              if (j < ny) {{ // we load yj from device global memory only if j<ny
-                                  {load_vars(dimsy, indsj, yjloc, args, row_index=j)} // load yj variables from global memory to shared memory
-                              }}
-                              __syncthreads();
+    AssignZero = GpuAssignZero
 
-                              if (i < nx) {{ // we compute x1i only if needed
-                                  {dtype} * yjrel = yj; // Loop on the columns of the current block.
-                                  for (signed long int jrel = 0; (jrel < {blocksize_chunks}) && (jrel < ny - jstart); jrel++, yjrel += {dimy}) {{
-                                      {formula(foutjrel, table)} // Call the function, which outputs results in fout
-                                  }}
-                              }}
-        
-                              __syncthreads();
-        
-                              for (signed long int chunk=0; chunk<{nchunks-1}; chunk++) {{
-                                  {chunk_sub_routine}
-                              }}
-                              {chunk_sub_routine_last}
-                          }}
-                        }}
-                    """
+    def __new__(cls, *args, lang=None):
+        """
+        Create appropriate backend instance based on lang parameter.
+
+        Args:
+            *args: Standard arguments for MapReduce
+            lang: Language/frontend being used ("torch", "numpy", "jax", or None).
+                  JAX requires CMake backend instead of NVRTC for multi-GPU support.
+        """
+        if use_cuda_backend(lang):
+            return GpuReduc1D_finalchunks_Cuda(*args, lang=lang)
+        else:
+            return GpuReduc1D_finalchunks_Nvrtc(*args, lang=lang)

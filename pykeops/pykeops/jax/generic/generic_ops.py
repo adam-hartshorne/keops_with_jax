@@ -369,7 +369,7 @@ def _patch_nvcc_flags():
     os.environ["PYKEOPS_JAX_MODE"] = "1"
 
 
-def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_args, apply_axis_flip=True, use_ranges=False):
+def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_args, apply_axis_flip=True, use_ranges=False, enable_chunks=True):
     from pykeops.common.keops_io import keops_binder
     from pykeops.common.get_options import get_tag_backend
 
@@ -387,7 +387,7 @@ def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_a
         {
             'dtype_acc': dtype_str,
             'sum_scheme': 'block_sum',
-            'enable_chunks': False,
+            'enable_chunks': enable_chunks,
             'use_fast_math': True,
             'multVar_highdim': False
         }

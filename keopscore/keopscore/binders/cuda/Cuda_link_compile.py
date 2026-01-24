@@ -65,6 +65,13 @@ class Cuda_link_compile(LinkCompile):
 
     def generate_code(self):
         self.get_code()
+        
+        # Debug output for JAX chunked kernels
+        if getattr(self, 'jax_mode', False):
+            print(f"[Cuda_link_compile DEBUG] dimy={getattr(self, 'dimy', 'N/A')}")
+            print(f"[Cuda_link_compile DEBUG] blocksize_chunks={getattr(self, 'blocksize_chunks', 'N/A')}")
+            if hasattr(self, 'chk'):
+                print(f"[Cuda_link_compile DEBUG] chk.dimy={self.chk.dimy}")
 
         dtype_bytes = self._detect_dtype_bytes(self.code)
         self.code = self.add_launcher_wrapper(self.code, dtype_bytes=dtype_bytes)
@@ -271,8 +278,15 @@ extern "C" int launch_keops_kernel(
     int nvj = (var_counts >> 8) & 0xFF;
     int nvp = (var_counts >> 16) & 0xFF;
 
+    // Dynamically adjust block size to fit shared memory constraints (48KB limit)
+    // This matches the NVRTC behavior in keops_nvrtc.cpp line 454
+    int effective_block_size = std::min(
+        cuda_block_size,
+        (int)(48000 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
+    );
+
     int nbatchdims = 1;
-    dim3 blockSize(cuda_block_size);
+    dim3 blockSize(effective_block_size);
     dim3 gridSize(((nx + blockSize.x - 1) / blockSize.x) * batch_size);
     size_t nblocks = gridSize.x;
 
@@ -405,13 +419,26 @@ extern "C" int launch_keops_kernel(
 
     cudaMemcpyAsync(device_ptr, h_ptr, total_upload_size, cudaMemcpyHostToDevice, stream);
 
-    size_t shared_mem = cuda_block_size * dimy * KEOPS_DTYPE_BYTES;
+    size_t shared_mem = effective_block_size * dimy * KEOPS_DTYPE_BYTES;
+    
+    // Debug print before launch (debug_env already declared above)
+    if (debug_env && strcmp(debug_env, "1") == 0) {
+        printf("[RANGES LAUNCHER DEBUG] About to launch: gridSize=%d, blockSize=%d (effective), shared_mem=%zu\\n",
+               (int)gridSize.x, (int)blockSize.x, shared_mem);
+        printf("[RANGES LAUNCHER DEBUG] cuda_block_size=%d (requested), effective_block_size=%d (adjusted), dimy=%d\\n",
+               cuda_block_size, effective_block_size, dimy);
+    }
+    
     GpuConv1DOnDevice_ranges<<<gridSize, blockSize, shared_mem, stream>>>(
         nx, ny, nbatchdims, offsets_d, lookup_d, slices_x, ranges_y, out, args_d);
 
     cuda_err = cudaGetLastError();
     if (cuda_err != cudaSuccess) {
         printf("[LAUNCHER] Kernel launch error: %s\\n", cudaGetErrorString(cuda_err));
+        printf("[LAUNCHER] Launch config: gridSize=%d, blockSize=%d (effective), shared_mem=%zu bytes\\n",
+               (int)gridSize.x, (int)blockSize.x, shared_mem);
+        printf("[LAUNCHER] Parameters: nx=%d, ny=%d, dimy=%d, cuda_block_size=%d (requested), effective=%d\\n",
+               nx, ny, dimy, cuda_block_size, effective_block_size);
         return 1;
     }
     return 0;
@@ -450,7 +477,15 @@ extern "C" int launch_keops_kernel(
 ) {
     float* out = (float*)out_ptr;
     float** args = (float**)args_ptr;
-    dim3 blockSize(cuda_block_size);
+    
+    // Dynamically adjust block size to fit shared memory constraints (48KB limit)
+    // This matches the NVRTC behavior in keops_nvrtc.cpp line 454
+    int effective_block_size = std::min(
+        cuda_block_size,
+        (int)(48000 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
+    );
+    
+    dim3 blockSize(effective_block_size);
     dim3 gridSize((nx + blockSize.x - 1) / blockSize.x);
 
     int64_t var_counts = (int64_t)argshapes;
@@ -478,9 +513,17 @@ extern "C" int launch_keops_kernel(
     if (debug_env && strcmp(debug_env, "1") == 0) {
         printf("[SIMPLE LAUNCHER DEBUG] nx=%d, ny=%d, nvi=%d, nvj=%d, nvp=%d, total_args=%d, sparse_args_count=%d\\n",
                nx, ny, nvi, nvj, nvp, total_args, sparse_args_count);
+        printf("[SIMPLE LAUNCHER DEBUG] cuda_block_size=%d (requested), effective_block_size=%d (adjusted), dimy=%d\\n",
+               cuda_block_size, effective_block_size, dimy);
     }
 
-    size_t shared_mem = cuda_block_size * dimy * KEOPS_DTYPE_BYTES;
+    size_t shared_mem = effective_block_size * dimy * KEOPS_DTYPE_BYTES;
+    
+    // Always print shared_mem info for debugging chunk mode issues
+    if (debug_env && strcmp(debug_env, "1") == 0) {
+        printf("[SIMPLE LAUNCHER DEBUG] shared_mem=%zu bytes, gridSize=%d, blockSize=%d\\n",
+               shared_mem, (int)gridSize.x, (int)blockSize.x);
+    }
     size_t args_size = sizeof(float*) * sparse_args_count;  // Use sparse count, not total_args
 
     void* pinned_ptr = g_pinned_buffer.ensure(args_size);
@@ -520,12 +563,27 @@ extern "C" int launch_keops_kernel(
     char* device_ptr = (char*)scratch_ptr;
     float** args_d = (float**)device_ptr;
 
-    cudaMemcpyAsync(args_d, h_args, args_size, cudaMemcpyHostToDevice, stream);
+    cudaError_t memcpy_err = cudaMemcpyAsync(args_d, h_args, args_size, cudaMemcpyHostToDevice, stream);
+    if (memcpy_err != cudaSuccess) {
+        printf("[LAUNCHER] cudaMemcpyAsync error: %s\\n", cudaGetErrorString(memcpy_err));
+        return 1;
+    }
+    
+    // Debug print before launch
+    if (debug_env && strcmp(debug_env, "1") == 0) {
+        printf("[SIMPLE LAUNCHER DEBUG] About to launch kernel with gridSize=%d, blockSize=%d, shared_mem=%zu\\n",
+               (int)gridSize.x, (int)blockSize.x, shared_mem);
+    }
+    
     GpuConv1DOnDevice<<<gridSize, blockSize, shared_mem, stream>>>(nx, ny, out, args_d);
 
     cudaError_t cuda_err = cudaGetLastError();
     if (cuda_err != cudaSuccess) {
         printf("[LAUNCHER] Kernel launch error: %s\\n", cudaGetErrorString(cuda_err));
+        printf("[LAUNCHER] Launch config: gridSize=%d, blockSize=%d, shared_mem=%zu bytes\\n",
+               (int)gridSize.x, (int)blockSize.x, shared_mem);
+        printf("[LAUNCHER] Parameters: nx=%d, ny=%d, dimy=%d, cuda_block_size=%d\\n",
+               nx, ny, dimy, cuda_block_size);
         return 1;
     }
     return 0;
