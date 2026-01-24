@@ -518,7 +518,7 @@ public:
       gridSize2_x = (nx * dimred) / blockSize2_x +
                     ((nx * dimred) % blockSize2_x == 0 ? 0 : 1);
 
-      
+
       // Data on the device. We need an "inflated" outB, which contains
       // gridSize.y "copies" of out that will be reduced in the final pass.
 
@@ -546,7 +546,7 @@ public:
           kernel_params, 0));
       // block until the device has completed
       CUDA_SAFE_CALL(cuCtxSynchronize());
-      
+
       // Since we've used a 2D scheme, there's still a "blockwise" line
       // reduction to make on the output array px_d[0] = x1B. We go from shape (
       // gridSize.y * nx, DIMRED ) to (nx, DIMOUT)

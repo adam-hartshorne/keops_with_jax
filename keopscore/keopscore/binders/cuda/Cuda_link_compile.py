@@ -70,7 +70,8 @@ class Cuda_link_compile(LinkCompile):
         self.code = self.add_launcher_wrapper(self.code, dtype_bytes=dtype_bytes)
         self.write_code()
 
-        KeOps_Message("Compiling formula using CMake/nvcc ... ", flush=True, end="")
+        # print("\n")
+        KeOps_Message("Compiling formula using nvcc ... ", flush=True, end="")
 
         cuda_include = cuda_config.get_cuda_include_path()
 
@@ -290,6 +291,15 @@ extern "C" int launch_keops_kernel(
     }
     int sparse_args_count = max_var_idx + 1;
 
+    // DEBUG: Print launcher params
+    const char* debug_env = getenv("JAX_KEOPS_DEBUG");
+    if (debug_env && strcmp(debug_env, "1") == 0) {
+        printf("[RANGES LAUNCHER DEBUG] nx=%d, ny=%d, batch_size=%d, nblocks=%zu\\n",
+               nx, ny, batch_size, nblocks);
+        printf("  nvi=%d, nvj=%d, nvp=%d, max_var_idx=%d, sparse_args_count=%d\\n",
+               nvi, nvj, nvp, max_var_idx, sparse_args_count);
+    }
+
     int device_id;
     cudaError_t cuda_err = cudaGetDevice(&device_id);
     if (cuda_err != cudaSuccess) {
@@ -449,8 +459,29 @@ extern "C" int launch_keops_kernel(
     int nvp = (var_counts >> 16) & 0xFF;
     int total_args = nvi + nvj + nvp;
 
+    // Compute max_var_idx to handle sparse argument indices
+    // The kernel may use non-contiguous indices like [0,1,3,4] instead of [0,1,2,3]
+    int max_var_idx = -1;
+    if (nvi > 0 && indsi) {
+        for (int i = 0; i < nvi; i++) if (indsi[i] > max_var_idx) max_var_idx = indsi[i];
+    }
+    if (nvj > 0 && indsj) {
+        for (int j = 0; j < nvj; j++) if (indsj[j] > max_var_idx) max_var_idx = indsj[j];
+    }
+    if (nvp > 0 && indsp) {
+        for (int p = 0; p < nvp; p++) if (indsp[p] > max_var_idx) max_var_idx = indsp[p];
+    }
+    int sparse_args_count = max_var_idx + 1;
+
+    // DEBUG: Print launcher params
+    const char* debug_env = getenv("JAX_KEOPS_DEBUG");
+    if (debug_env && strcmp(debug_env, "1") == 0) {
+        printf("[SIMPLE LAUNCHER DEBUG] nx=%d, ny=%d, nvi=%d, nvj=%d, nvp=%d, total_args=%d, sparse_args_count=%d\\n",
+               nx, ny, nvi, nvj, nvp, total_args, sparse_args_count);
+    }
+
     size_t shared_mem = cuda_block_size * dimy * KEOPS_DTYPE_BYTES;
-    size_t args_size = sizeof(float*) * total_args;
+    size_t args_size = sizeof(float*) * sparse_args_count;  // Use sparse count, not total_args
 
     void* pinned_ptr = g_pinned_buffer.ensure(args_size);
     float** h_args;
@@ -460,16 +491,31 @@ extern "C" int launch_keops_kernel(
     } else {
         constexpr size_t FAST_PATH_MAX_ARGS = 32;
         static thread_local float* fallback_buffer[FAST_PATH_MAX_ARGS];
-        if (total_args <= FAST_PATH_MAX_ARGS) {
+        if (sparse_args_count <= FAST_PATH_MAX_ARGS) {
             h_args = fallback_buffer;
         } else {
             static thread_local std::vector<float*> dynamic_args_buffer;
-            dynamic_args_buffer.resize(total_args);
+            dynamic_args_buffer.resize(sparse_args_count);
             h_args = dynamic_args_buffer.data();
         }
     }
 
-    memcpy(h_args, args, args_size);
+    // Build sparse args array: map dense input indices to sparse kernel indices
+    // Initialize to nullptr for safety
+    for (int i = 0; i < sparse_args_count; i++) h_args[i] = nullptr;
+
+    // Collect all variable indices and sort them
+    int all_var_indices[256];
+    int idx = 0;
+    for (int i = 0; i < nvi; i++) all_var_indices[idx++] = indsi[i];
+    for (int j = 0; j < nvj; j++) all_var_indices[idx++] = indsj[j];
+    for (int p = 0; p < nvp; p++) all_var_indices[idx++] = indsp[p];
+    std::sort(all_var_indices, all_var_indices + total_args);
+
+    // Map: args[dense_idx] -> h_args[sparse_idx]
+    for (int dense_idx = 0; dense_idx < total_args; dense_idx++) {
+        h_args[all_var_indices[dense_idx]] = args[dense_idx];
+    }
 
     char* device_ptr = (char*)scratch_ptr;
     float** args_d = (float**)device_ptr;

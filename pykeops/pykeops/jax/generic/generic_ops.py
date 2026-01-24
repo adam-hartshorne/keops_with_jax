@@ -223,7 +223,10 @@ def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
 
     if ndims == 3:
         batch_size = first_shape[0]
-        if target_cat is not None:
+        # For Pm (parameter) gradients, we should NOT use target_cat to determine
+        # the output size. The kernel still outputs over the non-reduced dimension.
+        if target_cat is not None and target_cat != 2:
+            # For Vi/Vj gradients, find the first variable with matching category
             for i, cat in enumerate(var_cats):
                 if i < num_args and cat == target_cat:
                     if len(args_shapes[i]) < 2:
@@ -231,6 +234,7 @@ def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
                     return (batch_size, args_shapes[i][1], dimout)
             return (batch_size, args_shapes[0][1], dimout)
 
+        # For Pm gradients (target_cat=2) or forward pass, use axis-based logic
         if axis == 0:
             for i, cat in enumerate(var_cats):
                 if i < num_args and cat == 1:
@@ -246,7 +250,12 @@ def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
                     return (batch_size, args_shapes[i][1], dimout)
             return (batch_size, args_shapes[0][1], dimout)
     else:
-        if target_cat is not None:
+        # For Pm (parameter) gradients, we should NOT use target_cat to determine
+        # the output size. The kernel still outputs over the non-reduced dimension
+        # (Vi for axis=1, Vj for axis=0). The VJP code will sum this to get the
+        # final Pm gradient.
+        if target_cat is not None and target_cat != 2:
+            # For Vi/Vj gradients, find the first variable with matching category
             for i, cat in enumerate(var_cats):
                 if i < num_args and cat == target_cat:
                     if len(args_shapes[i]) < 1:
@@ -254,6 +263,7 @@ def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
                     return (args_shapes[i][0], dimout)
             return (args_shapes[0][0], dimout)
 
+        # For Pm gradients (target_cat=2) or forward pass, use axis-based logic
         if axis == 0:
             for i, cat in enumerate(var_cats):
                 if i < num_args and cat == 1:

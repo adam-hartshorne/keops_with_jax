@@ -190,7 +190,7 @@ bool is_kernel_registered(uint64_t kernel_id) {
     if (err != cudaSuccess) {
         return false;  // CUDA not available or context issue
     }
-    
+
     std::shared_lock lock(g_registry_mutex);  // Reader lock
     uint64_t key = make_registry_key(kernel_id, device_id);
     return g_kernel_registry.find(key) != g_kernel_registry.end();
@@ -203,7 +203,7 @@ bool is_kernel_registered_all_devices(uint64_t kernel_id) {
     if (err != cudaSuccess || num_devices == 0) {
         return false;
     }
-    
+
     std::shared_lock lock(g_registry_mutex);
     for (int dev = 0; dev < num_devices; dev++) {
         uint64_t key = make_registry_key(kernel_id, dev);
@@ -242,7 +242,7 @@ int get_kernel_dimout(uint64_t kernel_id) {
     int device_id;
     cudaError_t err = cudaGetDevice(&device_id);
     if (err != cudaSuccess) return -1;
-    
+
     std::shared_lock lock(g_registry_mutex);
     uint64_t key = make_registry_key(kernel_id, device_id);
     auto it = g_kernel_registry.find(key);
@@ -274,20 +274,20 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
             break;
         }
     }
-    
+
     if (all_registered) {
         return;  // Already registered on all devices
     }
 
     // Need to register - prepare info (shared across all devices)
     auto info = std::make_shared<KeOpsKernelInfo>();
-    
+
     {
         nb::gil_scoped_acquire gil;
 
         try {
             std::string kernel_path = nb::cast<std::string>(myconv.attr("kernel_so_path"));
-            
+
             // Use RTLD_DEEPBIND for multi-GPU symbol isolation
             // Use RTLD_NODELETE to prevent unloading (GPU may reference code asynchronously)
             info->kernel_lib = dlopen(kernel_path.c_str(), RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND | RTLD_NODELETE);
@@ -332,7 +332,7 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
     // Register on ALL devices (shared_ptr allows sharing the same info)
     {
         std::unique_lock write_lock(g_registry_mutex);
-        
+
         // Check cache size and evict if needed
         if (g_kernel_registry.size() >= MAX_KERNEL_CACHE_SIZE) {
             g_kernel_registry.clear();
@@ -341,7 +341,7 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
                 std::cout << "[KeOps] Registry cache full, cleared all kernels" << std::endl;
             }
         }
-        
+
         // Register for each device
         for (int dev = 0; dev < num_devices; dev++) {
             uint64_t key = make_registry_key(kernel_id, dev);
@@ -352,7 +352,7 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
                 }
             }
         }
-        
+
         g_registry_version.fetch_add(1, std::memory_order_release);
     }
 
@@ -394,7 +394,7 @@ ffi::Error KeOpsKernelImpl(
     } else {
         // Slow path: hash map lookup with reader lock
         std::shared_lock lock(g_registry_mutex);
-        
+
         uint64_t key = make_registry_key(kid, device_id);
         auto it = g_kernel_registry.find(key);
         if (it == g_kernel_registry.end()) {
@@ -475,11 +475,40 @@ ffi::Error KeOpsKernelImpl(
     if (!scratch_result.has_value()) return ffi::Error::Internal("Scratch allocation failed");
     void* scratch_ptr = scratch_result.value();
 
+    // Additional validation
+    if (scratch_ptr == nullptr) {
+        return ffi::Error::Internal("Scratch allocation returned null pointer");
+    }
+
+    // Verify all input pointers are non-null
+    for (size_t i = 0; i < num_inputs; ++i) {
+        if (input_ptrs[i] == nullptr) {
+            return ffi::Error::Internal("Input pointer " + std::to_string(i) + " is null");
+        }
+    }
+    if (output_ptr == nullptr) {
+        return ffi::Error::Internal("Output pointer is null");
+    }
+
     // CRITICAL FIX: Pass actual batch_size, not just a flag
     int64_t ranges_enc_value = (batch_size > 1) ? batch_size : 0;
     void* ranges_enc_ptr = (void*)ranges_enc_value;
 
     void* argshapes_ptr = (void*)kernel.var_counts_packed;
+
+    // DEBUG: Print launch parameters
+    if (KEOPS_DEBUG) {
+        std::cout << "[KeOps FFI DEBUG] Launch params:" << std::endl;
+        std::cout << "  num_inputs=" << num_inputs << std::endl;
+        std::cout << "  nx_kernel=" << nx_kernel << ", ny_kernel=" << ny_kernel << std::endl;
+        std::cout << "  batch_size=" << batch_size << std::endl;
+        std::cout << "  nvi=" << kernel.nvi_count << ", nvj=" << kernel.nvj_count << ", nvp=" << kernel.nvp_count << std::endl;
+        std::cout << "  max_var_idx=" << kernel.max_var_idx << std::endl;
+        std::cout << "  indsi=["; for(int i=0; i<kernel.nvi_count; i++) std::cout << kernel.indsi[i] << " "; std::cout << "]" << std::endl;
+        std::cout << "  indsj=["; for(int i=0; i<kernel.nvj_count; i++) std::cout << kernel.indsj[i] << " "; std::cout << "]" << std::endl;
+        std::cout << "  indsp=["; for(int i=0; i<kernel.nvp_count; i++) std::cout << kernel.indsp[i] << " "; std::cout << "]" << std::endl;
+        std::cout << "  scratch_bytes=" << needed_bytes << std::endl;
+    }
 
     int result = kernel.launch_fn(
         kernel.tagHostDevice, kernel.dimy, nx_kernel, ny_kernel, kernel.tagI, kernel.tagZero,
