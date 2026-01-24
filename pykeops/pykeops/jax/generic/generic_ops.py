@@ -369,14 +369,20 @@ def _patch_nvcc_flags():
     os.environ["PYKEOPS_JAX_MODE"] = "1"
 
 
-def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_args, apply_axis_flip=True, use_ranges=False, enable_chunks=True):
+def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_args, apply_axis_flip=True, use_ranges=False, enable_chunks=True, opt_arg=None, formula2=None):
     from pykeops.common.keops_io import keops_binder
     from pykeops.common.get_options import get_tag_backend
 
     var_names, var_dims, var_cats = _parse_aliases(aliases)
 
     cat = (axis + 1) % 2 if apply_axis_flip else axis
-    reduction_formula_str = f"{reduction_op}_Reduction({formula},{cat})"
+    
+    # Build the reduction formula string
+    # Format: ReductionOp_Reduction(formula[,opt_arg],cat[,formula2])
+    str_opt_arg = f",{opt_arg}" if opt_arg is not None else ""
+    str_formula2 = f",{formula2}" if formula2 else ""
+    reduction_formula_str = f"{reduction_op}_Reduction({formula}{str_opt_arg},{cat}{str_formula2})"
+    
     tagCPUGPU, tag1D2D, tagHostDevice = get_tag_backend("GPU", jax_args)
 
     return keops_binder["cpp"](
@@ -394,7 +400,7 @@ def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_a
     ).import_module()
 
 
-def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str, axis: int, dtype_str: str, enable_vjp: bool = True, max_order: int = 2):
+def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str, axis: int, dtype_str: str, enable_vjp: bool = True, max_order: int = 2, opt_arg: int = None, formula2: str = None):
     """Creates a JAX op for KeOps kernel with FULLY OPTIMIZED gradient computation."""
     _patch_nvcc_flags()
     var_names, var_dims, var_cats = _parse_aliases(list(aliases))
@@ -405,7 +411,7 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
     if enable_vjp:
         forward_output_cat = 0 if axis == 1 else 1
         inner_formula = formula
-        for red in ["Sum", "Max", "Min", "LogSumExp"]:
+        for red in ["Sum", "Max", "Min", "LogSumExp", "Max_SumShiftExp", "Max_SumShiftExpWeight"]:
             if formula.startswith(f"{red}(") and formula.endswith(")"):
                 inner_formula = formula[len(red)+1:-1]
                 break
@@ -435,8 +441,13 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
         batch_key = "3d" if is_batched else "2d"
 
         if batch_key not in kernel_cache:
+            # Include opt_arg and formula2 in hash for uniqueness
+            opt_arg_str = str(opt_arg) if opt_arg is not None else ""
+            formula2_str = formula2 if formula2 else ""
+            extended_batch_key = f"{batch_key}_{opt_arg_str}_{formula2_str}"
+            
             kernel_id, target_name = _compute_kernel_hash(
-                formula, aliases, reduction_op, axis, dtype_str, batch_key
+                formula, aliases, reduction_op, axis, dtype_str, extended_batch_key
             )
 
             kernel_cache[batch_key] = {
@@ -477,7 +488,8 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                             # Need to create backend (either for registration or to get dimout)
                             myconv_orig = _create_keops_backend(
                                 formula, list(aliases), reduction_op, axis, dtype_str,
-                                jax_args, use_ranges=is_batched_inner
+                                jax_args, use_ranges=is_batched_inner,
+                                opt_arg=opt_arg, formula2=formula2
                             )
 
                             dimout = getattr(myconv_orig, 'dim', getattr(myconv_orig, 'dimout', 1))
@@ -593,12 +605,12 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                 # to match the original parameter shape.
                 # The gradient formula may produce (batch, n_i, dim) but input was (1, dim)
                 input_shape = args[i].shape
-
+                
                 if raw_grad.shape != input_shape:
                     # Sum over extra leading dimensions
                     while len(raw_grad.shape) > len(input_shape):
                         raw_grad = jnp.sum(raw_grad, axis=0)
-
+                    
                     # Sum over axes where input has size 1 but grad has larger size
                     # This is the key fix: for Pm params, we sum gradients, not reshape
                     if raw_grad.shape != input_shape:
@@ -607,15 +619,15 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                             if axis < len(input_shape):
                                 if input_shape[axis] == 1 and raw_grad.shape[axis] > 1:
                                     axes_to_sum.append(axis)
-
+                        
                         # Sum over all mismatched axes at once, keeping dims
                         if axes_to_sum:
                             raw_grad = jnp.sum(raw_grad, axis=tuple(axes_to_sum), keepdims=True)
-
+                    
                     # Final reshape if shapes still don't match (should be rare)
                     if raw_grad.shape != input_shape:
                         raw_grad = jnp.broadcast_to(raw_grad, input_shape) if raw_grad.size == 1 else raw_grad.reshape(input_shape)
-
+                
                 grad_i = raw_grad
 
             results.append(grad_i)
@@ -626,8 +638,8 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
     return keops_jax_op
 
 
-def keops_reduction(formula, aliases, reduction_op='Sum', axis=0, dtype='float32', enable_vjp=True):
-    return make_keops_jax_op(formula, aliases, reduction_op, axis, dtype, enable_vjp)
+def keops_reduction(formula, aliases, reduction_op='Sum', axis=0, dtype='float32', enable_vjp=True, opt_arg=None, formula2=None):
+    return make_keops_jax_op(formula, aliases, reduction_op, axis, dtype, enable_vjp, opt_arg=opt_arg, formula2=formula2)
 
 
 def cleanup_registry():

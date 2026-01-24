@@ -103,7 +103,7 @@ class LazyTensor(GenericLazyTensor):
         self.tools = safe_tools
         self.Genred = Genred
         self.KernelSolve = None
-
+        
         # Initialize _var_ids
         self._var_ids = ()
 
@@ -134,12 +134,12 @@ class LazyTensor(GenericLazyTensor):
         else:
             # x is None - initialize empty
             super().__init__(x=None, axis=axis)
-
+    
     def _init_from_jax_array(self, x, axis):
         """Initialize LazyTensor from a JAX array with consistent ID scheme."""
         # Set the duck typing attribute (required for base class compatibility)
         self.__GenericLazyTensor__ = True
-
+        
         # Initialize attributes that base class would set
         self.batchdims = ()
         self.ni = None
@@ -184,7 +184,7 @@ class LazyTensor(GenericLazyTensor):
         # Use monotonic counter for unique ID
         unique_id = _get_unique_var_id()
         self.formula = f"Var({unique_id},{self.ndim},{self.axis})"
-
+        
         # Store the unique_id for this variable
         self._var_ids = (unique_id,)
 
@@ -214,37 +214,37 @@ class LazyTensor(GenericLazyTensor):
     def join(self, other, is_complex=False):
         """Override to merge _var_ids from both operands, deduplicating by ID."""
         res = super().join(other, is_complex=is_complex)
-
+        
         # Get _var_ids from both operands
         self_ids = getattr(self, '_var_ids', ())
         other_ids = getattr(other, '_var_ids', ())
-
+        
         # The base class concatenates variables: res.variables = self.variables + other.variables
         # We need to deduplicate by _var_id, keeping only the first occurrence
-
+        
         # Build deduplicated variables and _var_ids
         seen_ids = set()
         new_variables = []
         new_var_ids = []
-
+        
         # Process self's variables first
         for i, var_id in enumerate(self_ids):
             if var_id not in seen_ids:
                 seen_ids.add(var_id)
                 new_variables.append(self.variables[i])
                 new_var_ids.append(var_id)
-
+        
         # Then other's variables (skip duplicates)
         for i, var_id in enumerate(other_ids):
             if var_id not in seen_ids:
                 seen_ids.add(var_id)
                 new_variables.append(other.variables[i])
                 new_var_ids.append(var_id)
-
+        
         # Update result with deduplicated variables
         res.variables = tuple(new_variables)
         res._var_ids = tuple(new_var_ids)
-
+        
         return res
 
     def fixvariables(self):
@@ -254,7 +254,7 @@ class LazyTensor(GenericLazyTensor):
         When we manually initialize LazyTensors (in except block), we use
         Var(unique_id, dim, cat) for uniqueness. But Genred needs Var(0, dim, cat),
         Var(1, dim, cat), etc. This method does the conversion.
-
+        
         Uses _var_ids to correctly map each variable to its unique_id in the formula.
         """
         import re
@@ -264,7 +264,7 @@ class LazyTensor(GenericLazyTensor):
 
         # Get the _var_ids mapping (unique_id -> variable index in tuple)
         var_ids = getattr(self, '_var_ids', ())
-
+        
         # Build mapping: unique_id -> index in self.variables tuple
         # Use FIRST occurrence of each unique_id
         id_to_tuple_idx = {}

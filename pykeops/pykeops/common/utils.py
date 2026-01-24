@@ -39,7 +39,7 @@ def get_tools(lang):
     get_tools is used to simulate template as in Cpp code. Depending on the langage
     it import the right classes.
 
-    :param lang: a string with the langage ('torch'/'pytorch' or 'numpy')
+    :param lang: a string with the langage ('torch'/'pytorch', 'numpy', or 'jax')
     :return: a class tools
     """
 
@@ -51,6 +51,10 @@ def get_tools(lang):
         from pykeops.torch.utils import torchtools
 
         tools = torchtools()
+    elif lang == "jax":
+        from pykeops.jax.utils import jaxtools
+
+        tools = jaxtools
 
     return tools
 
