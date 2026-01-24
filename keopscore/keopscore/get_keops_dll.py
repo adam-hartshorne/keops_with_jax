@@ -99,8 +99,11 @@ def get_keops_dll_impl(
         set_mult_var_highdim(mul_var_highdim)
         red_formula = GetReduction(red_formula_string, aliases)
         
-        # Debug output for chunking decision (always print for JAX)
-        if lang == "jax":
+        # Debug output for chunking decision (only when JAX_KEOPS_DEBUG=1)
+        import os
+        debug_enabled = os.environ.get("JAX_KEOPS_DEBUG") == "1"
+        
+        if lang == "jax" and debug_enabled:
             print(f"[KeOps DEBUG] Chunking decision:")
             print(f"  enable_chunks={enable_chunks}, get_enable_chunk()={get_enable_chunk()}")
             chunked_formulas = red_formula.formula.chunked_formulas(dimchunk)
@@ -116,16 +119,16 @@ def get_keops_dll_impl(
                 )
 
                 chk = Chunk_Mode_Constants(red_formula)
-                if lang == "jax":
+                if lang == "jax" and debug_enabled:
                     print(f"  chk.chunk_postchunk_mix={chk.chunk_postchunk_mix}")
                 if not chk.chunk_postchunk_mix:
                     use_chunk_mode = 1
                     map_reduce_id += "_chunks"
-                    if lang == "jax":
+                    if lang == "jax" and debug_enabled:
                         print(f"  -> Chunking ENABLED! map_reduce_id={map_reduce_id}")
-            elif lang == "jax":
+            elif lang == "jax" and debug_enabled:
                 print(f"  -> Chunking NOT enabled: formula has {len(red_formula.formula.chunked_formulas(dimchunk))} chunked representations")
-        elif lang == "jax":
+        elif lang == "jax" and debug_enabled:
             print(f"  -> Chunking NOT enabled: get_enable_chunk()={get_enable_chunk()}")
     # Instantiation of
     map_reduce_class = map_reduce[map_reduce_id]
@@ -166,8 +169,8 @@ def get_keops_dll_impl(
     # Chunked kernels compute a smaller block size based on shared memory constraints
     actual_block_size = getattr(map_reduce_obj, 'blocksize_chunks', cuda_block_size)
     
-    # Always print debug output for JAX
-    if lang == "jax":
+    # Debug output (only when JAX_KEOPS_DEBUG=1)
+    if lang == "jax" and debug_enabled:
         print(f"[KeOps DEBUG] map_reduce_id={map_reduce_id}, use_chunk_mode={use_chunk_mode}")
         print(f"[KeOps DEBUG] cuda_block_size={actual_block_size}, dimy={res['dimy']}, global_block_size={cuda_block_size}")
         if hasattr(map_reduce_obj, 'chk'):

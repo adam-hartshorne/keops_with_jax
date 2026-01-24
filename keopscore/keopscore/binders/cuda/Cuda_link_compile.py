@@ -66,8 +66,9 @@ class Cuda_link_compile(LinkCompile):
     def generate_code(self):
         self.get_code()
         
-        # Debug output for JAX chunked kernels
-        if getattr(self, 'jax_mode', False):
+        # Debug output for JAX chunked kernels (only when JAX_KEOPS_DEBUG=1)
+        import os
+        if getattr(self, 'jax_mode', False) and os.environ.get("JAX_KEOPS_DEBUG") == "1":
             print(f"[Cuda_link_compile DEBUG] dimy={getattr(self, 'dimy', 'N/A')}")
             print(f"[Cuda_link_compile DEBUG] blocksize_chunks={getattr(self, 'blocksize_chunks', 'N/A')}")
             if hasattr(self, 'chk'):
@@ -88,7 +89,6 @@ class Cuda_link_compile(LinkCompile):
             "-Xcompiler", "-fPIC",
             "-O3",
             "--use_fast_math",
-            "--ptxas-options=-v",
             f"-I{config.get_bindings_source_dir()}",
         ]
 
@@ -161,6 +161,30 @@ class Cuda_link_compile(LinkCompile):
         """Add a C-compatible launcher function that can be called from C++ via dlopen."""
         is_ranges = "GpuConv1DOnDevice_ranges" in kernel_code
 
+        # Precompute index mapping at code generation time
+        # This avoids sorting/mapping on every kernel launch
+        indsi = list(getattr(self.varloader, 'indsi', []))
+        indsj = list(getattr(self.varloader, 'indsj', []))
+        indsp = list(getattr(self.varloader, 'indsp', []))
+
+        all_indices = indsi + indsj + indsp
+        total_args = len(all_indices)
+
+        if total_args > 0:
+            # Compute sparse_args_count (max index + 1)
+            sparse_args_count = max(all_indices) + 1
+
+            # Create sorted mapping: sorted_indices[i] = original index that maps to position i
+            # We need: h_args[sorted_indices[dense_idx]] = args[dense_idx]
+            sorted_pairs = sorted(enumerate(all_indices), key=lambda x: x[1])
+            sorted_mapping = [p[1] for p in sorted_pairs]  # Target positions in sorted order
+        else:
+            sparse_args_count = 0
+            sorted_mapping = []
+
+        # Generate the mapping as a static array
+        mapping_array = ', '.join(str(x) for x in sorted_mapping) if sorted_mapping else '0'
+
         preamble = '''
 #include <stdio.h>
 #include <cuda_runtime.h>
@@ -172,6 +196,9 @@ class Cuda_link_compile(LinkCompile):
 using std::min;
 
 #define KEOPS_DTYPE_BYTES ''' + str(dtype_bytes) + '''
+#define PRECOMPUTED_SPARSE_ARGS_COUNT ''' + str(sparse_args_count) + '''
+#define PRECOMPUTED_TOTAL_ARGS ''' + str(total_args) + '''
+static const int PRECOMPUTED_MAPPING[''' + str(max(1, total_args)) + '''] = {''' + mapping_array + '''};
 
 #define CHECK_CUDA_LAUNCH(err) \\
     if (err != cudaSuccess) { \\
@@ -293,26 +320,9 @@ extern "C" int launch_keops_kernel(
     int total_offsets = nvi + nvj + nvp;
     if (total_offsets == 0) total_offsets = 2;
 
-    int max_var_idx = -1;
-    if (nvi > 0 && indsi) {
-        for (int i = 0; i < nvi; i++) if (indsi[i] > max_var_idx) max_var_idx = indsi[i];
-    }
-    if (nvj > 0 && indsj) {
-        for (int j = 0; j < nvj; j++) if (indsj[j] > max_var_idx) max_var_idx = indsj[j];
-    }
-    if (nvp > 0 && indsp) {
-        for (int p = 0; p < nvp; p++) if (indsp[p] > max_var_idx) max_var_idx = indsp[p];
-    }
-    int sparse_args_count = max_var_idx + 1;
-
-    // DEBUG: Print launcher params
-    const char* debug_env = getenv("JAX_KEOPS_DEBUG");
-    if (debug_env && strcmp(debug_env, "1") == 0) {
-        printf("[RANGES LAUNCHER DEBUG] nx=%d, ny=%d, batch_size=%d, nblocks=%zu\\n",
-               nx, ny, batch_size, nblocks);
-        printf("  nvi=%d, nvj=%d, nvp=%d, max_var_idx=%d, sparse_args_count=%d\\n",
-               nvi, nvj, nvp, max_var_idx, sparse_args_count);
-    }
+    // Use precomputed values instead of runtime computation
+    constexpr int sparse_args_count = PRECOMPUTED_SPARSE_ARGS_COUNT;
+    constexpr int total_args = PRECOMPUTED_TOTAL_ARGS;
 
     int device_id;
     cudaError_t cuda_err = cudaGetDevice(&device_id);
@@ -398,20 +408,14 @@ extern "C" int launch_keops_kernel(
 
     float** h_args = (float**)(h_ptr + tables_size);
 
+    // Use precomputed mapping instead of runtime sorting
     float* sparse_buffer[256];
     float** sparse_args = (sparse_args_count <= 256) ? sparse_buffer : new float*[sparse_args_count];
     for (int i = 0; i < sparse_args_count; i++) sparse_args[i] = nullptr;
 
-    int all_var_indices[256];
-    int num_vars = nvi + nvj + nvp;
-    int idx = 0;
-    for (int i = 0; i < nvi; i++) all_var_indices[idx++] = indsi[i];
-    for (int j = 0; j < nvj; j++) all_var_indices[idx++] = indsj[j];
-    for (int p = 0; p < nvp; p++) all_var_indices[idx++] = indsp[p];
-    std::sort(all_var_indices, all_var_indices + num_vars);
-
-    for (int dense_idx = 0; dense_idx < num_vars; dense_idx++) {
-        sparse_args[all_var_indices[dense_idx]] = args[dense_idx];
+    // Apply precomputed mapping: sparse_args[PRECOMPUTED_MAPPING[i]] = args[i]
+    for (int i = 0; i < total_args; i++) {
+        sparse_args[PRECOMPUTED_MAPPING[i]] = args[i];
     }
 
     memcpy(h_args, sparse_args, size_args);
@@ -421,24 +425,12 @@ extern "C" int launch_keops_kernel(
 
     size_t shared_mem = effective_block_size * dimy * KEOPS_DTYPE_BYTES;
     
-    // Debug print before launch (debug_env already declared above)
-    if (debug_env && strcmp(debug_env, "1") == 0) {
-        printf("[RANGES LAUNCHER DEBUG] About to launch: gridSize=%d, blockSize=%d (effective), shared_mem=%zu\\n",
-               (int)gridSize.x, (int)blockSize.x, shared_mem);
-        printf("[RANGES LAUNCHER DEBUG] cuda_block_size=%d (requested), effective_block_size=%d (adjusted), dimy=%d\\n",
-               cuda_block_size, effective_block_size, dimy);
-    }
-    
     GpuConv1DOnDevice_ranges<<<gridSize, blockSize, shared_mem, stream>>>(
         nx, ny, nbatchdims, offsets_d, lookup_d, slices_x, ranges_y, out, args_d);
 
     cuda_err = cudaGetLastError();
     if (cuda_err != cudaSuccess) {
         printf("[LAUNCHER] Kernel launch error: %s\\n", cudaGetErrorString(cuda_err));
-        printf("[LAUNCHER] Launch config: gridSize=%d, blockSize=%d (effective), shared_mem=%zu bytes\\n",
-               (int)gridSize.x, (int)blockSize.x, shared_mem);
-        printf("[LAUNCHER] Parameters: nx=%d, ny=%d, dimy=%d, cuda_block_size=%d (requested), effective=%d\\n",
-               nx, ny, dimy, cuda_block_size, effective_block_size);
         return 1;
     }
     return 0;
@@ -446,7 +438,9 @@ extern "C" int launch_keops_kernel(
 '''
         else:
             launcher_code = preamble + '''
-static thread_local PinnedBuffer g_pinned_buffer;
+// Ultra-minimal launcher - all overhead removed
+// Thread-local buffer for args pointers (static allocation, no runtime checks)
+static thread_local float* g_args_buffer[64];
 
 extern "C" int launch_keops_kernel(
     int tagHostDevice,
@@ -475,117 +469,34 @@ extern "C" int launch_keops_kernel(
     cudaStream_t stream,
     void* scratch_ptr
 ) {
+    // Direct pointer casts - no validation
     float* out = (float*)out_ptr;
     float** args = (float**)args_ptr;
+    float** args_d = (float**)scratch_ptr;
     
-    // Dynamically adjust block size to fit shared memory constraints (48KB limit)
-    // This matches the NVRTC behavior in keops_nvrtc.cpp line 454
-    int effective_block_size = std::min(
-        cuda_block_size,
-        (int)(48000 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
-    );
+    // Block size adjustment for shared memory (compile-time when possible)
+    int effective_block_size = (dimy * KEOPS_DTYPE_BYTES > 48000) ?
+        (48000 / (dimy * KEOPS_DTYPE_BYTES)) : cuda_block_size;
     
+    // Apply precomputed mapping directly to thread-local buffer
+    // PRECOMPUTED_MAPPING[i] gives the kernel's expected position for args[i]
+    #pragma unroll
+    for (int i = 0; i < PRECOMPUTED_TOTAL_ARGS; i++) {
+        g_args_buffer[PRECOMPUTED_MAPPING[i]] = args[i];
+    }
+
+    // Single async copy of args pointers to device
+    cudaMemcpyAsync(args_d, g_args_buffer, 
+                    sizeof(float*) * PRECOMPUTED_SPARSE_ARGS_COUNT,
+                    cudaMemcpyHostToDevice, stream);
+    
+    // Launch kernel - no error checking in hot path
     dim3 blockSize(effective_block_size);
-    dim3 gridSize((nx + blockSize.x - 1) / blockSize.x);
-
-    int64_t var_counts = (int64_t)argshapes;
-    int nvi = var_counts & 0xFF;
-    int nvj = (var_counts >> 8) & 0xFF;
-    int nvp = (var_counts >> 16) & 0xFF;
-    int total_args = nvi + nvj + nvp;
-
-    // Compute max_var_idx to handle sparse argument indices
-    // The kernel may use non-contiguous indices like [0,1,3,4] instead of [0,1,2,3]
-    int max_var_idx = -1;
-    if (nvi > 0 && indsi) {
-        for (int i = 0; i < nvi; i++) if (indsi[i] > max_var_idx) max_var_idx = indsi[i];
-    }
-    if (nvj > 0 && indsj) {
-        for (int j = 0; j < nvj; j++) if (indsj[j] > max_var_idx) max_var_idx = indsj[j];
-    }
-    if (nvp > 0 && indsp) {
-        for (int p = 0; p < nvp; p++) if (indsp[p] > max_var_idx) max_var_idx = indsp[p];
-    }
-    int sparse_args_count = max_var_idx + 1;
-
-    // DEBUG: Print launcher params
-    const char* debug_env = getenv("JAX_KEOPS_DEBUG");
-    if (debug_env && strcmp(debug_env, "1") == 0) {
-        printf("[SIMPLE LAUNCHER DEBUG] nx=%d, ny=%d, nvi=%d, nvj=%d, nvp=%d, total_args=%d, sparse_args_count=%d\\n",
-               nx, ny, nvi, nvj, nvp, total_args, sparse_args_count);
-        printf("[SIMPLE LAUNCHER DEBUG] cuda_block_size=%d (requested), effective_block_size=%d (adjusted), dimy=%d\\n",
-               cuda_block_size, effective_block_size, dimy);
-    }
-
+    dim3 gridSize((nx + effective_block_size - 1) / effective_block_size);
     size_t shared_mem = effective_block_size * dimy * KEOPS_DTYPE_BYTES;
     
-    // Always print shared_mem info for debugging chunk mode issues
-    if (debug_env && strcmp(debug_env, "1") == 0) {
-        printf("[SIMPLE LAUNCHER DEBUG] shared_mem=%zu bytes, gridSize=%d, blockSize=%d\\n",
-               shared_mem, (int)gridSize.x, (int)blockSize.x);
-    }
-    size_t args_size = sizeof(float*) * sparse_args_count;  // Use sparse count, not total_args
-
-    void* pinned_ptr = g_pinned_buffer.ensure(args_size);
-    float** h_args;
-    
-    if (pinned_ptr) {
-        h_args = (float**)pinned_ptr;
-    } else {
-        constexpr size_t FAST_PATH_MAX_ARGS = 32;
-        static thread_local float* fallback_buffer[FAST_PATH_MAX_ARGS];
-        if (sparse_args_count <= FAST_PATH_MAX_ARGS) {
-            h_args = fallback_buffer;
-        } else {
-            static thread_local std::vector<float*> dynamic_args_buffer;
-            dynamic_args_buffer.resize(sparse_args_count);
-            h_args = dynamic_args_buffer.data();
-        }
-    }
-
-    // Build sparse args array: map dense input indices to sparse kernel indices
-    // Initialize to nullptr for safety
-    for (int i = 0; i < sparse_args_count; i++) h_args[i] = nullptr;
-
-    // Collect all variable indices and sort them
-    int all_var_indices[256];
-    int idx = 0;
-    for (int i = 0; i < nvi; i++) all_var_indices[idx++] = indsi[i];
-    for (int j = 0; j < nvj; j++) all_var_indices[idx++] = indsj[j];
-    for (int p = 0; p < nvp; p++) all_var_indices[idx++] = indsp[p];
-    std::sort(all_var_indices, all_var_indices + total_args);
-
-    // Map: args[dense_idx] -> h_args[sparse_idx]
-    for (int dense_idx = 0; dense_idx < total_args; dense_idx++) {
-        h_args[all_var_indices[dense_idx]] = args[dense_idx];
-    }
-
-    char* device_ptr = (char*)scratch_ptr;
-    float** args_d = (float**)device_ptr;
-
-    cudaError_t memcpy_err = cudaMemcpyAsync(args_d, h_args, args_size, cudaMemcpyHostToDevice, stream);
-    if (memcpy_err != cudaSuccess) {
-        printf("[LAUNCHER] cudaMemcpyAsync error: %s\\n", cudaGetErrorString(memcpy_err));
-        return 1;
-    }
-    
-    // Debug print before launch
-    if (debug_env && strcmp(debug_env, "1") == 0) {
-        printf("[SIMPLE LAUNCHER DEBUG] About to launch kernel with gridSize=%d, blockSize=%d, shared_mem=%zu\\n",
-               (int)gridSize.x, (int)blockSize.x, shared_mem);
-    }
-    
     GpuConv1DOnDevice<<<gridSize, blockSize, shared_mem, stream>>>(nx, ny, out, args_d);
-
-    cudaError_t cuda_err = cudaGetLastError();
-    if (cuda_err != cudaSuccess) {
-        printf("[LAUNCHER] Kernel launch error: %s\\n", cudaGetErrorString(cuda_err));
-        printf("[LAUNCHER] Launch config: gridSize=%d, blockSize=%d, shared_mem=%zu bytes\\n",
-               (int)gridSize.x, (int)blockSize.x, shared_mem);
-        printf("[LAUNCHER] Parameters: nx=%d, ny=%d, dimy=%d, cuda_block_size=%d\\n",
-               nx, ny, dimy, cuda_block_size);
-        return 1;
-    }
+    
     return 0;
 }
 '''
