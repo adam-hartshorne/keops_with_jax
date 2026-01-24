@@ -384,6 +384,14 @@ def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_a
     reduction_formula_str = f"{reduction_op}_Reduction({formula}{str_opt_arg},{cat}{str_formula2})"
     
     tagCPUGPU, tag1D2D, tagHostDevice = get_tag_backend("GPU", jax_args)
+    
+    # Determine sum_scheme based on reduction type
+    # block_sum is only valid for sum-type reductions
+    sum_type_reductions = ("Sum", "Max_SumShiftExp", "Max_SumShiftExpWeight")
+    if reduction_op in sum_type_reductions:
+        sum_scheme = 'block_sum'
+    else:
+        sum_scheme = 'direct_sum'
 
     return keops_binder["cpp"](
         tagCPUGPU, tag1D2D, tagHostDevice,
@@ -391,8 +399,8 @@ def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_a
         -1,
         reduction_formula_str, aliases, len(jax_args), dtype_str, "jax",
         {
-            'dtype_acc': dtype_str,
-            'sum_scheme': 'block_sum',
+            'dtype_acc': dtype_str if reduction_op in sum_type_reductions else 'auto',
+            'sum_scheme': sum_scheme,
             'enable_chunks': enable_chunks,
             'use_fast_math': True,
             'multVar_highdim': False

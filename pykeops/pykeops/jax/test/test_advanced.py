@@ -7,10 +7,16 @@ Tests for advanced KeOps features not covered in the basic API tests.
 All tests compare JAX KeOps against PyTorch KeOps (ground truth).
 
 Tests cover:
-- Advanced Reductions (LogSumExp, KMin, ArgKMin) - if supported
+- All Reduction Types:
+  * Basic: Sum, Min, Max
+  * Index: ArgMin, ArgMax
+  * Combined: Min_ArgMin, Max_ArgMax, KMin_ArgKMin
+  * LogSumExp: LogSumExp, LogSumExpWeight
+  * SoftMax: SumSoftMaxWeight
+  * KNN: KMin, ArgKMin
 - Exotic Math Operations (Trig, Step, Abs, Sign, Clamp)
 - Batched Operations
-- Higher-Order Gradients (Hessians) - if supported
+- Higher-Order Gradients (Hessians) - documents FFI limitation
 - Various Genred formulas
 
 These tests ensure the JAX backend produces identical results to PyTorch.
@@ -97,11 +103,213 @@ def skip_if_no_torch(test_func):
 # =============================================================================
 
 class TestAdvancedReductions(unittest.TestCase):
-    """Tests for specialized reductions like LogSumExp and KMin."""
+    """Tests for all specialized reductions."""
     
     def setUp(self):
         self.data_np = generate_data_np(100, 80, 3)
         self.D = 3
+        # Additional data for weighted reductions
+        np.random.seed(SEED + 100)
+        self.b_np = np.random.randn(80, 3).astype(np.float32)
+    
+    # =========================================================================
+    # Basic Reductions
+    # =========================================================================
+    
+    @skip_if_no_torch
+    def test_min_reduction(self):
+        """Test Min reduction."""
+        formula = "SqDist(x,y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='Min', axis=1)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='Min', axis=1)
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda')
+        )
+        
+        match, max_diff = compare_arrays(result_jax, result_torch.cpu().numpy(), rtol=RTOL, atol=ATOL)
+        self.assertTrue(match, f"Min max diff: {max_diff}")
+
+    @skip_if_no_torch
+    def test_max_reduction(self):
+        """Test Max reduction."""
+        formula = "SqDist(x,y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='Max', axis=1)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='Max', axis=1)
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda')
+        )
+        
+        match, max_diff = compare_arrays(result_jax, result_torch.cpu().numpy(), rtol=RTOL, atol=ATOL)
+        self.assertTrue(match, f"Max max diff: {max_diff}")
+
+    # =========================================================================
+    # Arg Reductions (return indices)
+    # =========================================================================
+
+    @skip_if_no_torch
+    def test_argmin_reduction(self):
+        """Test ArgMin reduction (index of minimum value)."""
+        formula = "SqDist(x,y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='ArgMin', axis=1)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='ArgMin', axis=1)
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda')
+        )
+        
+        # Indices should match exactly
+        jax_indices = np.array(result_jax).astype(np.int32)
+        torch_indices = result_torch.cpu().numpy().astype(np.int32)
+        self.assertTrue(np.all(jax_indices == torch_indices), "ArgMin indices mismatch")
+
+    @skip_if_no_torch
+    def test_argmax_reduction(self):
+        """Test ArgMax reduction (index of maximum value)."""
+        formula = "SqDist(x,y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='ArgMax', axis=1)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='ArgMax', axis=1)
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda')
+        )
+        
+        # Indices should match exactly
+        jax_indices = np.array(result_jax).astype(np.int32)
+        torch_indices = result_torch.cpu().numpy().astype(np.int32)
+        self.assertTrue(np.all(jax_indices == torch_indices), "ArgMax indices mismatch")
+
+    # =========================================================================
+    # Combined Reductions (return tuples of values + indices)
+    # =========================================================================
+
+    @skip_if_no_torch
+    def test_min_argmin_reduction(self):
+        """Test Min_ArgMin reduction (min value AND its index)."""
+        formula = "SqDist(x,y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='Min_ArgMin', axis=1)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='Min_ArgMin', axis=1)
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda')
+        )
+        
+        # Should return tuple (values, indices)
+        self.assertIsInstance(result_jax, tuple, "Min_ArgMin should return tuple")
+        self.assertEqual(len(result_jax), 2, "Min_ArgMin should return 2 arrays")
+        
+        # Compare values
+        match_vals, max_diff_vals = compare_arrays(
+            result_jax[0], result_torch[0].cpu().numpy(), rtol=RTOL, atol=ATOL
+        )
+        self.assertTrue(match_vals, f"Min_ArgMin values max diff: {max_diff_vals}")
+        
+        # Compare indices
+        jax_indices = np.array(result_jax[1]).astype(np.int32)
+        torch_indices = result_torch[1].cpu().numpy().astype(np.int32)
+        self.assertTrue(np.all(jax_indices == torch_indices), "Min_ArgMin indices mismatch")
+
+    @skip_if_no_torch
+    def test_max_argmax_reduction(self):
+        """Test Max_ArgMax reduction (max value AND its index)."""
+        formula = "SqDist(x,y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='Max_ArgMax', axis=1)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='Max_ArgMax', axis=1)
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda')
+        )
+        
+        # Should return tuple (values, indices)
+        self.assertIsInstance(result_jax, tuple, "Max_ArgMax should return tuple")
+        self.assertEqual(len(result_jax), 2, "Max_ArgMax should return 2 arrays")
+        
+        # Compare values
+        match_vals, max_diff_vals = compare_arrays(
+            result_jax[0], result_torch[0].cpu().numpy(), rtol=RTOL, atol=ATOL
+        )
+        self.assertTrue(match_vals, f"Max_ArgMax values max diff: {max_diff_vals}")
+        
+        # Compare indices
+        jax_indices = np.array(result_jax[1]).astype(np.int32)
+        torch_indices = result_torch[1].cpu().numpy().astype(np.int32)
+        self.assertTrue(np.all(jax_indices == torch_indices), "Max_ArgMax indices mismatch")
+
+    @skip_if_no_torch
+    def test_kmin_argkmin_reduction(self):
+        """Test KMin_ArgKMin reduction (K smallest values AND their indices)."""
+        K = 5
+        formula = "SqDist(x,y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='KMin_ArgKMin', axis=1, opt_arg=K)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='KMin_ArgKMin', axis=1, opt_arg=K)
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda')
+        )
+        
+        # Should return tuple (values, indices)
+        self.assertIsInstance(result_jax, tuple, "KMin_ArgKMin should return tuple")
+        self.assertEqual(len(result_jax), 2, "KMin_ArgKMin should return 2 arrays")
+        self.assertEqual(result_jax[0].shape, (100, K), f"KMin values shape should be (100, {K})")
+        self.assertEqual(result_jax[1].shape, (100, K), f"ArgKMin indices shape should be (100, {K})")
+        
+        # Compare values
+        match_vals, max_diff_vals = compare_arrays(
+            result_jax[0], result_torch[0].cpu().numpy(), rtol=RTOL, atol=ATOL
+        )
+        self.assertTrue(match_vals, f"KMin_ArgKMin values max diff: {max_diff_vals}")
+        
+        # Compare indices
+        jax_indices = np.array(result_jax[1]).astype(np.int32)
+        torch_indices = result_torch[1].cpu().numpy().astype(np.int32)
+        self.assertTrue(np.all(jax_indices == torch_indices), "KMin_ArgKMin indices mismatch")
+
+    # =========================================================================
+    # LogSumExp Reductions
+    # =========================================================================
     
     @skip_if_no_torch
     def test_logsumexp(self):
@@ -113,11 +321,8 @@ class TestAdvancedReductions(unittest.TestCase):
         aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
         
         # JAX
-        try:
-            op_jax = Genred(formula, aliases, reduction_op='LogSumExp', axis=1)
-            result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
-        except (NameError, NotImplementedError, TypeError) as e:
-            self.skipTest(f"LogSumExp not supported in JAX backend: {e}")
+        op_jax = Genred(formula, aliases, reduction_op='LogSumExp', axis=1)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
         
         # PyTorch ground truth
         op_torch = Genred_torch(formula, aliases, reduction_op='LogSumExp', axis=1)
@@ -130,6 +335,70 @@ class TestAdvancedReductions(unittest.TestCase):
         self.assertTrue(match, f"LogSumExp max diff: {max_diff}")
 
     @skip_if_no_torch
+    def test_logsumexp_weight(self):
+        """
+        Test LogSumExpWeight reduction (weighted log-sum-exp).
+        Computes: log(sum_j(exp(f_ij) * g_ij))
+        """
+        formula = "-SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", f"b=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='LogSumExpWeight', axis=1, formula2="b")
+        result_jax = op_jax(
+            jnp.array(self.data_np['x']), 
+            jnp.array(self.data_np['y']),
+            jnp.array(self.b_np)
+        )
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='LogSumExpWeight', axis=1, formula2="b")
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda'),
+            torch.tensor(self.b_np, device='cuda')
+        )
+        
+        match, max_diff = compare_arrays(result_jax, result_torch.cpu().numpy(), rtol=RTOL, atol=ATOL)
+        self.assertTrue(match, f"LogSumExpWeight max diff: {max_diff}")
+
+    # =========================================================================
+    # SoftMax Reductions
+    # =========================================================================
+
+    @skip_if_no_torch
+    def test_sumsoftmaxweight(self):
+        """
+        Test SumSoftMaxWeight reduction (softmax-weighted average).
+        Computes: sum_j(softmax(f_ij) * g_ij) = sum_j(exp(f_ij) * g_ij) / sum_j(exp(f_ij))
+        """
+        formula = "-SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", f"b=Vj({self.D})"]
+        
+        # JAX
+        op_jax = Genred(formula, aliases, reduction_op='SumSoftMaxWeight', axis=1, formula2="b")
+        result_jax = op_jax(
+            jnp.array(self.data_np['x']), 
+            jnp.array(self.data_np['y']),
+            jnp.array(self.b_np)
+        )
+        
+        # PyTorch ground truth
+        op_torch = Genred_torch(formula, aliases, reduction_op='SumSoftMaxWeight', axis=1, formula2="b")
+        result_torch = op_torch(
+            torch.tensor(self.data_np['x'], device='cuda'),
+            torch.tensor(self.data_np['y'], device='cuda'),
+            torch.tensor(self.b_np, device='cuda')
+        )
+        
+        match, max_diff = compare_arrays(result_jax, result_torch.cpu().numpy(), rtol=RTOL, atol=ATOL)
+        self.assertTrue(match, f"SumSoftMaxWeight max diff: {max_diff}")
+
+    # =========================================================================
+    # K-Nearest Neighbor Reductions
+    # =========================================================================
+
+    @skip_if_no_torch
     def test_kmin(self):
         """Test KMin reduction (K-smallest values, for KNN)."""
         K = 5
@@ -137,11 +406,8 @@ class TestAdvancedReductions(unittest.TestCase):
         aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
         
         # JAX
-        try:
-            op_jax = Genred(formula, aliases, reduction_op='KMin', axis=1, opt_arg=K)
-            result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
-        except (NameError, NotImplementedError, TypeError) as e:
-            self.skipTest(f"KMin not supported in JAX backend: {e}")
+        op_jax = Genred(formula, aliases, reduction_op='KMin', axis=1, opt_arg=K)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
         
         # PyTorch ground truth
         op_torch = Genred_torch(formula, aliases, reduction_op='KMin', axis=1, opt_arg=K)
@@ -162,11 +428,8 @@ class TestAdvancedReductions(unittest.TestCase):
         aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
         
         # JAX
-        try:
-            op_jax = Genred(formula, aliases, reduction_op='ArgKMin', axis=1, opt_arg=K)
-            result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
-        except (NameError, NotImplementedError, TypeError) as e:
-            self.skipTest(f"ArgKMin not supported in JAX backend: {e}")
+        op_jax = Genred(formula, aliases, reduction_op='ArgKMin', axis=1, opt_arg=K)
+        result_jax = op_jax(jnp.array(self.data_np['x']), jnp.array(self.data_np['y']))
         
         # PyTorch ground truth
         op_torch = Genred_torch(formula, aliases, reduction_op='ArgKMin', axis=1, opt_arg=K)
@@ -176,13 +439,10 @@ class TestAdvancedReductions(unittest.TestCase):
         )
         
         self.assertEqual(result_jax.shape, (100, K))
-        # Indices should match exactly
-        match, max_diff = compare_arrays(
-            result_jax.astype(jnp.int32), 
-            result_torch.cpu().numpy().astype(np.int32), 
-            rtol=0, atol=0
-        )
-        self.assertTrue(match, f"ArgKMin indices mismatch")
+        # Indices should match exactly (convert to same int type for comparison)
+        jax_indices = np.array(result_jax).astype(np.int32)
+        torch_indices = result_torch.cpu().numpy().astype(np.int32)
+        self.assertTrue(np.all(jax_indices == torch_indices), "ArgKMin indices mismatch")
 
 
 # =============================================================================
@@ -231,6 +491,31 @@ class TestExoticMath(unittest.TestCase):
         
         match, max_diff = compare_arrays(result_jax, result_torch.cpu().numpy(), rtol=RTOL, atol=ATOL)
         self.assertTrue(match, f"Cos max diff: {max_diff}")
+
+    @skip_if_no_torch
+    def test_trigonometry_combined(self):
+        """
+        Test combined sin(x-y) + cos(x) - exercises variable deduplication.
+        
+        This is a regression test for the bug where reusing a LazyTensor
+        in different parts of an expression caused variable ID mismatch.
+        """
+        np.random.seed(SEED)
+        x_np = np.random.randn(50, 3).astype(np.float32)
+        y_np = np.random.randn(40, 3).astype(np.float32)
+        
+        # JAX
+        x_i_jax = LazyTensor(jnp.array(x_np)[:, None, :])
+        y_j_jax = LazyTensor(jnp.array(y_np)[None, :, :])
+        result_jax = ((x_i_jax - y_j_jax).sin() + x_i_jax.cos()).sum(axis=1)
+        
+        # PyTorch
+        x_i_torch = LazyTensor_torch(torch.tensor(x_np, device='cuda')[:, None, :])
+        y_j_torch = LazyTensor_torch(torch.tensor(y_np, device='cuda')[None, :, :])
+        result_torch = ((x_i_torch - y_j_torch).sin() + x_i_torch.cos()).sum(axis=1)
+        
+        match, max_diff = compare_arrays(result_jax, result_torch.cpu().numpy(), rtol=RTOL, atol=ATOL)
+        self.assertTrue(match, f"Combined sin+cos max diff: {max_diff}")
 
     @skip_if_no_torch
     def test_abs_sign(self):
@@ -411,13 +696,26 @@ class TestBatchedOperations(unittest.TestCase):
 # =============================================================================
 
 class TestHigherOrderGrads(unittest.TestCase):
-    """Test second-order derivatives (Hessian-vector products)."""
+    """
+    Test second-order derivatives (Hessian-vector products).
+    
+    NOTE: Higher-order gradients are NOT currently supported in the JAX backend.
+    
+    The JAX FFI (Foreign Function Interface) calls cannot be differentiated 
+    automatically. While first-order gradients work via custom_vjp, the backward
+    pass itself uses FFI calls which blocks second-order differentiation.
+    
+    To support this feature would require implementing custom_jvp for the 
+    backward pass with symbolic second-order gradient formulas.
+    """
     
     @skip_if_no_torch
     def test_hessian_vector_product(self):
         """
         Test 2nd order gradient: ∇²(Loss) @ v
-        Verifies the backward pass graph is differentiable.
+        
+        This test documents that higher-order gradients are NOT supported.
+        It will skip with an informative message.
         """
         data = generate_data_np(30, 25, 3)
         
@@ -440,21 +738,22 @@ class TestHigherOrderGrads(unittest.TestCase):
             _, hvp_jax = jax.jvp(grad_fn_jax, (x_jax,), (v_jax,))
         except ValueError as e:
             if "cannot be differentiated" in str(e):
-                self.skipTest(f"Higher-order gradients not supported: {e}")
+                self.skipTest(
+                    "Higher-order gradients not supported in JAX backend. "
+                    "FFI calls cannot be differentiated. Would require custom_jvp "
+                    "implementation for backward pass with symbolic 2nd-order formulas."
+                )
             raise
         
-        # PyTorch ground truth - compute HVP manually
+        # If we get here, higher-order grads work! Compare with PyTorch.
         x_torch = torch.tensor(data['x'], device='cuda', requires_grad=True)
         y_torch = torch.tensor(data['y'], device='cuda')
         v_torch = torch.ones_like(x_torch)
         
         op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
         
-        # First gradient
         loss = op_torch(x_torch, y_torch).sum()
         grad1, = torch.autograd.grad(loss, x_torch, create_graph=True)
-        
-        # HVP = gradient of (grad1 . v) w.r.t x
         hvp_torch, = torch.autograd.grad(grad1, x_torch, grad_outputs=v_torch)
         
         match, max_diff = compare_arrays(hvp_jax, hvp_torch.cpu().numpy(), rtol=1e-4, atol=1e-4)
