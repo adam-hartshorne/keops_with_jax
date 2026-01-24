@@ -2,8 +2,9 @@
 # Use the explicit subfolder path
 from .lazytensor.LazyTensor import LazyTensor, Vi, Vj, Pm
 from .generic import Genred
+from .operations import KernelSolve
 
 # This ensures the FFI targets are registered on import
 from .generic import generic_ops
 
-__all__ = ['LazyTensor', 'Vi', 'Vj', 'Pm', 'Genred']
+__all__ = ['LazyTensor', 'Vi', 'Vj', 'Pm', 'Genred', 'KernelSolve']
