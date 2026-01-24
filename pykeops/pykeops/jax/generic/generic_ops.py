@@ -589,12 +589,33 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                         raw_grad = raw_grad.reshape(target_shape)
                 grad_i = raw_grad + (jnp.zeros((), dtype=args[i].dtype) * args[i])
             else:
+                # For Pm (parameter) variables, gradient needs to be summed/reduced
+                # to match the original parameter shape.
+                # The gradient formula may produce (batch, n_i, dim) but input was (1, dim)
                 input_shape = args[i].shape
+
                 if raw_grad.shape != input_shape:
+                    # Sum over extra leading dimensions
                     while len(raw_grad.shape) > len(input_shape):
                         raw_grad = jnp.sum(raw_grad, axis=0)
+
+                    # Sum over axes where input has size 1 but grad has larger size
+                    # This is the key fix: for Pm params, we sum gradients, not reshape
                     if raw_grad.shape != input_shape:
-                        raw_grad = raw_grad.reshape(input_shape)
+                        axes_to_sum = []
+                        for axis in range(len(raw_grad.shape)):
+                            if axis < len(input_shape):
+                                if input_shape[axis] == 1 and raw_grad.shape[axis] > 1:
+                                    axes_to_sum.append(axis)
+
+                        # Sum over all mismatched axes at once, keeping dims
+                        if axes_to_sum:
+                            raw_grad = jnp.sum(raw_grad, axis=tuple(axes_to_sum), keepdims=True)
+
+                    # Final reshape if shapes still don't match (should be rare)
+                    if raw_grad.shape != input_shape:
+                        raw_grad = jnp.broadcast_to(raw_grad, input_shape) if raw_grad.size == 1 else raw_grad.reshape(input_shape)
+
                 grad_i = raw_grad
 
             results.append(grad_i)
