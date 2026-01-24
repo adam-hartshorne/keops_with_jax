@@ -104,6 +104,9 @@ class LazyTensor(GenericLazyTensor):
         self.Genred = Genred
         self.KernelSolve = None
 
+        # Initialize _var_ids
+        self._var_ids = ()
+
         # Handle scalars FIRST
         if x is not None and not isinstance(x, tuple):
             if isinstance(x, (int, float)):
@@ -113,67 +116,109 @@ class LazyTensor(GenericLazyTensor):
             if hasattr(x, 'shape') and len(x.shape) == 0:
                 x = jnp.reshape(x, (1,))
 
-        # Try base class first
-        try:
-            super().__init__(x=x, axis=axis)
-        except TypeError as e:
-            # Base class rejected JAX array - handle manually
-            if x is not None and safe_tools.is_tensor(x):
-                self.batchdims = ()
-                self.ni = None
-                self.nj = None
-
-                # Handle 3D tensors
-                if len(x.shape) >= 3:
-                    if len(x.shape) > 3:
-                        self.batchdims = tuple(x.shape[:-3])
-
-                    dim_i = x.shape[-3]
-                    dim_j = x.shape[-2]
-
-                    # Determine axis from shape if not provided
-                    if axis is None:
-                        if dim_i > 1 and dim_j == 1:
-                            axis = 0  # Vi
-                        elif dim_i == 1 and dim_j > 1:
-                            axis = 1  # Vj
-                        elif dim_i == 1 and dim_j == 1:
-                            axis = 1  # Default to Vj for (1,1,D)
-
-                    # Squeeze dimensions
-                    if dim_i == 1 and dim_j == 1:
-                        x = jnp.squeeze(x, axis=-3)
-                        x = jnp.squeeze(x, axis=-2)
-                    elif dim_i == 1:
-                        x = jnp.squeeze(x, axis=-3)
-                    elif dim_j == 1:
-                        x = jnp.squeeze(x, axis=-2)
-
-                # Set basic attributes - Use monotonic counter for uniqueness!
-                self.variables = (x,)
-                self.ndim = x.shape[-1]
-                self.axis = axis if axis is not None else (2 if len(x.shape) == 1 else None)
-
-                # FIX: Use monotonic counter instead of id(x) to avoid reuse issues
-                unique_id = _get_unique_var_id()
-                self.formula = f"Var({unique_id},{self.ndim},{self.axis})"
-
-                # Set ni/nj
-                if len(x.shape) >= 2:
-                    if self.axis == 0:
-                        self.ni = x.shape[-2]
-                    elif self.axis == 1:
-                        self.nj = x.shape[-2]
-
-                self._dtype = safe_tools.dtypename(safe_tools.dtype(x))
-            else:
+        # For JAX arrays (but NOT LazyTensors), we handle them ourselves to ensure consistent ID scheme
+        # The base class uses id(x) which doesn't work well with JAX tracers
+        is_lazy_tensor = hasattr(x, '__GenericLazyTensor__')
+        if x is not None and not isinstance(x, tuple) and not is_lazy_tensor and safe_tools.is_tensor(x):
+            self._init_from_jax_array(x, axis)
+        elif x is not None:
+            # Non-tensor types (tuple for symbolic, int, list) - use base class
+            try:
+                super().__init__(x=x, axis=axis)
+                # Base class may have created variables with id()-based IDs
+                # We need to track these
+                if hasattr(self, 'variables') and self.variables:
+                    self._var_ids = tuple(id(v) for v in self.variables)
+            except TypeError:
                 raise
+        else:
+            # x is None - initialize empty
+            super().__init__(x=None, axis=axis)
+
+    def _init_from_jax_array(self, x, axis):
+        """Initialize LazyTensor from a JAX array with consistent ID scheme."""
+        # Set the duck typing attribute (required for base class compatibility)
+        self.__GenericLazyTensor__ = True
+
+        # Initialize attributes that base class would set
+        self.batchdims = ()
+        self.ni = None
+        self.nj = None
+        self.symbolic_variables = ()
+        self.ranges = None
+        self.backend = None
+        self.formula2 = None
+        self.is_complex = False
+
+        # Handle 3D+ tensors
+        if len(x.shape) >= 3:
+            if len(x.shape) > 3:
+                self.batchdims = tuple(x.shape[:-3])
+
+            dim_i = x.shape[-3]
+            dim_j = x.shape[-2]
+
+            # Determine axis from shape if not provided
+            if axis is None:
+                if dim_i > 1 and dim_j == 1:
+                    axis = 0  # Vi
+                elif dim_i == 1 and dim_j > 1:
+                    axis = 1  # Vj
+                elif dim_i == 1 and dim_j == 1:
+                    axis = 1  # Default to Vj for (1,1,D)
+
+            # Squeeze dimensions
+            if dim_i == 1 and dim_j == 1:
+                x = jnp.squeeze(x, axis=-3)
+                x = jnp.squeeze(x, axis=-2)
+            elif dim_i == 1:
+                x = jnp.squeeze(x, axis=-3)
+            elif dim_j == 1:
+                x = jnp.squeeze(x, axis=-2)
+
+        # Set basic attributes
+        self.variables = (x,)
+        self.ndim = x.shape[-1]
+        self.axis = axis if axis is not None else (2 if len(x.shape) == 1 else None)
+
+        # Use monotonic counter for unique ID
+        unique_id = _get_unique_var_id()
+        self.formula = f"Var({unique_id},{self.ndim},{self.axis})"
+
+        # Store the unique_id for this variable
+        self._var_ids = (unique_id,)
+
+        # Set ni/nj
+        if len(x.shape) >= 2:
+            if self.axis == 0:
+                self.ni = x.shape[-2]
+            elif self.axis == 1:
+                self.nj = x.shape[-2]
+
+        self._dtype = safe_tools.dtypename(safe_tools.dtype(x))
 
     def get_tools(self):
         pass
 
     def lt_constructor(self, x=None, axis=None, is_complex=False):
         return LazyTensor(x=x, axis=axis, is_complex=is_complex)
+
+    def init(self, is_complex=False):
+        """Override to propagate _var_ids."""
+        res = super().init(is_complex=is_complex)
+        # Propagate _var_ids if we have it
+        if hasattr(self, '_var_ids'):
+            res._var_ids = self._var_ids
+        return res
+
+    def join(self, other, is_complex=False):
+        """Override to merge _var_ids from both operands."""
+        res = super().join(other, is_complex=is_complex)
+        # Merge _var_ids: self's ids + other's ids (same order as variables)
+        self_ids = getattr(self, '_var_ids', ())
+        other_ids = getattr(other, '_var_ids', ())
+        res._var_ids = self_ids + other_ids
+        return res
 
     def fixvariables(self):
         """
@@ -182,37 +227,24 @@ class LazyTensor(GenericLazyTensor):
         When we manually initialize LazyTensors (in except block), we use
         Var(unique_id, dim, cat) for uniqueness. But Genred needs Var(0, dim, cat),
         Var(1, dim, cat), etc. This method does the conversion.
+
+        Uses _var_ids to correctly map each variable to its unique_id in the formula.
         """
         import re
 
         combined = (self.formula or "") + (self.formula2 or "")
-
-        # Build mapping from unique_id to index based on variable order
-        id_to_idx = {}
-        for i, v in enumerate(self.variables):
-            # Find the unique ID used for this variable in the formula
-            # We search for Var(large_number, dim, cat) patterns
-            pass  # Will be handled below
-
-        # Find all Var IDs in formulas
         var_pattern = r'Var\((\d+),\s*(\d+),\s*(\d+|None)\)'
 
-        # Collect all unique IDs in order of appearance
-        seen_ids = []
-        for match in re.finditer(var_pattern, combined):
-            var_id = int(match.group(1))
-            if var_id not in seen_ids:
-                seen_ids.append(var_id)
+        # Get the _var_ids mapping (unique_id -> variable index in tuple)
+        var_ids = getattr(self, '_var_ids', ())
 
-        # Build mapping: large IDs (>1000000) are our unique IDs, map to indices
-        id_to_idx = {}
-        idx = 0
-        for var_id in seen_ids:
-            if var_id >= 1000000:  # Our unique IDs start at 1000001
-                id_to_idx[var_id] = idx
-                idx += 1
+        # Build mapping: unique_id -> index in self.variables tuple
+        # Since _var_ids[i] is the unique_id for variables[i], this is straightforward
+        id_to_tuple_idx = {}
+        for tuple_idx, unique_id in enumerate(var_ids):
+            id_to_tuple_idx[unique_id] = tuple_idx
 
-        # Replace Var(unique_id, dim, cat) with Var(idx, dim, cat)
+        # Replace Var(unique_id, dim, cat) with Var(tuple_idx, dim, cat)
         def replace_var(match):
             var_id = int(match.group(1))
             dim = match.group(2)
@@ -222,14 +254,18 @@ class LazyTensor(GenericLazyTensor):
             if var_id < 1000000:
                 return match.group(0)
 
-            # Look up index
-            idx = id_to_idx.get(var_id, 0)
+            # Look up the tuple index for this unique_id
+            tuple_idx = id_to_tuple_idx.get(var_id)
+            if tuple_idx is None:
+                # Fallback: not found in _var_ids, use old approach (for base class LazyTensors)
+                # This shouldn't happen for JAX LazyTensors we create
+                return match.group(0)
 
             # Convert None to 2 (Pm)
             if cat == "None":
                 cat = "2"
 
-            return f"Var({idx},{dim},{cat})"
+            return f"Var({tuple_idx},{dim},{cat})"
 
         # Fix both formulas
         if self.formula:

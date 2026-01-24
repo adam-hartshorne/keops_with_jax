@@ -2,18 +2,20 @@
 """
 KeOps JAX Multi-GPU Benchmark
 =============================
-Benchmark single GPU vs multi-GPU performance.
+Tests multi-GPU scaling efficiency using JAX's sharding capabilities.
 
-Updated with improved accuracy:
-- More iterations (50) for stable statistics
-- More warmup iterations (10)
-- Uses MEDIAN for fair comparison (accounts for async variance)
-- Explicit @jax.jit wrapping
-- Percentile statistics (P10, P90)
+Measures:
+- Single GPU baseline
+- Multi-GPU parallel execution
+- Scaling efficiency (speedup vs linear ideal)
+- Memory distribution
+
+Requirements:
+- Multiple NVIDIA GPUs
+- JAX with CUDA support
 """
 
 import os
-
 os.environ['JAX_KEOPS_DEBUG'] = '0'
 
 import sys
@@ -22,622 +24,297 @@ import json
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import List, Optional, Dict
 
-# Import test utilities
+# =============================================================================
+# JAX Setup - Must be before imports that use JAX
+# =============================================================================
+
+import jax
+import jax.numpy as jnp
+
 from test_utils import (
-    Colors, print_header, print_subheader,
-    ASCIITable, TableColumn, format_speedup, format_efficiency
+    print_header, print_subheader, print_info, print_success, print_warning, print_error,
+    print_benchmark_table, print_environment_info, RICH_AVAILABLE
 )
 
+if RICH_AVAILABLE:
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from test_utils import console
+
+# Check GPU availability
+devices = jax.devices('gpu')
+N_GPUS = len(devices)
+
+if N_GPUS < 2:
+    print_warning(f"Only {N_GPUS} GPU(s) available. Multi-GPU tests require 2+ GPUs.")
+    print_info("Running single-GPU benchmark instead.")
+
 # =============================================================================
-# JAX Setup
+# Import KeOps
 # =============================================================================
 
-# Try to import JAX with multi-GPU support
 try:
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-    from jax.experimental import shard_map
-
-    JAX_AVAILABLE = True
-    N_DEVICES = len(jax.devices())
-except ImportError as e:
-    print(f"{Colors.RED}Error: JAX not found: {e}{Colors.RESET}")
-    JAX_AVAILABLE = False
-    N_DEVICES = 0
-
-# Import KeOps JAX
-try:
-    from pykeops.jax import Genred
-
+    from pykeops.jax import Genred, LazyTensor
     KEOPS_AVAILABLE = True
 except ImportError as e:
-    print(f"{Colors.RED}Error: pykeops.jax not found: {e}{Colors.RESET}")
-    KEOPS_AVAILABLE = False
+    print_error(f"pykeops.jax not found: {e}")
+    sys.exit(1)
 
+# JAX sharding imports
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+from jax.experimental import mesh_utils
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 @dataclass
-class MultiGPUConfig:
-    """Configuration for multi-GPU benchmark."""
+class ScalingConfig:
+    """Configuration for a scaling test."""
     name: str
-    n: int
+    nx: int
+    ny: int
     dim: int
     formula: str
     has_param: bool = False
 
 
-# Problem sizes that benefit from multi-GPU
-MULTIGPU_CONFIGS = [
-    MultiGPUConfig("Small", 10_000, 3, "SqDist(x, y)"),
-    MultiGPUConfig("Medium", 50_000, 3, "SqDist(x, y)"),
-    MultiGPUConfig("Large", 100_000, 3, "SqDist(x, y)"),
-    MultiGPUConfig("Huge", 500_000, 3, "SqDist(x, y)"),
-    MultiGPUConfig("HighD/Medium", 50_000, 16, "SqDist(x, y)"),
-    MultiGPUConfig("Gaussian/Medium", 50_000, 3, "Exp(-SqNorm2(x-y)*s)", True),
-]
-
-# Updated benchmark parameters for better accuracy
-N_WARMUP = 10  # More warmup for JAX async stabilization
-N_ITER = 50  # More iterations for stable statistics
-
-
-# =============================================================================
-# Benchmark Results
-# =============================================================================
-
-@dataclass
-class MultiGPUResult:
-    """Result of a multi-GPU benchmark."""
+@dataclass 
+class ScalingResult:
+    """Result from a scaling test."""
     config_name: str
-    n: int
-    dim: int
-    n_devices: int
-    single_gpu_median_ms: float
-    single_gpu_mean_ms: float
-    single_gpu_min_ms: float
-    multi_gpu_median_ms: float
-    multi_gpu_mean_ms: float
-    multi_gpu_min_ms: float
+    n_gpus: int
+    time_ms: float
+    time_std: float
     speedup: float
     efficiency_pct: float
-    pass_type: str
+
+
+# Test configurations
+SCALING_CONFIGS = [
+    ScalingConfig("Medium/SqDist", 20000, 20000, 3, "SqNorm2(x-y)"),
+    ScalingConfig("Medium/Gaussian", 20000, 20000, 3, "Exp(-SqNorm2(x-y)*s)", True),
+    ScalingConfig("Large/SqDist", 50000, 50000, 3, "SqNorm2(x-y)"),
+    ScalingConfig("Large/Gaussian", 50000, 50000, 3, "Exp(-SqNorm2(x-y)*s)", True),
+    ScalingConfig("XLarge/SqDist", 100000, 100000, 3, "SqNorm2(x-y)"),
+]
+
+N_WARMUP = 5
+N_ITERS = 100
+N_BATCH = 20  # Number of iterations per batch (sync only at end of batch)
 
 
 # =============================================================================
-# Benchmark Functions
+# Sharding Utilities
 # =============================================================================
 
-def benchmark_single_gpu(config: MultiGPUConfig, n_warmup: int, n_iter: int) -> dict:
-    """Benchmark single GPU performance with explicit @jax.jit."""
-    devices = jax.devices()
-    device = devices[0]
-
-    # Create data on single device
-    x = jax.device_put(
-        jnp.array(np.random.randn(config.n, config.dim).astype(np.float32)),
-        device
-    )
-    y = jax.device_put(
-        jnp.array(np.random.randn(config.n, config.dim).astype(np.float32)),
-        device
-    )
-
-    # Create operator with explicit @jax.jit
-    if config.has_param:
-        aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})", "s=Pm(1)"]
-        s = jax.device_put(jnp.array([0.5], dtype=jnp.float32), device)
-        op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        @jax.jit
-        def compute(x, y, s):
-            return op(x, y, s)
-
-        # Trigger compilation
-        _ = compute(x, y, s)
-        jax.block_until_ready(_)
-
-        # Warmup
-        for _ in range(n_warmup):
-            _ = compute(x, y, s)
-            jax.block_until_ready(_)
-
-        # Benchmark
-        times = []
-        for _ in range(n_iter):
-            start = time.perf_counter()
-            result = compute(x, y, s)
-            jax.block_until_ready(result)
-            times.append((time.perf_counter() - start) * 1000)
-    else:
-        aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})"]
-        op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        @jax.jit
-        def compute(x, y):
-            return op(x, y)
-
-        # Trigger compilation
-        _ = compute(x, y)
-        jax.block_until_ready(_)
-
-        # Warmup
-        for _ in range(n_warmup):
-            _ = compute(x, y)
-            jax.block_until_ready(_)
-
-        # Benchmark
-        times = []
-        for _ in range(n_iter):
-            start = time.perf_counter()
-            result = compute(x, y)
-            jax.block_until_ready(result)
-            times.append((time.perf_counter() - start) * 1000)
-
-    times = np.array(times)
-    return {
-        'median': float(np.median(times)),
-        'mean': float(np.mean(times)),
-        'std': float(np.std(times)),
-        'min': float(np.min(times)),
-        'p10': float(np.percentile(times, 10)),
-        'p90': float(np.percentile(times, 90)),
-    }
-
-
-def benchmark_multi_gpu(config: MultiGPUConfig, n_warmup: int, n_iter: int) -> dict:
-    """Benchmark multi-GPU performance with sharding."""
-    devices = jax.devices()
-    n_devices = len(devices)
-
-    if n_devices < 2:
-        return None
-
+def create_sharded_data(nx, ny, dim, n_gpus, seed=42):
+    """Create data sharded across GPUs."""
+    np.random.seed(seed)
+    
+    x_np = np.random.randn(nx, dim).astype(np.float32)
+    y_np = np.random.randn(ny, dim).astype(np.float32)
+    s_np = np.array([0.5], dtype=np.float32)
+    
     # Create mesh
-    mesh = Mesh(np.array(devices), axis_names=('batch',))
-
-    # Create data
-    x_host = np.random.randn(config.n, config.dim).astype(np.float32)
-    y_host = np.random.randn(config.n, config.dim).astype(np.float32)
-
-    # Shard x across devices, replicate y
-    shard_x = NamedSharding(mesh, P('batch', None))
-    repl_y = NamedSharding(mesh, P(None, None))
-
-    x = jax.device_put(x_host, shard_x)
-    y = jax.device_put(y_host, repl_y)
-
-    # Create operator with explicit @jax.jit
-    if config.has_param:
-        aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})", "s=Pm(1)"]
-        s = jnp.array([0.5], dtype=jnp.float32)
-        op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        def local_compute(x_loc, y_repl):
-            return op(x_loc, y_repl, s)
-
-        @jax.jit
-        @shard_map.shard_map(mesh=mesh, in_specs=(P('batch', None), P(None, None)), out_specs=P('batch', None))
-        def compute_sharded(x_loc, y_repl):
-            return local_compute(x_loc, y_repl)
-    else:
-        aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})"]
-        op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        def local_compute(x_loc, y_repl):
-            return op(x_loc, y_repl)
-
-        @jax.jit
-        @shard_map.shard_map(mesh=mesh, in_specs=(P('batch', None), P(None, None)), out_specs=P('batch', None))
-        def compute_sharded(x_loc, y_repl):
-            return local_compute(x_loc, y_repl)
-
-    # Warmup with error handling
-    try:
-        _ = compute_sharded(x, y)
-        jax.block_until_ready(_)
-    except Exception as e:
-        print(f"    {Colors.RED}Multi-GPU setup failed: {e}{Colors.RESET}")
-        return None
-
-    for _ in range(n_warmup):
-        _ = compute_sharded(x, y)
-        jax.block_until_ready(_)
-
-    # Benchmark
-    times = []
-    for _ in range(n_iter):
-        start = time.perf_counter()
-        result = compute_sharded(x, y)
-        jax.block_until_ready(result)
-        times.append((time.perf_counter() - start) * 1000)
-
-    times = np.array(times)
-    return {
-        'median': float(np.median(times)),
-        'mean': float(np.mean(times)),
-        'std': float(np.std(times)),
-        'min': float(np.min(times)),
-        'p10': float(np.percentile(times, 10)),
-        'p90': float(np.percentile(times, 90)),
-    }
+    devices = jax.devices('gpu')[:n_gpus]
+    mesh = Mesh(np.array(devices), ('batch',))
+    
+    # Create sharding specs
+    # Shard x across batch dimension
+    x_sharding = NamedSharding(mesh, P('batch', None))
+    y_sharding = NamedSharding(mesh, P(None, None))  # Replicate y
+    s_sharding = NamedSharding(mesh, P(None))  # Replicate s
+    
+    # Create sharded arrays
+    x = jax.device_put(jnp.array(x_np), x_sharding)
+    y = jax.device_put(jnp.array(y_np), y_sharding)
+    s = jax.device_put(jnp.array(s_np), s_sharding)
+    
+    return x, y, s, mesh
 
 
-def benchmark_single_gpu_backward(config: MultiGPUConfig, n_warmup: int, n_iter: int) -> dict:
-    """Benchmark single GPU gradient computation with explicit @jax.jit."""
-    devices = jax.devices()
-    device = devices[0]
-
-    x = jax.device_put(
-        jnp.array(np.random.randn(config.n, config.dim).astype(np.float32)),
-        device
-    )
-    y = jax.device_put(
-        jnp.array(np.random.randn(config.n, config.dim).astype(np.float32)),
-        device
-    )
-
-    if config.has_param:
-        aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})", "s=Pm(1)"]
-        s = jax.device_put(jnp.array([0.5], dtype=jnp.float32), device)
-        op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        @jax.jit
-        def compute_grad(x, y):
-            def loss(x):
-                return jnp.sum(op(x, y, s))
-
-            return jax.grad(loss)(x)
-    else:
-        aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})"]
-        op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        @jax.jit
-        def compute_grad(x, y):
-            def loss(x):
-                return jnp.sum(op(x, y))
-
-            return jax.grad(loss)(x)
-
-    # Trigger compilation
-    _ = compute_grad(x, y)
-    jax.block_until_ready(_)
-
+def time_sharded_forward(op, args, mesh, n_warmup=N_WARMUP, n_iters=N_ITERS, batch_size=N_BATCH):
+    """
+    Time sharded forward pass using batched timing.
+    
+    To avoid block_until_ready() overhead dominating the measurement,
+    we run `batch_size` iterations, then sync once and divide.
+    """
+    # Create sharded compute function
+    @jax.jit
+    def compute(*a):
+        return op(*a)
+    
     # Warmup
     for _ in range(n_warmup):
-        _ = compute_grad(x, y)
-        jax.block_until_ready(_)
-
-    # Benchmark
+        result = compute(*args)
+    jax.block_until_ready(result)
+    
+    # Time in batches
     times = []
-    for _ in range(n_iter):
+    n_batches = n_iters // batch_size
+    
+    for _ in range(n_batches):
         start = time.perf_counter()
-        result = compute_grad(x, y)
-        jax.block_until_ready(result)
-        times.append((time.perf_counter() - start) * 1000)
-
-    times = np.array(times)
-    return {
-        'median': float(np.median(times)),
-        'mean': float(np.mean(times)),
-        'std': float(np.std(times)),
-        'min': float(np.min(times)),
-        'p10': float(np.percentile(times, 10)),
-        'p90': float(np.percentile(times, 90)),
-    }
+        for _ in range(batch_size):
+            result = compute(*args)
+        jax.block_until_ready(result)  # Sync once per batch
+        batch_time = (time.perf_counter() - start) * 1000
+        times.append(batch_time / batch_size)  # Per-iteration time
+    
+    return np.median(times), np.std(times)
 
 
-def benchmark_multi_gpu_backward(config: MultiGPUConfig, n_warmup: int, n_iter: int) -> dict:
-    """Benchmark multi-GPU gradient computation."""
-    devices = jax.devices()
-    n_devices = len(devices)
+# =============================================================================
+# Benchmark Runner
+# =============================================================================
 
-    if n_devices < 2:
-        return None
-
-    mesh = Mesh(np.array(devices), axis_names=('batch',))
-
-    x_host = np.random.randn(config.n, config.dim).astype(np.float32)
-    y_host = np.random.randn(config.n, config.dim).astype(np.float32)
-
-    shard_x = NamedSharding(mesh, P('batch', None))
-    repl_y = NamedSharding(mesh, P(None, None))
-
-    x = jax.device_put(x_host, shard_x)
-    y = jax.device_put(y_host, repl_y)
-
-    if config.has_param:
-        aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})", "s=Pm(1)"]
-        s = jnp.array([0.5], dtype=jnp.float32)
-        op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        @shard_map.shard_map(mesh=mesh, in_specs=(P('batch', None), P(None, None)), out_specs=P())
-        def loss_fn(x_loc, y_repl):
-            local_sum = jnp.sum(op(x_loc, y_repl, s))
-            global_loss = jax.lax.psum(local_sum, 'batch')
-            return global_loss / jax.lax.psum(1, 'batch')
-    else:
+def run_scaling_test(config: ScalingConfig, gpu_counts: List[int]) -> List[ScalingResult]:
+    """Run scaling test for different GPU counts."""
+    results = []
+    baseline_time = None
+    
+    for n_gpus in gpu_counts:
+        if n_gpus > N_GPUS:
+            continue
+        
+        # Create data
+        x, y, s, mesh = create_sharded_data(config.nx, config.ny, config.dim, n_gpus)
+        
+        # Create operator
         aliases = [f"x=Vi({config.dim})", f"y=Vj({config.dim})"]
+        if config.has_param:
+            aliases.append("s=Pm(1)")
+        
         op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
-
-        @shard_map.shard_map(mesh=mesh, in_specs=(P('batch', None), P(None, None)), out_specs=P())
-        def loss_fn(x_loc, y_repl):
-            local_sum = jnp.sum(op(x_loc, y_repl))
-            global_loss = jax.lax.psum(local_sum, 'batch')
-            return global_loss / jax.lax.psum(1, 'batch')
-
-    @jax.jit
-    def compute_grad(x, y):
-        return jax.grad(loss_fn)(x, y)
-
-    # Warmup with error handling
-    try:
-        _ = compute_grad(x, y)
-        jax.block_until_ready(_)
-    except Exception as e:
-        print(f"    {Colors.RED}Multi-GPU backward setup failed: {e}{Colors.RESET}")
-        return None
-
-    for _ in range(n_warmup):
-        _ = compute_grad(x, y)
-        jax.block_until_ready(_)
-
-    # Benchmark
-    times = []
-    for _ in range(n_iter):
-        start = time.perf_counter()
-        result = compute_grad(x, y)
-        jax.block_until_ready(result)
-        times.append((time.perf_counter() - start) * 1000)
-
-    times = np.array(times)
-    return {
-        'median': float(np.median(times)),
-        'mean': float(np.mean(times)),
-        'std': float(np.std(times)),
-        'min': float(np.min(times)),
-        'p10': float(np.percentile(times, 10)),
-        'p90': float(np.percentile(times, 90)),
-    }
+        args = (x, y, s) if config.has_param else (x, y)
+        
+        # Time
+        time_ms, time_std = time_sharded_forward(op, args, mesh)
+        
+        # Compute speedup
+        if baseline_time is None:
+            baseline_time = time_ms
+            speedup = 1.0
+        else:
+            speedup = baseline_time / time_ms
+        
+        # Efficiency (compared to linear scaling)
+        efficiency = (speedup / n_gpus) * 100 if n_gpus > 1 else 100.0
+        
+        results.append(ScalingResult(
+            config_name=config.name,
+            n_gpus=n_gpus,
+            time_ms=time_ms,
+            time_std=time_std,
+            speedup=speedup,
+            efficiency_pct=efficiency,
+        ))
+    
+    return results
 
 
 # =============================================================================
-# Main Benchmark Runner
+# Main
 # =============================================================================
-
-def run_multi_gpu_benchmarks(save_results: bool = True):
-    """Run multi-GPU benchmarks."""
-    if not JAX_AVAILABLE or not KEOPS_AVAILABLE:
-        print(f"{Colors.RED}JAX or KeOps not available. Cannot run benchmarks.{Colors.RESET}")
-        return False
-
-    print_header("KeOps JAX Multi-GPU Scaling Benchmark")
-
-    # Print configuration
-    print(f"  JAX version: {jax.__version__}")
-    print(f"  Number of devices: {N_DEVICES}")
-    if N_DEVICES > 0:
-        for i, dev in enumerate(jax.devices()):
-            print(f"    Device {i}: {dev}")
-    print(f"  Warmup iterations: {N_WARMUP}")
-    print(f"  Benchmark iterations: {N_ITER}")
-    print()
-    print(f"  {Colors.CYAN}Note: Using MEDIAN for all comparisons (accounts for async variance){Colors.RESET}")
-    print()
-
-    if N_DEVICES < 2:
-        print(
-            f"{Colors.YELLOW}Warning: Only {N_DEVICES} device(s) available. Multi-GPU tests will be skipped.{Colors.RESET}")
-        print()
-
-    results: List[MultiGPUResult] = []
-
-    # =========================
-    # Forward Pass Benchmarks
-    # =========================
-    print_subheader("Forward Pass: Single vs Multi-GPU")
-
-    table = ASCIITable([
-        TableColumn("Problem", 18),
-        TableColumn("N", 10, 'right'),
-        TableColumn("Single (ms)", 12, 'right'),
-        TableColumn(f"Multi-{N_DEVICES}GPU", 12, 'right'),
-        TableColumn("Speedup", 10, 'right'),
-        TableColumn("Efficiency", 10, 'right'),
-    ], title=f"Forward Pass Scaling ({N_DEVICES} GPUs) - Median times")
-
-    for config in MULTIGPU_CONFIGS:
-        print(f"  Running {config.name}...", end='', flush=True)
-
-        try:
-            single_result = benchmark_single_gpu(config, N_WARMUP, N_ITER)
-            multi_result = benchmark_multi_gpu(config, N_WARMUP, N_ITER)
-
-            if multi_result:
-                speedup = single_result['median'] / multi_result['median']
-                efficiency = (speedup / N_DEVICES) * 100
-
-                table.add_row([
-                    config.name,
-                    f"{config.n:,}",
-                    f"{single_result['median']:.3f}",
-                    f"{multi_result['median']:.3f}",
-                    format_speedup(speedup),
-                    format_efficiency(efficiency),
-                ])
-
-                results.append(MultiGPUResult(
-                    config_name=config.name,
-                    n=config.n,
-                    dim=config.dim,
-                    n_devices=N_DEVICES,
-                    single_gpu_median_ms=single_result['median'],
-                    single_gpu_mean_ms=single_result['mean'],
-                    single_gpu_min_ms=single_result['min'],
-                    multi_gpu_median_ms=multi_result['median'],
-                    multi_gpu_mean_ms=multi_result['mean'],
-                    multi_gpu_min_ms=multi_result['min'],
-                    speedup=speedup,
-                    efficiency_pct=efficiency,
-                    pass_type='forward',
-                ))
-
-                print(f" done (1GPU: {single_result['median']:.3f}ms, {N_DEVICES}GPU: {multi_result['median']:.3f}ms)")
-            else:
-                table.add_row([
-                    config.name,
-                    f"{config.n:,}",
-                    f"{single_result['median']:.3f}",
-                    "-",
-                    "-",
-                    "-",
-                ])
-                print(f" done (single GPU only)")
-
-        except Exception as e:
-            print(f" {Colors.RED}ERROR: {e}{Colors.RESET}")
-            import traceback
-            traceback.print_exc()
-            table.add_row([config.name, f"{config.n:,}", "ERROR", "-", "-", "-"])
-
-    table.print()
-
-    # =========================
-    # Backward Pass Benchmarks
-    # =========================
-    if N_DEVICES >= 2:
-        print_subheader("Backward Pass: Single vs Multi-GPU")
-
-        table = ASCIITable([
-            TableColumn("Problem", 18),
-            TableColumn("N", 10, 'right'),
-            TableColumn("Single (ms)", 12, 'right'),
-            TableColumn(f"Multi-{N_DEVICES}GPU", 12, 'right'),
-            TableColumn("Speedup", 10, 'right'),
-            TableColumn("Efficiency", 10, 'right'),
-        ], title=f"Backward Pass Scaling ({N_DEVICES} GPUs) - Median times")
-
-        # Use smaller configs for backward
-        backward_configs = [c for c in MULTIGPU_CONFIGS if c.n <= 100_000]
-
-        for config in backward_configs:
-            print(f"  Running {config.name}...", end='', flush=True)
-
-            try:
-                single_result = benchmark_single_gpu_backward(config, N_WARMUP, N_ITER)
-                multi_result = benchmark_multi_gpu_backward(config, N_WARMUP, N_ITER)
-
-                if multi_result:
-                    speedup = single_result['median'] / multi_result['median']
-                    efficiency = (speedup / N_DEVICES) * 100
-
-                    table.add_row([
-                        config.name,
-                        f"{config.n:,}",
-                        f"{single_result['median']:.3f}",
-                        f"{multi_result['median']:.3f}",
-                        format_speedup(speedup),
-                        format_efficiency(efficiency),
-                    ])
-
-                    results.append(MultiGPUResult(
-                        config_name=config.name,
-                        n=config.n,
-                        dim=config.dim,
-                        n_devices=N_DEVICES,
-                        single_gpu_median_ms=single_result['median'],
-                        single_gpu_mean_ms=single_result['mean'],
-                        single_gpu_min_ms=single_result['min'],
-                        multi_gpu_median_ms=multi_result['median'],
-                        multi_gpu_mean_ms=multi_result['mean'],
-                        multi_gpu_min_ms=multi_result['min'],
-                        speedup=speedup,
-                        efficiency_pct=efficiency,
-                        pass_type='backward',
-                    ))
-
-                    print(
-                        f" done (1GPU: {single_result['median']:.3f}ms, {N_DEVICES}GPU: {multi_result['median']:.3f}ms)")
-                else:
-                    table.add_row([
-                        config.name,
-                        f"{config.n:,}",
-                        f"{single_result['median']:.3f}",
-                        "-",
-                        "-",
-                        "-",
-                    ])
-                    print(f" done (single GPU only)")
-
-            except Exception as e:
-                print(f" {Colors.RED}ERROR: {e}{Colors.RESET}")
-                table.add_row([config.name, f"{config.n:,}", "ERROR", "-", "-", "-"])
-
-        table.print()
-
-    # =========================
-    # Summary
-    # =========================
-    print_subheader("Summary")
-
-    forward_results = [r for r in results if r.pass_type == 'forward']
-    backward_results = [r for r in results if r.pass_type == 'backward']
-
-    if forward_results:
-        speedups = [r.speedup for r in forward_results]
-        efficiencies = [r.efficiency_pct for r in forward_results]
-        print(f"  Forward pass ({len(forward_results)} tests):")
-        print(f"    Average speedup: {format_speedup(np.mean(speedups))}")
-        print(f"    Speedup range: {min(speedups):.2f}x - {max(speedups):.2f}x")
-        print(f"    Average efficiency: {np.mean(efficiencies):.1f}%")
-        print(f"    Efficiency range: {min(efficiencies):.1f}% - {max(efficiencies):.1f}%")
-
-    if backward_results:
-        speedups = [r.speedup for r in backward_results]
-        efficiencies = [r.efficiency_pct for r in backward_results]
-        print(f"  Backward pass ({len(backward_results)} tests):")
-        print(f"    Average speedup: {format_speedup(np.mean(speedups))}")
-        print(f"    Speedup range: {min(speedups):.2f}x - {max(speedups):.2f}x")
-        print(f"    Average efficiency: {np.mean(efficiencies):.1f}%")
-        print(f"    Efficiency range: {min(efficiencies):.1f}% - {max(efficiencies):.1f}%")
-
-    print()
-    print(f"  {Colors.CYAN}Efficiency = (speedup / num_gpus) * 100%")
-    print(f"  100% = perfect linear scaling, >50% = good scaling{Colors.RESET}")
-
-    # Save results
-    if save_results and results:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"benchmark_multi_gpu_{timestamp}.json"
-        with open(filename, 'w') as f:
-            json.dump([asdict(r) for r in results], f, indent=2)
-        print(f"\n  Results saved to: {filename}")
-
-    return True
-
-
-# =============================================================================
-# Entry Points
-# =============================================================================
-
-def test_multi_gpu_scaling():
-    """Test function for pytest."""
-    if N_DEVICES < 2:
-        print(f"Skipping multi-GPU test: only {N_DEVICES} device(s) available")
-        return True
-
-    return run_multi_gpu_benchmarks(save_results=False)
-
 
 def main():
-    """Main entry point."""
-    success = run_multi_gpu_benchmarks(save_results=True)
-    return 0 if success else 1
+    print_header("KeOps JAX Multi-GPU Benchmark", 
+                f"Scaling test across {N_GPUS} GPUs")
+    
+    print_environment_info()
+    
+    if N_GPUS < 2:
+        print_error("Multi-GPU benchmark requires at least 2 GPUs")
+        return 1
+    
+    # GPU counts to test
+    gpu_counts = [1, 2, 4, 8]
+    gpu_counts = [g for g in gpu_counts if g <= N_GPUS]
+    
+    print_info(f"Testing with GPU counts: {gpu_counts}")
+    
+    all_results: Dict[str, List[ScalingResult]] = {}
+    
+    print_subheader("Running Scaling Tests")
+    
+    for config in SCALING_CONFIGS:
+        print_info(f"Testing {config.name}...")
+        
+        try:
+            results = run_scaling_test(config, gpu_counts)
+            all_results[config.name] = results
+            
+            # Print immediate results
+            for r in results:
+                speedup_str = f"↑{r.speedup:.2f}x" if r.speedup > 1 else f"→{r.speedup:.2f}x"
+                print(f"    {r.n_gpus} GPU(s): {r.time_ms:.2f}ms ({speedup_str}, {r.efficiency_pct:.0f}% eff)")
+        
+        except Exception as e:
+            print_warning(f"Failed: {e}")
+            continue
+    
+    # ==========================================================================
+    # Summary Tables
+    # ==========================================================================
+    print_subheader("Scaling Results Summary")
+    
+    for config_name, results in all_results.items():
+        rows = []
+        for r in results:
+            rows.append({
+                'n_gpus': f"{r.n_gpus} GPU(s)",
+                'time_ms': r.time_ms,
+                'time_std': r.time_std,
+                'speedup': r.speedup,
+                'efficiency': f"{r.efficiency_pct:.0f}%",
+            })
+        
+        columns = [
+            ('n_gpus', 'Configuration', 12),
+            ('time_ms', 'Time (ms)', 12),
+            ('time_std', '± std', 8),
+            ('speedup', 'Speedup', 10),
+            ('efficiency', 'Efficiency', 10),
+        ]
+        
+        print_benchmark_table(f"Scaling: {config_name}", rows, columns)
+    
+    # ==========================================================================
+    # Overall Summary
+    # ==========================================================================
+    print_subheader("Overall Scaling Efficiency")
+    
+    # Calculate average efficiency for each GPU count
+    for n_gpus in gpu_counts[1:]:  # Skip 1 GPU
+        efficiencies = []
+        for results in all_results.values():
+            for r in results:
+                if r.n_gpus == n_gpus:
+                    efficiencies.append(r.efficiency_pct)
+        
+        if efficiencies:
+            avg_eff = np.mean(efficiencies)
+            if avg_eff >= 80:
+                print_success(f"{n_gpus} GPUs: {avg_eff:.0f}% average efficiency (excellent)")
+            elif avg_eff >= 50:
+                print_info(f"{n_gpus} GPUs: {avg_eff:.0f}% average efficiency (good)")
+            else:
+                print_warning(f"{n_gpus} GPUs: {avg_eff:.0f}% average efficiency (poor)")
+    
+    # Save results
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f"benchmark_multi_gpu_{timestamp}.json"
+    
+    serializable = {k: [asdict(r) for r in v] for k, v in all_results.items()}
+    with open(output_file, 'w') as f:
+        json.dump(serializable, f, indent=2)
+    
+    print_info(f"Results saved to: {output_file}")
+    
+    return 0
 
 
 if __name__ == "__main__":

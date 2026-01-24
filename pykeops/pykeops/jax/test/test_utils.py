@@ -1,18 +1,47 @@
+#!/usr/bin/env python3
 """
 KeOps JAX Test Utilities
 ========================
 Shared utilities for test formatting, color output, and table rendering.
+
+Features:
+- Rich library integration for beautiful output (falls back to ANSI if unavailable)
+- ASCII table rendering
+- Test result tracking
+- Progress indicators
+- Comparison helpers
 """
 
 import sys
 import time
-from typing import List, Tuple, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any, Optional, Callable
+from dataclasses import dataclass, field
 from enum import Enum
+from contextlib import contextmanager
+import numpy as np
+
+# =============================================================================
+# Try to import Rich for beautiful output
+# =============================================================================
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+    from rich.text import Text
+    from rich import box
+    from rich.live import Live
+    from rich.style import Style
+    RICH_AVAILABLE = True
+    console = Console()
+except ImportError:
+    RICH_AVAILABLE = False
+    console = None
 
 
 # =============================================================================
-# ANSI Color Codes
+# ANSI Color Codes (fallback when Rich not available)
 # =============================================================================
 
 class Colors:
@@ -25,6 +54,7 @@ class Colors:
     MAGENTA = '\033[95m'
     CYAN = '\033[96m'
     WHITE = '\033[97m'
+    GREY = '\033[90m'
     
     # Styles
     BOLD = '\033[1m'
@@ -43,21 +73,9 @@ class Colors:
     @staticmethod
     def disable():
         """Disable colors for non-terminal output."""
-        Colors.RED = ''
-        Colors.GREEN = ''
-        Colors.YELLOW = ''
-        Colors.BLUE = ''
-        Colors.MAGENTA = ''
-        Colors.CYAN = ''
-        Colors.WHITE = ''
-        Colors.BOLD = ''
-        Colors.DIM = ''
-        Colors.UNDERLINE = ''
-        Colors.RESET = ''
-        Colors.BG_RED = ''
-        Colors.BG_GREEN = ''
-        Colors.BG_YELLOW = ''
-        Colors.BG_BLUE = ''
+        for attr in ['RED', 'GREEN', 'YELLOW', 'BLUE', 'MAGENTA', 'CYAN', 'WHITE', 'GREY',
+                     'BOLD', 'DIM', 'UNDERLINE', 'RESET', 'BG_RED', 'BG_GREEN', 'BG_YELLOW', 'BG_BLUE']:
+            setattr(Colors, attr, '')
 
 
 # Check if output is to a terminal
@@ -66,7 +84,7 @@ if not sys.stdout.isatty():
 
 
 # =============================================================================
-# Status Indicators
+# Status Enum
 # =============================================================================
 
 class Status(Enum):
@@ -79,197 +97,35 @@ class Status(Enum):
 
 def status_icon(status: Status) -> str:
     """Get colored status icon."""
-    icons = {
-        Status.PASS: f"{Colors.GREEN}✓ PASS{Colors.RESET}",
-        Status.FAIL: f"{Colors.RED}✗ FAIL{Colors.RESET}",
-        Status.SKIP: f"{Colors.YELLOW}○ SKIP{Colors.RESET}",
-        Status.ERROR: f"{Colors.RED}💥 ERROR{Colors.RESET}",
-        Status.WARN: f"{Colors.YELLOW}⚠ WARN{Colors.RESET}",
-    }
+    if RICH_AVAILABLE:
+        icons = {
+            Status.PASS: "[bold green]✓ PASS[/]",
+            Status.FAIL: "[bold red]✗ FAIL[/]",
+            Status.SKIP: "[bold yellow]○ SKIP[/]",
+            Status.ERROR: "[bold red]💥 ERROR[/]",
+            Status.WARN: "[bold yellow]⚠ WARN[/]",
+        }
+    else:
+        icons = {
+            Status.PASS: f"{Colors.GREEN}✓ PASS{Colors.RESET}",
+            Status.FAIL: f"{Colors.RED}✗ FAIL{Colors.RESET}",
+            Status.SKIP: f"{Colors.YELLOW}○ SKIP{Colors.RESET}",
+            Status.ERROR: f"{Colors.RED}💥 ERROR{Colors.RESET}",
+            Status.WARN: f"{Colors.YELLOW}⚠ WARN{Colors.RESET}",
+        }
     return icons.get(status, "?")
 
 
-def status_badge(status: Status) -> str:
-    """Get colored status badge for tables."""
-    badges = {
-        Status.PASS: f"{Colors.BG_GREEN}{Colors.WHITE} PASS {Colors.RESET}",
-        Status.FAIL: f"{Colors.BG_RED}{Colors.WHITE} FAIL {Colors.RESET}",
-        Status.SKIP: f"{Colors.BG_YELLOW}{Colors.WHITE} SKIP {Colors.RESET}",
-        Status.ERROR: f"{Colors.BG_RED}{Colors.WHITE} ERR  {Colors.RESET}",
-        Status.WARN: f"{Colors.BG_YELLOW}{Colors.WHITE} WARN {Colors.RESET}",
+def status_style(status: Status) -> str:
+    """Get Rich style for status."""
+    styles = {
+        Status.PASS: "bold green",
+        Status.FAIL: "bold red",
+        Status.SKIP: "bold yellow",
+        Status.ERROR: "bold red",
+        Status.WARN: "bold yellow",
     }
-    return badges.get(status, "  ?  ")
-
-
-# =============================================================================
-# Speed Formatting
-# =============================================================================
-
-def color_speed(time_ms: float, reference_ms: Optional[float] = None) -> str:
-    """Color-code a timing value based on speed or comparison."""
-    if reference_ms is not None:
-        ratio = time_ms / reference_ms
-        if ratio < 0.9:  # Faster
-            color = Colors.GREEN
-        elif ratio < 1.1:  # Similar
-            color = Colors.YELLOW
-        else:  # Slower
-            color = Colors.RED
-        return f"{color}{time_ms:.3f}{Colors.RESET}"
-    else:
-        # Standalone - color by absolute time
-        if time_ms < 1.0:
-            color = Colors.GREEN
-        elif time_ms < 10.0:
-            color = Colors.YELLOW
-        else:
-            color = Colors.RED
-        return f"{color}{time_ms:.3f}{Colors.RESET}"
-
-
-def format_speedup(speedup: float) -> str:
-    """Format speedup value with color."""
-    if speedup > 1.1:
-        color = Colors.GREEN
-        arrow = "↑"
-    elif speedup < 0.9:
-        color = Colors.RED
-        arrow = "↓"
-    else:
-        color = Colors.YELLOW
-        arrow = "→"
-    return f"{color}{arrow} {speedup:.2f}x{Colors.RESET}"
-
-
-def format_efficiency(efficiency_pct: float) -> str:
-    """Format scaling efficiency percentage."""
-    if efficiency_pct >= 80:
-        color = Colors.GREEN
-    elif efficiency_pct >= 50:
-        color = Colors.YELLOW
-    else:
-        color = Colors.RED
-    return f"{color}{efficiency_pct:.0f}%{Colors.RESET}"
-
-
-# =============================================================================
-# ASCII Table Rendering
-# =============================================================================
-
-@dataclass
-class TableColumn:
-    """Definition for a table column."""
-    header: str
-    width: int
-    align: str = 'left'  # 'left', 'right', 'center'
-
-
-class ASCIITable:
-    """Simple ASCII table renderer with colors."""
-    
-    # Box drawing characters
-    CORNER_TL = '┌'
-    CORNER_TR = '┐'
-    CORNER_BL = '└'
-    CORNER_BR = '┘'
-    HORIZONTAL = '─'
-    VERTICAL = '│'
-    T_DOWN = '┬'
-    T_UP = '┴'
-    T_RIGHT = '├'
-    T_LEFT = '┤'
-    CROSS = '┼'
-    
-    # Double line variants for headers
-    DOUBLE_HORIZONTAL = '═'
-    
-    def __init__(self, columns: List[TableColumn], title: Optional[str] = None):
-        self.columns = columns
-        self.title = title
-        self.rows: List[List[str]] = []
-        
-    def add_row(self, values: List[Any]):
-        """Add a row of values."""
-        self.rows.append([str(v) for v in values])
-        
-    def add_separator(self):
-        """Add a separator row."""
-        self.rows.append(None)  # None indicates separator
-        
-    def _strip_ansi(self, text: str) -> str:
-        """Remove ANSI codes for width calculation."""
-        import re
-        return re.sub(r'\033\[[0-9;]*m', '', text)
-    
-    def _pad(self, text: str, width: int, align: str) -> str:
-        """Pad text to width, accounting for ANSI codes."""
-        visible_len = len(self._strip_ansi(text))
-        padding = width - visible_len
-        if padding <= 0:
-            return text
-        if align == 'left':
-            return text + ' ' * padding
-        elif align == 'right':
-            return ' ' * padding + text
-        else:  # center
-            left = padding // 2
-            right = padding - left
-            return ' ' * left + text + ' ' * right
-    
-    def _horizontal_line(self, left: str, mid: str, right: str) -> str:
-        """Create a horizontal line."""
-        parts = [left]
-        for i, col in enumerate(self.columns):
-            parts.append(self.HORIZONTAL * (col.width + 2))
-            if i < len(self.columns) - 1:
-                parts.append(mid)
-        parts.append(right)
-        return ''.join(parts)
-    
-    def render(self) -> str:
-        """Render the table as a string."""
-        lines = []
-        
-        # Title
-        if self.title:
-            total_width = sum(c.width + 3 for c in self.columns) + 1
-            lines.append('')
-            lines.append(f"{Colors.BOLD}{Colors.CYAN}{self.title.center(total_width)}{Colors.RESET}")
-            lines.append('')
-        
-        # Top border
-        lines.append(self._horizontal_line(self.CORNER_TL, self.T_DOWN, self.CORNER_TR))
-        
-        # Header row
-        header_parts = [self.VERTICAL]
-        for col in self.columns:
-            header_parts.append(f" {Colors.BOLD}{self._pad(col.header, col.width, 'center')}{Colors.RESET} ")
-            header_parts.append(self.VERTICAL)
-        lines.append(''.join(header_parts))
-        
-        # Header separator
-        lines.append(self._horizontal_line(self.T_RIGHT, self.CROSS, self.T_LEFT))
-        
-        # Data rows
-        for row in self.rows:
-            if row is None:
-                # Separator
-                lines.append(self._horizontal_line(self.T_RIGHT, self.CROSS, self.T_LEFT))
-            else:
-                row_parts = [self.VERTICAL]
-                for i, (value, col) in enumerate(zip(row, self.columns)):
-                    row_parts.append(f" {self._pad(value, col.width, col.align)} ")
-                    row_parts.append(self.VERTICAL)
-                lines.append(''.join(row_parts))
-        
-        # Bottom border
-        lines.append(self._horizontal_line(self.CORNER_BL, self.T_UP, self.CORNER_BR))
-        
-        return '\n'.join(lines)
-    
-    def print(self):
-        """Print the table."""
-        print(self.render())
+    return styles.get(status, "white")
 
 
 # =============================================================================
@@ -283,18 +139,16 @@ class TestResult:
     status: Status
     duration_ms: float = 0.0
     message: str = ""
-    details: Dict[str, Any] = None
-    
-    def __post_init__(self):
-        if self.details is None:
-            self.details = {}
+    details: Dict[str, Any] = field(default_factory=dict)
+    max_diff: Optional[float] = None
 
 
 class TestSuite:
     """Collection of test results with summary reporting."""
     
-    def __init__(self, name: str):
+    def __init__(self, name: str, description: str = ""):
         self.name = name
+        self.description = description
         self.results: List[TestResult] = []
         self.start_time = time.time()
         
@@ -302,7 +156,7 @@ class TestSuite:
         """Add a test result."""
         self.results.append(result)
         
-    def get_summary(self) -> Dict[str, int]:
+    def get_summary(self) -> Dict[Status, int]:
         """Get count by status."""
         summary = {s: 0 for s in Status}
         for r in self.results:
@@ -318,50 +172,101 @@ class TestSuite:
         total_time = time.time() - self.start_time
         summary = self.get_summary()
         
-        # Header
+        if RICH_AVAILABLE:
+            self._print_summary_rich(total_time, summary)
+        else:
+            self._print_summary_ansi(total_time, summary)
+    
+    def _print_summary_rich(self, total_time: float, summary: Dict[Status, int]):
+        """Print summary using Rich."""
+        # Create table
+        table = Table(
+            title=f"[bold cyan]{self.name}[/]",
+            box=box.ROUNDED,
+            show_header=True,
+            header_style="bold magenta"
+        )
+        
+        table.add_column("Status", justify="center", width=10)
+        table.add_column("Test Name", justify="left", width=50)
+        table.add_column("Time", justify="right", width=12)
+        table.add_column("Details", justify="left", width=25)
+        
+        for r in self.results:
+            status_text = Text()
+            if r.status == Status.PASS:
+                status_text.append("✓ PASS", style="bold green")
+            elif r.status == Status.FAIL:
+                status_text.append("✗ FAIL", style="bold red")
+            elif r.status == Status.SKIP:
+                status_text.append("○ SKIP", style="bold yellow")
+            elif r.status == Status.ERROR:
+                status_text.append("💥 ERR", style="bold red")
+            else:
+                status_text.append("⚠ WARN", style="bold yellow")
+            
+            time_str = f"{r.duration_ms:.1f}ms" if r.duration_ms > 0 else "-"
+            details = r.message[:25] if r.message else ""
+            if r.max_diff is not None:
+                details = f"diff: {r.max_diff:.2e}"
+            
+            table.add_row(status_text, r.name[:50], time_str, details)
+        
+        console.print()
+        console.print(table)
+        
+        # Summary line
+        console.print()
+        parts = []
+        if summary[Status.PASS] > 0:
+            parts.append(f"[bold green]{summary[Status.PASS]} passed[/]")
+        if summary[Status.FAIL] > 0:
+            parts.append(f"[bold red]{summary[Status.FAIL]} failed[/]")
+        if summary[Status.SKIP] > 0:
+            parts.append(f"[bold yellow]{summary[Status.SKIP]} skipped[/]")
+        if summary[Status.ERROR] > 0:
+            parts.append(f"[bold red]{summary[Status.ERROR]} errors[/]")
+        
+        console.print(f"  {' │ '.join(parts)}")
+        console.print(f"  [dim]Total: {len(self.results)} tests in {total_time:.2f}s[/]")
+        console.print()
+        
+        # Overall status
+        if self.all_passed():
+            console.print(Panel("[bold green]ALL TESTS PASSED[/]", style="green"))
+        else:
+            console.print(Panel("[bold red]SOME TESTS FAILED[/]", style="red"))
+    
+    def _print_summary_ansi(self, total_time: float, summary: Dict[Status, int]):
+        """Print summary using ANSI codes."""
         print()
         print(f"{Colors.BOLD}{'═' * 70}{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.CYAN}{self.name.center(70)}{Colors.RESET}")
         print(f"{Colors.BOLD}{'═' * 70}{Colors.RESET}")
         print()
         
-        # Results table
-        table = ASCIITable([
-            TableColumn("Status", 8, 'center'),
-            TableColumn("Test Name", 45, 'left'),
-            TableColumn("Time", 10, 'right'),
-        ])
-        
+        # Print each result
         for r in self.results:
+            icon = "✓" if r.status == Status.PASS else "✗" if r.status == Status.FAIL else "○"
+            color = Colors.GREEN if r.status == Status.PASS else Colors.RED if r.status in (Status.FAIL, Status.ERROR) else Colors.YELLOW
             time_str = f"{r.duration_ms:.1f}ms" if r.duration_ms > 0 else "-"
-            status_str = status_icon(r.status).split()[0]  # Just the icon
-            table.add_row([status_str, r.name[:45], time_str])
-            
-        table.print()
+            print(f"  {color}{icon}{Colors.RESET} {r.name[:50]:<50} {time_str:>10}")
         
-        # Summary line
+        # Summary
         print()
         passed = summary[Status.PASS]
         failed = summary[Status.FAIL]
-        skipped = summary[Status.SKIP]
-        errors = summary[Status.ERROR]
-        total = len(self.results)
         
         status_line = []
         if passed > 0:
             status_line.append(f"{Colors.GREEN}{passed} passed{Colors.RESET}")
         if failed > 0:
             status_line.append(f"{Colors.RED}{failed} failed{Colors.RESET}")
-        if skipped > 0:
-            status_line.append(f"{Colors.YELLOW}{skipped} skipped{Colors.RESET}")
-        if errors > 0:
-            status_line.append(f"{Colors.RED}{errors} errors{Colors.RESET}")
-            
+        
         print(f"  {' | '.join(status_line)}")
-        print(f"  Total: {total} tests in {total_time:.2f}s")
+        print(f"  Total: {len(self.results)} tests in {total_time:.2f}s")
         print()
         
-        # Overall status
         if self.all_passed():
             print(f"  {Colors.BG_GREEN}{Colors.WHITE} ALL TESTS PASSED {Colors.RESET}")
         else:
@@ -370,123 +275,94 @@ class TestSuite:
 
 
 # =============================================================================
-# Progress Display
+# Print Helpers
 # =============================================================================
 
-class ProgressBar:
-    """Simple progress bar for benchmarks."""
-    
-    def __init__(self, total: int, description: str = "", width: int = 40):
-        self.total = total
-        self.current = 0
-        self.description = description
-        self.width = width
-        
-    def update(self, n: int = 1):
-        """Update progress by n steps."""
-        self.current += n
-        self._display()
-        
-    def _display(self):
-        """Display the progress bar."""
-        pct = self.current / self.total
-        filled = int(self.width * pct)
-        bar = '█' * filled + '░' * (self.width - filled)
-        print(f"\r  {self.description}: [{Colors.CYAN}{bar}{Colors.RESET}] "
-              f"{self.current}/{self.total}", end='', flush=True)
-        if self.current >= self.total:
-            print()  # New line when done
-
-
-class Spinner:
-    """Simple spinner for operations of unknown duration."""
-    
-    CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-    
-    def __init__(self, description: str = ""):
-        self.description = description
-        self.idx = 0
-        
-    def spin(self):
-        """Display next spinner frame."""
-        char = self.CHARS[self.idx % len(self.CHARS)]
-        print(f"\r  {Colors.CYAN}{char}{Colors.RESET} {self.description}", end='', flush=True)
-        self.idx += 1
-        
-    def done(self, message: str = "Done"):
-        """Display completion."""
-        print(f"\r  {Colors.GREEN}✓{Colors.RESET} {self.description}: {message}")
-
-
-# =============================================================================
-# Section Headers
-# =============================================================================
-
-def print_header(title: str, width: int = 70):
+def print_header(title: str, subtitle: str = ""):
     """Print a major section header."""
-    print()
-    print(f"{Colors.BOLD}{Colors.CYAN}{'=' * width}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.CYAN}{title.center(width)}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.CYAN}{'=' * width}{Colors.RESET}")
-    print()
+    if RICH_AVAILABLE:
+        console.print()
+        if subtitle:
+            console.print(Panel(f"[bold]{title}[/]\n[dim]{subtitle}[/]", 
+                               style="cyan", box=box.DOUBLE))
+        else:
+            console.print(Panel(f"[bold]{title}[/]", style="cyan", box=box.DOUBLE))
+        console.print()
+    else:
+        print()
+        print(f"{Colors.BOLD}{Colors.CYAN}{'═' * 70}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}{title.center(70)}{Colors.RESET}")
+        if subtitle:
+            print(f"{Colors.DIM}{subtitle.center(70)}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}{'═' * 70}{Colors.RESET}")
+        print()
 
 
-def print_subheader(title: str, width: int = 70):
+def print_subheader(title: str):
     """Print a subsection header."""
-    print()
-    print(f"{Colors.BOLD}{title}{Colors.RESET}")
-    print(f"{Colors.DIM}{'-' * min(len(title) + 10, width)}{Colors.RESET}")
+    if RICH_AVAILABLE:
+        console.print()
+        console.print(f"[bold cyan]▶ {title}[/]")
+        console.print(f"[dim]{'─' * 60}[/]")
+    else:
+        print()
+        print(f"{Colors.BOLD}{Colors.CYAN}▶ {title}{Colors.RESET}")
+        print(f"{Colors.DIM}{'─' * 60}{Colors.RESET}")
 
 
-def print_test_start(name: str):
-    """Print test start indicator."""
-    print(f"\n  {Colors.DIM}▶ {name}...{Colors.RESET}", end='', flush=True)
+def print_info(message: str):
+    """Print info message."""
+    if RICH_AVAILABLE:
+        console.print(f"  [dim]ℹ {message}[/]")
+    else:
+        print(f"  {Colors.DIM}ℹ {message}{Colors.RESET}")
 
 
-def print_test_end(status: Status, message: str = ""):
-    """Print test end status."""
-    icon = "✓" if status == Status.PASS else "✗" if status == Status.FAIL else "○"
-    color = Colors.GREEN if status == Status.PASS else Colors.RED if status in (Status.FAIL, Status.ERROR) else Colors.YELLOW
-    suffix = f" ({message})" if message else ""
-    print(f"\r  {color}{icon}{Colors.RESET} {suffix}")
+def print_success(message: str):
+    """Print success message."""
+    if RICH_AVAILABLE:
+        console.print(f"  [bold green]✓ {message}[/]")
+    else:
+        print(f"  {Colors.GREEN}✓ {message}{Colors.RESET}")
+
+
+def print_error(message: str):
+    """Print error message."""
+    if RICH_AVAILABLE:
+        console.print(f"  [bold red]✗ {message}[/]")
+    else:
+        print(f"  {Colors.RED}✗ {message}{Colors.RESET}")
+
+
+def print_warning(message: str):
+    """Print warning message."""
+    if RICH_AVAILABLE:
+        console.print(f"  [bold yellow]⚠ {message}[/]")
+    else:
+        print(f"  {Colors.YELLOW}⚠ {message}{Colors.RESET}")
 
 
 # =============================================================================
-# Benchmark Result Display
+# Comparison Utilities
 # =============================================================================
 
-def print_benchmark_comparison(
-    name: str,
-    jax_time_ms: float,
-    torch_time_ms: float,
-    jax_std_ms: float = 0,
-    torch_std_ms: float = 0
-):
-    """Print a single benchmark comparison line."""
-    speedup = torch_time_ms / jax_time_ms if jax_time_ms > 0 else 0
+def compare_arrays(arr1, arr2, rtol: float = 1e-5, atol: float = 1e-6, 
+                   squeeze: bool = True) -> Tuple[bool, float]:
+    """
+    Compare two arrays, return (match, max_diff).
     
-    jax_str = color_speed(jax_time_ms, torch_time_ms)
-    torch_str = f"{torch_time_ms:.3f}"
-    speedup_str = format_speedup(speedup)
-    
-    # Format with optional std deviation
-    if jax_std_ms > 0:
-        jax_str += f" ±{jax_std_ms:.2f}"
-    if torch_std_ms > 0:
-        torch_str += f" ±{torch_std_ms:.2f}"
-    
-    print(f"  {name:<30} JAX: {jax_str:>15}ms  PyTorch: {torch_str:>12}ms  {speedup_str}")
-
-
-# =============================================================================
-# Validation Helpers
-# =============================================================================
-
-def compare_arrays(arr1, arr2, rtol: float = 1e-5, atol: float = 1e-6) -> Tuple[bool, float]:
-    """Compare two arrays, return (match, max_diff)."""
-    import numpy as np
+    Args:
+        arr1, arr2: Arrays to compare
+        rtol: Relative tolerance
+        atol: Absolute tolerance
+        squeeze: If True, squeeze arrays before comparison (handles KeOps trailing dim)
+    """
     a1 = np.asarray(arr1)
     a2 = np.asarray(arr2)
+    
+    if squeeze:
+        a1 = np.squeeze(a1)
+        a2 = np.squeeze(a2)
     
     if a1.shape != a2.shape:
         return False, float('inf')
@@ -498,7 +374,206 @@ def compare_arrays(arr1, arr2, rtol: float = 1e-5, atol: float = 1e-6) -> Tuple[
 
 def format_comparison_result(matches: bool, max_diff: float) -> str:
     """Format comparison result with color."""
-    if matches:
-        return f"{Colors.GREEN}✓ Match{Colors.RESET} (max diff: {max_diff:.2e})"
+    if RICH_AVAILABLE:
+        if matches:
+            return f"[bold green]✓ Match[/] (diff: {max_diff:.2e})"
+        else:
+            return f"[bold red]✗ Mismatch[/] (diff: {max_diff:.2e})"
     else:
-        return f"{Colors.RED}✗ Mismatch{Colors.RESET} (max diff: {max_diff:.2e})"
+        if matches:
+            return f"{Colors.GREEN}✓ Match{Colors.RESET} (diff: {max_diff:.2e})"
+        else:
+            return f"{Colors.RED}✗ Mismatch{Colors.RESET} (diff: {max_diff:.2e})"
+
+
+# =============================================================================
+# Benchmark Table
+# =============================================================================
+
+def print_benchmark_table(title: str, rows: List[Dict[str, Any]], 
+                          columns: List[Tuple[str, str, int]]):
+    """
+    Print a benchmark results table.
+    
+    Args:
+        title: Table title
+        rows: List of dicts with column data
+        columns: List of (key, header, width) tuples
+    """
+    if RICH_AVAILABLE:
+        table = Table(title=f"[bold cyan]{title}[/]", box=box.ROUNDED)
+        
+        for key, header, width in columns:
+            table.add_column(header, justify="right" if key.endswith("_ms") else "left", 
+                           width=width)
+        
+        for row in rows:
+            values = []
+            for key, _, _ in columns:
+                val = row.get(key, "")
+                if isinstance(val, float):
+                    if key.endswith("_ms"):
+                        values.append(f"{val:.3f}")
+                    elif key == "speedup":
+                        if val > 1.1:
+                            values.append(f"[green]↑{val:.2f}x[/]")
+                        elif val < 0.9:
+                            values.append(f"[red]↓{val:.2f}x[/]")
+                        else:
+                            values.append(f"[yellow]→{val:.2f}x[/]")
+                    else:
+                        values.append(f"{val:.4f}")
+                else:
+                    values.append(str(val))
+            table.add_row(*values)
+        
+        console.print(table)
+    else:
+        # ANSI fallback - simple table
+        print(f"\n{Colors.BOLD}{title}{Colors.RESET}")
+        print("─" * 80)
+        
+        # Header
+        header = " │ ".join(h.center(w) for _, h, w in columns)
+        print(header)
+        print("─" * 80)
+        
+        # Rows
+        for row in rows:
+            values = []
+            for key, _, width in columns:
+                val = row.get(key, "")
+                if isinstance(val, float):
+                    s = f"{val:.3f}" if key.endswith("_ms") else f"{val:.2f}"
+                else:
+                    s = str(val)
+                values.append(s.center(width))
+            print(" │ ".join(values))
+        print()
+
+
+# =============================================================================
+# Test Runner Helper
+# =============================================================================
+
+@contextmanager
+def test_context(name: str, suite: TestSuite):
+    """Context manager for running a test with timing and error handling."""
+    start_time = time.time()
+    result = TestResult(name=name, status=Status.PASS)
+    
+    try:
+        yield result
+    except AssertionError as e:
+        result.status = Status.FAIL
+        result.message = str(e)[:100]
+    except Exception as e:
+        result.status = Status.ERROR
+        result.message = f"{type(e).__name__}: {str(e)[:80]}"
+    finally:
+        result.duration_ms = (time.time() - start_time) * 1000
+        suite.add_result(result)
+
+
+def run_test(name: str, test_fn: Callable, suite: TestSuite, **kwargs) -> TestResult:
+    """
+    Run a test function and record the result.
+    
+    Args:
+        name: Test name
+        test_fn: Function to run (should return (passed, max_diff) or raise exception)
+        suite: TestSuite to add result to
+        **kwargs: Additional kwargs for test_fn
+    
+    Returns:
+        TestResult
+    """
+    start_time = time.time()
+    
+    try:
+        result = test_fn(**kwargs)
+        
+        if isinstance(result, tuple) and len(result) == 2:
+            passed, max_diff = result
+            status = Status.PASS if passed else Status.FAIL
+            tr = TestResult(name=name, status=status, max_diff=max_diff)
+        elif isinstance(result, bool):
+            status = Status.PASS if result else Status.FAIL
+            tr = TestResult(name=name, status=status)
+        else:
+            tr = TestResult(name=name, status=Status.PASS)
+            
+    except AssertionError as e:
+        tr = TestResult(name=name, status=Status.FAIL, message=str(e)[:100])
+    except Exception as e:
+        tr = TestResult(name=name, status=Status.ERROR, 
+                       message=f"{type(e).__name__}: {str(e)[:80]}")
+    
+    tr.duration_ms = (time.time() - start_time) * 1000
+    suite.add_result(tr)
+    
+    # Print immediate feedback
+    if RICH_AVAILABLE:
+        icon = "✓" if tr.status == Status.PASS else "✗" if tr.status == Status.FAIL else "○"
+        style = status_style(tr.status)
+        detail = f" (diff: {tr.max_diff:.2e})" if tr.max_diff is not None else ""
+        console.print(f"  [{style}]{icon}[/] {name}{detail}")
+    else:
+        icon = "✓" if tr.status == Status.PASS else "✗" if tr.status == Status.FAIL else "○"
+        color = Colors.GREEN if tr.status == Status.PASS else Colors.RED if tr.status in (Status.FAIL, Status.ERROR) else Colors.YELLOW
+        print(f"  {color}{icon}{Colors.RESET} {name}")
+    
+    return tr
+
+
+# =============================================================================
+# Environment Info
+# =============================================================================
+
+def print_environment_info():
+    """Print information about the test environment."""
+    import platform
+    
+    info = {
+        "Python": platform.python_version(),
+        "Platform": platform.platform(),
+    }
+    
+    # JAX
+    try:
+        import jax
+        info["JAX"] = jax.__version__
+        info["JAX Devices"] = str(jax.devices())
+    except ImportError:
+        info["JAX"] = "Not installed"
+    
+    # PyTorch
+    try:
+        import torch
+        info["PyTorch"] = torch.__version__
+        info["CUDA Available"] = str(torch.cuda.is_available())
+        if torch.cuda.is_available():
+            info["CUDA Device"] = torch.cuda.get_device_name(0)
+    except ImportError:
+        info["PyTorch"] = "Not installed"
+    
+    # NumPy
+    try:
+        import numpy as np
+        info["NumPy"] = np.__version__
+    except ImportError:
+        pass
+    
+    if RICH_AVAILABLE:
+        table = Table(title="[bold]Environment[/]", box=box.SIMPLE)
+        table.add_column("Component", style="cyan")
+        table.add_column("Version/Info", style="white")
+        
+        for key, value in info.items():
+            table.add_row(key, value)
+        
+        console.print(table)
+    else:
+        print_subheader("Environment")
+        for key, value in info.items():
+            print(f"  {key}: {value}")

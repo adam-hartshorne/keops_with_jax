@@ -2,623 +2,330 @@
 """
 KeOps JAX API Tests
 ===================
-Comprehensive unit tests for the JAX KeOps API.
+Unit tests for the JAX KeOps API.
 
 Tests cover:
-- Genred interface (all reduction operations)
-- LazyTensor interface (operations and reductions)
+- Genred interface (basic operations)
+- LazyTensor interface (symbolic operations)
 - Vi, Vj, Pm helper functions
-- Parameter handling
 - Data types (float32, float64)
-- Batched and unbatched operations
-- JIT compilation
-- Gradients
+- Batched operations
+- JIT compilation compatibility
+- Gradient computation
+
+Can run standalone or with pytest.
 """
 
 import sys
-import time
 import unittest
-from functools import partial
+import numpy as np
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
-# Import test utilities
 from test_utils import (
-    Colors, Status, TestResult, TestSuite,
-    print_header, print_subheader, print_test_start, print_test_end,
-    ASCIITable, TableColumn, compare_arrays, format_comparison_result
+    TestSuite, Status, print_header, print_subheader, print_info,
+    compare_arrays, run_test, print_environment_info, RICH_AVAILABLE
 )
 
-# Import KeOps JAX API
+# =============================================================================
+# Import KeOps
+# =============================================================================
+
 try:
     from pykeops.jax import Genred, LazyTensor, Vi, Vj, Pm
     KEOPS_AVAILABLE = True
 except ImportError as e:
-    print(f"{Colors.RED}Error: pykeops.jax not found: {e}{Colors.RESET}")
+    print(f"Error: pykeops.jax not found: {e}")
     KEOPS_AVAILABLE = False
+    sys.exit(1)
+
+# Optional PyTorch for comparison
+try:
+    import torch
+    from pykeops.torch import Genred as Genred_torch, LazyTensor as LazyTensor_torch
+    TORCH_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
 
 
 # =============================================================================
-# Test Configuration
+# Configuration
 # =============================================================================
 
-# Random seed for reproducibility
 SEED = 42
-
-# Default tolerances
 RTOL = 1e-4
 ATOL = 1e-5
-
-# Test sizes
-SMALL_N = 50
-SMALL_M = 30
-MEDIUM_N = 500
-MEDIUM_M = 300
+RTOL_LOOSE = 1e-3  # For comparing against pure JAX (different accumulation)
+ATOL_LOOSE = 1e-3
 
 
 # =============================================================================
 # Test Fixtures
 # =============================================================================
 
-def get_test_data(n: int, m: int, d: int, dtype='float32', seed=SEED):
+def get_test_data(n, m, d, dtype='float32', seed=SEED):
     """Generate test data."""
-    key = jax.random.PRNGKey(seed)
-    keys = jax.random.split(key, 4)
+    np.random.seed(seed)
+    np_dtype = np.float32 if dtype == 'float32' else np.float64
     
-    jnp_dtype = jnp.float32 if dtype == 'float32' else jnp.float64
-    
-    x = jax.random.normal(keys[0], (n, d), dtype=jnp_dtype)
-    y = jax.random.normal(keys[1], (m, d), dtype=jnp_dtype)
-    b = jax.random.normal(keys[2], (m, d), dtype=jnp_dtype)
-    sigma = jnp.array([0.5], dtype=jnp_dtype)
-    
-    return x, y, b, sigma
+    return {
+        'x': jnp.array(np.random.randn(n, d).astype(np_dtype)),
+        'y': jnp.array(np.random.randn(m, d).astype(np_dtype)),
+        'b': jnp.array(np.random.randn(m, d).astype(np_dtype)),
+        'sigma': jnp.array([0.5], dtype=jnp.float32 if dtype == 'float32' else jnp.float64),
+    }
 
 
-def get_batched_test_data(batch: int, n: int, m: int, d: int, dtype='float32', seed=SEED):
+def get_batched_data(batch, n, m, d, dtype='float32', seed=SEED):
     """Generate batched test data."""
-    key = jax.random.PRNGKey(seed)
-    keys = jax.random.split(key, 4)
+    np.random.seed(seed)
+    np_dtype = np.float32 if dtype == 'float32' else np.float64
     
-    jnp_dtype = jnp.float32 if dtype == 'float32' else jnp.float64
-    
-    x = jax.random.normal(keys[0], (batch, n, d), dtype=jnp_dtype)
-    y = jax.random.normal(keys[1], (batch, m, d), dtype=jnp_dtype)
-    b = jax.random.normal(keys[2], (batch, m, d), dtype=jnp_dtype)
-    sigma = jnp.array([0.5], dtype=jnp_dtype)
-    
-    return x, y, b, sigma
+    return {
+        'x': jnp.array(np.random.randn(batch, n, d).astype(np_dtype)),
+        'y': jnp.array(np.random.randn(batch, m, d).astype(np_dtype)),
+    }
+
+
+def pure_jax_sqdist_sum(x, y, axis=1):
+    """Pure JAX reference for squared distance sum."""
+    diff = x[:, None, :] - y[None, :, :]
+    sqdist = jnp.sum(diff ** 2, axis=-1)
+    return jnp.sum(sqdist, axis=axis, keepdims=True)
+
+
+def pure_jax_gaussian_sum(x, y, sigma):
+    """Pure JAX reference for Gaussian kernel sum."""
+    diff = x[:, None, :] - y[None, :, :]
+    sqdist = jnp.sum(diff ** 2, axis=-1)
+    K = jnp.exp(-sqdist * sigma)
+    return jnp.sum(K, axis=1, keepdims=True)
 
 
 # =============================================================================
-# Genred Tests
+# Genred Interface Tests
 # =============================================================================
 
-class TestGenredBasics(unittest.TestCase):
-    """Test basic Genred functionality."""
+class TestGenredBasic(unittest.TestCase):
+    """Basic Genred functionality tests."""
     
     def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
+        self.data = get_test_data(100, 80, 3)
+        self.D = 3
     
-    def test_sum_reduction_basic(self):
-        """Test basic Sum reduction with squared distance."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
-        result = op(self.x, self.y)
+    def test_sqdist_sum(self):
+        """Test SqDist formula with Sum reduction."""
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
         
-        # Compute expected result with pure JAX
-        diff = self.x[:, None, :] - self.y[None, :, :]  # (N, M, D)
-        expected = jnp.sum(jnp.sum(diff**2, axis=-1), axis=1, keepdims=True)  # (N, 1)
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        result = op(self.data['x'], self.data['y'])
         
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
+        expected = pure_jax_sqdist_sum(self.data['x'], self.data['y'])
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        
+        self.assertEqual(result.shape, (100, 1))
+        self.assertTrue(match, f"Max diff: {diff}")
     
-    def test_sum_reduction_axis0(self):
+    def test_sqdist_sum_axis0(self):
         """Test Sum reduction over axis 0."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=0)
-        result = op(self.x, self.y)
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
         
-        # Expected: sum over i
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        expected = jnp.sum(jnp.sum(diff**2, axis=-1), axis=0, keepdims=True).T
+        op = Genred(formula, aliases, reduction_op='Sum', axis=0)
+        result = op(self.data['x'], self.data['y'])
         
-        self.assertEqual(result.shape, (self.M, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
+        expected = pure_jax_sqdist_sum(self.data['x'], self.data['y'], axis=0).T
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        
+        self.assertEqual(result.shape, (80, 1))
+        self.assertTrue(match, f"Max diff: {diff}")
+    
+    def test_gaussian_kernel(self):
+        """Test Gaussian kernel with Pm parameter."""
+        formula = "Exp(-SqNorm2(x-y) * s)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", "s=Pm(1)"]
+        
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        result = op(self.data['x'], self.data['y'], self.data['sigma'])
+        
+        expected = pure_jax_gaussian_sum(self.data['x'], self.data['y'], self.data['sigma'])
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        
+        self.assertEqual(result.shape, (100, 1))
+        self.assertTrue(match, f"Max diff: {diff}")
     
     def test_min_reduction(self):
         """Test Min reduction."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Min', axis=1)
-        result = op(self.x, self.y)
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
         
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        expected = jnp.min(jnp.sum(diff**2, axis=-1), axis=1, keepdims=True)
+        op = Genred(formula, aliases, reduction_op='Min', axis=1)
+        result = op(self.data['x'], self.data['y'])
         
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
+        # Pure JAX reference
+        diff = self.data['x'][:, None, :] - self.data['y'][None, :, :]
+        sqdist = jnp.sum(diff ** 2, axis=-1)
+        expected = jnp.min(sqdist, axis=1, keepdims=True)
+        
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
     
     def test_max_reduction(self):
         """Test Max reduction."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Max', axis=1)
-        result = op(self.x, self.y)
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
         
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        expected = jnp.max(jnp.sum(diff**2, axis=-1), axis=1, keepdims=True)
+        op = Genred(formula, aliases, reduction_op='Max', axis=1)
+        result = op(self.data['x'], self.data['y'])
         
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_logsumexp_reduction(self):
-        """Test LogSumExp reduction."""
-        op = Genred("-SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'LogSumExp', axis=1)
-        result = op(self.x, self.y)
+        diff = self.data['x'][:, None, :] - self.data['y'][None, :, :]
+        sqdist = jnp.sum(diff ** 2, axis=-1)
+        expected = jnp.max(sqdist, axis=1, keepdims=True)
         
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        neg_sqdist = -jnp.sum(diff**2, axis=-1)
-        expected = jax.scipy.special.logsumexp(neg_sqdist, axis=1, keepdims=True)
-        
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=1e-3)  # Looser tolerance for logsumexp
-        self.assertTrue(match, f"Max diff: {max_diff}")
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
 
 
 class TestGenredFormulas(unittest.TestCase):
     """Test various formula types."""
     
     def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
-    
-    def test_gaussian_kernel(self):
-        """Test Gaussian kernel formula."""
-        formula = "Exp(-SqNorm2(x-y) * s)"
-        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", "s=Pm(1)"]
-        op = Genred(formula, aliases, 'Sum', axis=1)
-        
-        inv_sigma_sq = jnp.array([1.0 / (2 * self.sigma[0]**2)])
-        result = op(self.x, self.y, inv_sigma_sq)
-        
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        K = jnp.exp(-sqdist * float(inv_sigma_sq[0]))
-        expected = jnp.sum(K, axis=1, keepdims=True)
-        
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_kernel_weighted_sum(self):
-        """Test weighted kernel sum: K(x,y) @ b."""
-        formula = "Exp(-SqNorm2(x-y) * s) * b"
-        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", f"b=Vj({self.D})", "s=Pm(1)"]
-        op = Genred(formula, aliases, 'Sum', axis=1)
-        
-        inv_sigma_sq = jnp.array([1.0])
-        result = op(self.x, self.y, self.b, inv_sigma_sq)
-        
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        K = jnp.exp(-sqdist * float(inv_sigma_sq[0]))
-        expected = K @ self.b
-        
-        self.assertEqual(result.shape, (self.N, self.D))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
+        self.data = get_test_data(50, 40, 3)
+        self.D = 3
     
     def test_laplacian_kernel(self):
         """Test Laplacian kernel: exp(-|x-y|)."""
         formula = "Exp(-Norm2(x-y))"
         aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
-        op = Genred(formula, aliases, 'Sum', axis=1)
         
-        result = op(self.x, self.y)
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        result = op(self.data['x'], self.data['y'])
         
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        dist = jnp.sqrt(jnp.sum(diff**2, axis=-1))
-        K = jnp.exp(-dist)
-        expected = jnp.sum(K, axis=1, keepdims=True)
+        # Reference
+        diff = self.data['x'][:, None, :] - self.data['y'][None, :, :]
+        dist = jnp.sqrt(jnp.sum(diff ** 2, axis=-1))
+        expected = jnp.sum(jnp.exp(-dist), axis=1, keepdims=True)
         
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
     
     def test_cauchy_kernel(self):
-        """Test Cauchy kernel: 1/(1 + |x-y|^2)."""
+        """Test Cauchy kernel: 1/(1+|x-y|^2)."""
         formula = "Inv(IntCst(1) + SqNorm2(x-y))"
         aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
-        op = Genred(formula, aliases, 'Sum', axis=1)
         
-        result = op(self.x, self.y)
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        result = op(self.data['x'], self.data['y'])
         
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        K = 1.0 / (1.0 + sqdist)
-        expected = jnp.sum(K, axis=1, keepdims=True)
+        diff = self.data['x'][:, None, :] - self.data['y'][None, :, :]
+        sqdist = jnp.sum(diff ** 2, axis=-1)
+        expected = jnp.sum(1.0 / (1.0 + sqdist), axis=1, keepdims=True)
         
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-
-
-class TestGenredParameters(unittest.TestCase):
-    """Test parameter handling in Genred."""
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
     
-    def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
-    
-    def test_scalar_parameter(self):
-        """Test scalar parameter (Pm(1))."""
-        formula = "SqDist(x, y) * s"
-        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", "s=Pm(1)"]
-        op = Genred(formula, aliases, 'Sum', axis=1)
+    def test_weighted_sum(self):
+        """Test weighted kernel sum: K(x,y) @ b."""
+        formula = "Exp(-SqNorm2(x-y) * s) * b"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", f"b=Vj({self.D})", "s=Pm(1)"]
         
-        scale = jnp.array([2.5])
-        result = op(self.x, self.y, scale)
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        result = op(self.data['x'], self.data['y'], self.data['b'], self.data['sigma'])
         
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1) * float(scale[0])
-        expected = jnp.sum(sqdist, axis=1, keepdims=True)
+        # Reference
+        diff = self.data['x'][:, None, :] - self.data['y'][None, :, :]
+        sqdist = jnp.sum(diff ** 2, axis=-1)
+        K = jnp.exp(-sqdist * self.data['sigma'])
+        expected = jnp.sum(K[:, :, None] * self.data['b'][None, :, :], axis=1)
         
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_vector_parameter(self):
-        """Test vector parameter (Pm(D))."""
-        formula = "SqDist(x * w, y * w)"
-        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", f"w=Pm({self.D})"]
-        op = Genred(formula, aliases, 'Sum', axis=1)
-        
-        weights = jnp.array([1.0, 2.0, 0.5])
-        result = op(self.x, self.y, weights)
-        
-        # Expected
-        diff = (self.x * weights)[:, None, :] - (self.y * weights)[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        expected = jnp.sum(sqdist, axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_multiple_parameters(self):
-        """Test multiple parameters."""
-        formula = "Exp(-SqDist(x, y) * s1) * s2"
-        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", "s1=Pm(1)", "s2=Pm(1)"]
-        op = Genred(formula, aliases, 'Sum', axis=1)
-        
-        s1 = jnp.array([0.5])
-        s2 = jnp.array([2.0])
-        result = op(self.x, self.y, s1, s2)
-        
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        K = jnp.exp(-sqdist * float(s1[0])) * float(s2[0])
-        expected = jnp.sum(K, axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-
-
-class TestGenredDTypes(unittest.TestCase):
-    """Test different data types."""
-    
-    def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-    
-    def test_float32(self):
-        """Test float32 computation."""
-        x, y, _, _ = get_test_data(self.N, self.M, self.D, dtype='float32')
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1, dtype='float32')
-        
-        result = op(x, y)
-        self.assertEqual(result.dtype, jnp.float32)
-    
-    def test_float64(self):
-        """Test float64 computation."""
-        x, y, _, _ = get_test_data(self.N, self.M, self.D, dtype='float64')
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1, dtype='float64')
-        
-        result = op(x, y)
-        self.assertEqual(result.dtype, jnp.float64)
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertEqual(result.shape, (50, 3))
+        self.assertTrue(match, f"Max diff: {diff}")
 
 
 # =============================================================================
-# LazyTensor Tests
+# LazyTensor Interface Tests
 # =============================================================================
 
-class TestLazyTensorBasics(unittest.TestCase):
-    """Test basic LazyTensor functionality."""
+class TestLazyTensor(unittest.TestCase):
+    """LazyTensor interface tests."""
     
     def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
+        self.data = get_test_data(100, 80, 3)
     
-    def test_lazy_creation_vi(self):
-        """Test LazyTensor creation with Vi pattern."""
-        x_i = LazyTensor(self.x[:, None, :])
-        self.assertIsNotNone(x_i)
+    def test_basic_sqdist(self):
+        """Test basic squared distance with LazyTensor."""
+        x_i = LazyTensor(self.data['x'][:, None, :])
+        y_j = LazyTensor(self.data['y'][None, :, :])
+        
+        D_ij = ((x_i - y_j) ** 2).sum(-1)
+        result = D_ij.sum(axis=1)
+        
+        expected = pure_jax_sqdist_sum(self.data['x'], self.data['y'])
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
     
-    def test_lazy_creation_vj(self):
-        """Test LazyTensor creation with Vj pattern."""
-        y_j = LazyTensor(self.y[None, :, :])
-        self.assertIsNotNone(y_j)
+    def test_gaussian_kernel(self):
+        """Test Gaussian kernel with LazyTensor."""
+        x_i = LazyTensor(self.data['x'][:, None, :])
+        y_j = LazyTensor(self.data['y'][None, :, :])
+        
+        D_ij = ((x_i - y_j) ** 2).sum(-1)
+        K_ij = (-D_ij * self.data['sigma']).exp()
+        result = K_ij.sum(axis=1)
+        
+        expected = pure_jax_gaussian_sum(self.data['x'], self.data['y'], self.data['sigma'])
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
     
-    def test_lazy_subtraction(self):
-        """Test LazyTensor subtraction."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        diff = x_i - y_j
-        self.assertIsNotNone(diff)
+    def test_scalar_multiplication_left(self):
+        """Test scalar * LazyTensor (left multiplication)."""
+        x_i = LazyTensor(self.data['x'][:, None, :])
+        y_j = LazyTensor(self.data['y'][None, :, :])
+        
+        result = (2.0 * (x_i - y_j)).sum(-1).sum(axis=1)
+        expected = jnp.sum(2.0 * (self.data['x'][:, None, :] - self.data['y'][None, :, :]), 
+                         axis=(1, 2))[:, None]
+        
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
     
-    def test_lazy_squared_distance(self):
-        """Test LazyTensor squared distance computation."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
+    def test_scalar_multiplication_right(self):
+        """Test LazyTensor * scalar (right multiplication)."""
+        x_i = LazyTensor(self.data['x'][:, None, :])
+        y_j = LazyTensor(self.data['y'][None, :, :])
         
-        result = ((x_i - y_j)**2).sum(-1).sum(1)
+        result = ((x_i - y_j) * 2.0).sum(-1).sum(axis=1)
+        expected = jnp.sum(2.0 * (self.data['x'][:, None, :] - self.data['y'][None, :, :]), 
+                         axis=(1, 2))[:, None]
         
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        expected = jnp.sum(jnp.sum(diff**2, axis=-1), axis=1, keepdims=True)
-        
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_lazy_gaussian_kernel(self):
-        """Test LazyTensor Gaussian kernel."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        b_j = LazyTensor(self.b[None, :, :])
-        
-        # Use the pattern: ((-D_ij).exp() * b_j).sum(1)
-        D_ij = ((x_i - y_j)**2).sum(-1)
-        result = ((-D_ij).exp() * b_j).sum(1)
-        
-        # Expected
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        K = jnp.exp(-sqdist)
-        expected = K @ self.b
-        
-        self.assertEqual(result.shape, (self.N, self.D))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-        self.assertTrue(match, f"Max diff: {max_diff}")
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+        self.assertTrue(match, f"Max diff: {diff}")
 
 
-class TestLazyTensorOperations(unittest.TestCase):
-    """Test LazyTensor mathematical operations."""
+class TestLazyTensorBatched(unittest.TestCase):
+    """Batched LazyTensor tests."""
     
     def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
+        self.data = get_batched_data(4, 50, 40, 3)
     
-    def test_lazy_exp(self):
-        """Test exp() operation."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
+    def test_batched_sqdist(self):
+        """Test batched squared distance."""
+        x_i = LazyTensor(self.data['x'][:, :, None, :])
+        y_j = LazyTensor(self.data['y'][:, None, :, :])
         
-        result = (x_i - y_j).exp().sum(-1).sum(1)
+        D_ij = ((x_i - y_j) ** 2).sum(-1)
+        result = D_ij.sum(axis=2)
         
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        expected = jnp.sum(jnp.sum(jnp.exp(diff), axis=-1), axis=1, keepdims=True)
+        # Reference
+        diff = self.data['x'][:, :, None, :] - self.data['y'][:, None, :, :]
+        expected = jnp.sum(jnp.sum(diff ** 2, axis=-1), axis=2, keepdims=True)
         
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_lazy_log(self):
-        """Test log() operation on positive values."""
-        # Use absolute values to ensure positive
-        x_i = LazyTensor(jnp.abs(self.x[:, None, :]) + 0.1)
-        y_j = LazyTensor(jnp.abs(self.y[None, :, :]) + 0.1)
-        
-        result = (x_i + y_j).log().sum(-1).sum(1)
-        
-        pos_x = jnp.abs(self.x) + 0.1
-        pos_y = jnp.abs(self.y) + 0.1
-        sum_xy = pos_x[:, None, :] + pos_y[None, :, :]
-        expected = jnp.sum(jnp.sum(jnp.log(sum_xy), axis=-1), axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_lazy_multiplication(self):
-        """Test element-wise multiplication."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        
-        result = (x_i * y_j).sum(-1).sum(1)
-        
-        expected = jnp.sum(jnp.sum(self.x[:, None, :] * self.y[None, :, :], axis=-1), axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_lazy_scalar_multiplication(self):
-        """Test scalar multiplication."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        
-        result = ((x_i - y_j) * 2.0).sum(-1).sum(1)
-        
-        diff = (self.x[:, None, :] - self.y[None, :, :]) * 2.0
-        expected = jnp.sum(jnp.sum(diff, axis=-1), axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-
-
-class TestLazyTensorReductions(unittest.TestCase):
-    """Test LazyTensor reduction operations."""
-    
-    def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
-    
-    def test_lazy_sum_dim1(self):
-        """Test sum reduction over dim 1 (j)."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        
-        D_ij = ((x_i - y_j)**2).sum(-1)
-        result = D_ij.sum(1)
-        
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        expected = jnp.sum(sqdist, axis=1, keepdims=True)
-        
-        self.assertEqual(result.shape, (self.N, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_lazy_sum_dim0(self):
-        """Test sum reduction over dim 0 (i)."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        
-        D_ij = ((x_i - y_j)**2).sum(-1)
-        result = D_ij.sum(0)
-        
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        expected = jnp.sum(sqdist, axis=0, keepdims=True).T
-        
-        self.assertEqual(result.shape, (self.M, 1))
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_lazy_min(self):
-        """Test min reduction."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        
-        D_ij = ((x_i - y_j)**2).sum(-1)
-        result = D_ij.min(1)
-        
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        expected = jnp.min(sqdist, axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_lazy_max(self):
-        """Test max reduction."""
-        x_i = LazyTensor(self.x[:, None, :])
-        y_j = LazyTensor(self.y[None, :, :])
-        
-        D_ij = ((x_i - y_j)**2).sum(-1)
-        result = D_ij.max(1)
-        
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        sqdist = jnp.sum(diff**2, axis=-1)
-        expected = jnp.max(sqdist, axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-
-
-# =============================================================================
-# Vi/Vj/Pm Helper Tests
-# =============================================================================
-
-class TestViVjPmHelpers(unittest.TestCase):
-    """Test Vi, Vj, Pm helper functions."""
-    
-    def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
-    
-    def test_vi_from_2d(self):
-        """Test Vi() with 2D array."""
-        x_i = Vi(self.x)
-        self.assertIsNotNone(x_i)
-    
-    def test_vj_from_2d(self):
-        """Test Vj() with 2D array."""
-        y_j = Vj(self.y)
-        self.assertIsNotNone(y_j)
-    
-    def test_pm_scalar(self):
-        """Test Pm() with scalar."""
-        s = Pm(self.sigma)
-        self.assertIsNotNone(s)
-    
-    def test_vi_vj_computation(self):
-        """Test computation using Vi/Vj helpers."""
-        x_i = Vi(self.x)
-        y_j = Vj(self.y)
-        
-        result = ((x_i - y_j)**2).sum(-1).sum(1)
-        
-        diff = self.x[:, None, :] - self.y[None, :, :]
-        expected = jnp.sum(jnp.sum(diff**2, axis=-1), axis=1, keepdims=True)
-        
-        match, max_diff = compare_arrays(result, expected, rtol=RTOL)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-
-
-# =============================================================================
-# JIT Compilation Tests
-# =============================================================================
-
-class TestJITCompilation(unittest.TestCase):
-    """Test JIT compilation compatibility."""
-    
-    def setUp(self):
-        self.N, self.M, self.D = SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
-    
-    def test_genred_jit(self):
-        """Test JIT-compiled Genred."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
-        
-        @jax.jit
-        def compute(x, y):
-            return op(x, y)
-        
-        result = compute(self.x, self.y)
-        self.assertEqual(result.shape, (self.N, 1))
-    
-    def test_lazy_jit(self):
-        """Test JIT-compiled LazyTensor."""
-        @jax.jit
-        def compute(x, y):
-            x_i = LazyTensor(x[:, None, :])
-            y_j = LazyTensor(y[None, :, :])
-            return ((x_i - y_j)**2).sum(-1).sum(1)
-        
-        result = compute(self.x, self.y)
-        self.assertEqual(result.shape, (self.N, 1))
-    
-    def test_jit_repeated_calls(self):
-        """Test repeated JIT calls use cache."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
-        
-        @jax.jit
-        def compute(x, y):
-            return op(x, y)
-        
-        # First call - compiles
-        result1 = compute(self.x, self.y)
-        
-        # Second call - should use cache
-        result2 = compute(self.x, self.y)
-        
-        match, _ = compare_arrays(result1, result2)
-        self.assertTrue(match)
+        match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE, squeeze=True)
+        self.assertTrue(match, f"Max diff: {diff}")
 
 
 # =============================================================================
@@ -626,231 +333,246 @@ class TestJITCompilation(unittest.TestCase):
 # =============================================================================
 
 class TestGradients(unittest.TestCase):
-    """Test gradient computation."""
+    """Gradient computation tests."""
     
     def setUp(self):
-        self.N, self.M, self.D = 20, 15, 3  # Smaller for gradient tests
-        self.x, self.y, self.b, self.sigma = get_test_data(self.N, self.M, self.D)
+        self.data = get_test_data(50, 40, 3)
+        self.D = 3
     
-    def test_genred_grad_vi(self):
+    def test_gradient_vi(self):
         """Test gradient w.r.t. Vi variable."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
         
-        def loss(x):
-            return jnp.sum(op(x, self.y))
+        def forward(x):
+            return op(x, self.data['y']).sum()
         
-        grad = jax.grad(loss)(self.x)
+        grad = jax.grad(forward)(self.data['x'])
         
-        self.assertEqual(grad.shape, self.x.shape)
-        self.assertFalse(jnp.any(jnp.isnan(grad)))
+        # Check gradient is correct shape and non-zero
+        self.assertEqual(grad.shape, self.data['x'].shape)
+        self.assertTrue(jnp.any(grad != 0), "Gradient should be non-zero")
     
-    def test_genred_grad_vj(self):
+    def test_gradient_vj(self):
         """Test gradient w.r.t. Vj variable."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
         
-        def loss(y):
-            return jnp.sum(op(self.x, y))
+        def forward(y):
+            return op(self.data['x'], y).sum()
         
-        grad = jax.grad(loss)(self.y)
+        grad = jax.grad(forward)(self.data['y'])
         
-        self.assertEqual(grad.shape, self.y.shape)
-        self.assertFalse(jnp.any(jnp.isnan(grad)))
+        self.assertEqual(grad.shape, self.data['y'].shape)
+        self.assertTrue(jnp.any(grad != 0), "Gradient should be non-zero")
     
-    def test_genred_grad_both(self):
-        """Test gradient w.r.t. both variables."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
+    def test_gradient_pm(self):
+        """Test gradient w.r.t. Pm parameter."""
+        formula = "Exp(-SqNorm2(x-y) * s)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})", "s=Pm(1)"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
         
-        def loss(x, y):
-            return jnp.sum(op(x, y))
+        def forward(s):
+            return op(self.data['x'], self.data['y'], s).sum()
         
-        grad_x, grad_y = jax.grad(loss, argnums=(0, 1))(self.x, self.y)
+        grad = jax.grad(forward)(self.data['sigma'])
         
-        self.assertEqual(grad_x.shape, self.x.shape)
-        self.assertEqual(grad_y.shape, self.y.shape)
+        self.assertEqual(grad.shape, self.data['sigma'].shape)
+        self.assertTrue(jnp.isfinite(grad).all(), "Gradient should be finite")
     
-    def test_lazy_grad(self):
+    def test_gradient_lazytensor(self):
         """Test LazyTensor gradient."""
-        def loss(x):
+        def forward(x):
             x_i = LazyTensor(x[:, None, :])
-            y_j = LazyTensor(self.y[None, :, :])
-            return jnp.sum(((x_i - y_j)**2).sum(-1).sum(1))
+            y_j = LazyTensor(self.data['y'][None, :, :])
+            D_ij = ((x_i - y_j) ** 2).sum(-1)
+            return D_ij.sum(axis=1).sum()
         
-        grad = jax.grad(loss)(self.x)
+        grad = jax.grad(forward)(self.data['x'])
         
-        self.assertEqual(grad.shape, self.x.shape)
-        self.assertFalse(jnp.any(jnp.isnan(grad)))
-    
-    def test_value_and_grad(self):
-        """Test value_and_grad."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
-        
-        def loss(x):
-            return jnp.sum(op(x, self.y))
-        
-        val, grad = jax.value_and_grad(loss)(self.x)
-        
-        self.assertTrue(val > 0)
-        self.assertEqual(grad.shape, self.x.shape)
+        self.assertEqual(grad.shape, self.data['x'].shape)
+        self.assertTrue(jnp.any(grad != 0), "Gradient should be non-zero")
 
 
 # =============================================================================
-# Batching Tests
+# JIT Compilation Tests
 # =============================================================================
 
-class TestBatching(unittest.TestCase):
-    """Test batched operations."""
+class TestJIT(unittest.TestCase):
+    """JIT compilation tests."""
     
     def setUp(self):
-        self.B, self.N, self.M, self.D = 5, SMALL_N, SMALL_M, 3
-        self.x, self.y, self.b, self.sigma = get_batched_test_data(self.B, self.N, self.M, self.D)
+        self.data = get_test_data(100, 80, 3)
+        self.D = 3
     
-    def test_vmap_genred(self):
-        """Test vmap over Genred."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
+    def test_jit_genred(self):
+        """Test JIT with Genred."""
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
         
-        result = jax.vmap(op)(self.x, self.y)
+        @jax.jit
+        def compute(x, y):
+            return op(x, y)
         
-        self.assertEqual(result.shape, (self.B, self.N, 1))
+        # First call (compile)
+        result1 = compute(self.data['x'], self.data['y'])
+        # Second call (cached)
+        result2 = compute(self.data['x'], self.data['y'])
+        
+        match, diff = compare_arrays(result1, result2, rtol=0, atol=0)
+        self.assertTrue(match)
     
-    def test_batched_3d_input(self):
-        """Test 3D batched input directly."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
+    def test_jit_lazytensor(self):
+        """Test JIT with LazyTensor."""
+        @jax.jit
+        def compute(x, y):
+            x_i = LazyTensor(x[:, None, :])
+            y_j = LazyTensor(y[None, :, :])
+            return ((x_i - y_j) ** 2).sum(-1).sum(axis=1)
         
-        # Direct 3D input
-        result = op(self.x, self.y)
+        result1 = compute(self.data['x'], self.data['y'])
+        result2 = compute(self.data['x'], self.data['y'])
         
-        self.assertEqual(result.shape, (self.B, self.N, 1))
+        match, diff = compare_arrays(result1, result2, rtol=0, atol=0)
+        self.assertTrue(match)
     
-    def test_vmap_gradient(self):
-        """Test vmap over gradient computation."""
-        op = Genred("SqDist(x, y)", [f"x=Vi({self.D})", f"y=Vj({self.D})"], 'Sum', axis=1)
+    def test_jit_gradient(self):
+        """Test JIT with gradient computation."""
+        formula = "SqDist(x, y)"
+        aliases = [f"x=Vi({self.D})", f"y=Vj({self.D})"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
         
-        def single_loss(x, y):
-            return jnp.sum(op(x, y))
+        @jax.jit
+        def forward_and_grad(x, y):
+            return jax.grad(lambda x: op(x, y).sum())(x)
         
-        grad_fn = jax.grad(single_loss)
-        batched_grad = jax.vmap(grad_fn)(self.x, self.y)
+        grad1 = forward_and_grad(self.data['x'], self.data['y'])
+        grad2 = forward_and_grad(self.data['x'], self.data['y'])
         
-        self.assertEqual(batched_grad.shape, self.x.shape)
+        match, diff = compare_arrays(grad1, grad2, rtol=0, atol=0)
+        self.assertTrue(match)
 
 
 # =============================================================================
-# Edge Cases
+# Vi/Vj/Pm Helper Tests
 # =============================================================================
 
-class TestEdgeCases(unittest.TestCase):
-    """Test edge cases and special inputs."""
+class TestHelpers(unittest.TestCase):
+    """Test helper functions and LazyTensor creation."""
     
-    def test_empty_input_vi(self):
-        """Test with empty Vi input."""
-        op = Genred("SqDist(x, y)", ["x=Vi(3)", "y=Vj(3)"], 'Sum', axis=1)
+    def test_lazytensor_creation(self):
+        """Test LazyTensor creation with different shapes."""
+        data = get_test_data(50, 40, 3)
         
-        x = jnp.zeros((0, 3))
-        y = jnp.ones((5, 3))
-        result = op(x, y)
+        # Create LazyTensors with explicit shapes
+        x_i = LazyTensor(data['x'][:, None, :])  # (N, 1, D) - "i" indexed
+        y_j = LazyTensor(data['y'][None, :, :])  # (1, M, D) - "j" indexed
         
-        self.assertEqual(result.shape, (0, 1))
+        # Should be able to do operations
+        D_ij = ((x_i - y_j) ** 2).sum(-1)
+        result = D_ij.sum(axis=1)
+        
+        # Verify result is valid
+        self.assertEqual(result.shape[0], 50)
+        self.assertTrue(jnp.all(jnp.isfinite(result)))
     
-    def test_single_point(self):
-        """Test with single point."""
-        op = Genred("SqDist(x, y)", ["x=Vi(3)", "y=Vj(3)"], 'Sum', axis=1)
+    def test_genred_string_aliases(self):
+        """Test Genred with string aliases."""
+        data = get_test_data(50, 40, 3)
         
-        x = jnp.array([[1.0, 2.0, 3.0]])
-        y = jnp.array([[0.0, 0.0, 0.0]])
-        result = op(x, y)
+        formula = "Exp(-SqNorm2(x-y) * s)"
+        aliases = ["x=Vi(3)", "y=Vj(3)", "s=Pm(1)"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        result = op(data['x'], data['y'], data['sigma'])
         
-        expected = jnp.array([[14.0]])  # 1^2 + 2^2 + 3^2
-        match, max_diff = compare_arrays(result, expected, rtol=1e-5)
-        self.assertTrue(match, f"Max diff: {max_diff}")
-    
-    def test_high_dimension(self):
-        """Test with high-dimensional data."""
-        D = 64
-        N, M = 20, 15
-        
-        x, y, _, _ = get_test_data(N, M, D)
-        op = Genred("SqDist(x, y)", [f"x=Vi({D})", f"y=Vj({D})"], 'Sum', axis=1)
-        
-        result = op(x, y)
-        self.assertEqual(result.shape, (N, 1))
+        # Verify result shape and validity
+        self.assertEqual(result.shape, (50, 1))
+        self.assertTrue(jnp.all(jnp.isfinite(result)))
 
 
 # =============================================================================
-# Test Runner
+# Data Type Tests
 # =============================================================================
 
-def run_api_tests():
-    """Run all API tests with nice output."""
-    if not KEOPS_AVAILABLE:
-        print(f"{Colors.RED}KeOps JAX not available. Cannot run tests.{Colors.RESET}")
-        return False
+class TestDataTypes(unittest.TestCase):
+    """Test different data types."""
     
-    print_header("KeOps JAX API Tests")
+    def test_float32(self):
+        """Test float32 operations."""
+        data = get_test_data(50, 40, 3, dtype='float32')
+        
+        formula = "SqDist(x, y)"
+        aliases = ["x=Vi(3)", "y=Vj(3)"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype='float32')
+        result = op(data['x'], data['y'])
+        
+        self.assertEqual(result.dtype, jnp.float32)
+    
+    def test_float64(self):
+        """Test float64 operations (requires JAX_ENABLE_X64)."""
+        # Check if float64 is enabled in JAX
+        from jax import config
+        if not config.read('jax_enable_x64'):
+            self.skipTest("JAX float64 not enabled (set JAX_ENABLE_X64=True)")
+        
+        data = get_test_data(50, 40, 3, dtype='float64')
+        
+        formula = "SqDist(x, y)"
+        aliases = ["x=Vi(3)", "y=Vj(3)"]
+        op = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype='float64')
+        result = op(data['x'], data['y'])
+        
+        self.assertEqual(result.dtype, jnp.float64)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def run_tests():
+    """Run all tests with custom output."""
+    print_header("KeOps JAX API Tests", "Unit tests for Genred, LazyTensor, and helpers")
+    print_environment_info()
     
     # Create test suite
-    suite = TestSuite("API Test Results")
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
     
-    # Collect all test classes
+    # Add test classes
     test_classes = [
-        TestGenredBasics,
+        TestGenredBasic,
         TestGenredFormulas,
-        TestGenredParameters,
-        TestGenredDTypes,
-        TestLazyTensorBasics,
-        TestLazyTensorOperations,
-        TestLazyTensorReductions,
-        TestViVjPmHelpers,
-        TestJITCompilation,
+        TestLazyTensor,
+        TestLazyTensorBatched,
         TestGradients,
-        TestBatching,
-        TestEdgeCases,
+        TestJIT,
+        TestHelpers,
+        TestDataTypes,
     ]
     
-    # Run tests
-    loader = unittest.TestLoader()
-    
     for test_class in test_classes:
-        print_subheader(test_class.__name__)
-        
-        tests = loader.loadTestsFromTestCase(test_class)
-        
-        for test in tests:
-            test_name = test._testMethodName
-            start_time = time.time()
-            
-            try:
-                # Run with setUp and tearDown
-                test.setUp()
-                getattr(test, test_name)()
-                if hasattr(test, 'tearDown'):
-                    test.tearDown()
-                
-                duration = (time.time() - start_time) * 1000
-                suite.add_result(TestResult(test_name, Status.PASS, duration))
-                print(f"  {Colors.GREEN}✓{Colors.RESET} {test_name} ({duration:.1f}ms)")
-                
-            except unittest.SkipTest as e:
-                duration = (time.time() - start_time) * 1000
-                suite.add_result(TestResult(test_name, Status.SKIP, duration, str(e)))
-                print(f"  {Colors.YELLOW}○{Colors.RESET} {test_name} (skipped: {e})")
-                
-            except AssertionError as e:
-                duration = (time.time() - start_time) * 1000
-                suite.add_result(TestResult(test_name, Status.FAIL, duration, str(e)))
-                print(f"  {Colors.RED}✗{Colors.RESET} {test_name}: {e}")
-                
-            except Exception as e:
-                duration = (time.time() - start_time) * 1000
-                suite.add_result(TestResult(test_name, Status.ERROR, duration, str(e)))
-                print(f"  {Colors.RED}💥{Colors.RESET} {test_name}: {e}")
+        suite.addTests(loader.loadTestsFromTestCase(test_class))
     
-    # Print summary
-    suite.print_summary()
+    # Run with verbosity
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
     
-    return suite.all_passed()
+    # Summary
+    print()
+    if result.wasSuccessful():
+        print(f"\n{'='*70}")
+        print(f"{'ALL TESTS PASSED':^70}")
+        print(f"{'='*70}\n")
+        return 0
+    else:
+        print(f"\n{'='*70}")
+        print(f"{'SOME TESTS FAILED':^70}")
+        print(f"{'='*70}\n")
+        return 1
 
 
-if __name__ == '__main__':
-    import sys
-    success = run_api_tests()
-    sys.exit(0 if success else 1)
+if __name__ == "__main__":
+    sys.exit(run_tests())

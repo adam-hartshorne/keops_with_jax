@@ -3,7 +3,6 @@ import os
 # --- Configuration ---
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 
-
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
