@@ -212,12 +212,39 @@ class LazyTensor(GenericLazyTensor):
         return res
 
     def join(self, other, is_complex=False):
-        """Override to merge _var_ids from both operands."""
+        """Override to merge _var_ids from both operands, deduplicating by ID."""
         res = super().join(other, is_complex=is_complex)
-        # Merge _var_ids: self's ids + other's ids (same order as variables)
+
+        # Get _var_ids from both operands
         self_ids = getattr(self, '_var_ids', ())
         other_ids = getattr(other, '_var_ids', ())
-        res._var_ids = self_ids + other_ids
+
+        # The base class concatenates variables: res.variables = self.variables + other.variables
+        # We need to deduplicate by _var_id, keeping only the first occurrence
+
+        # Build deduplicated variables and _var_ids
+        seen_ids = set()
+        new_variables = []
+        new_var_ids = []
+
+        # Process self's variables first
+        for i, var_id in enumerate(self_ids):
+            if var_id not in seen_ids:
+                seen_ids.add(var_id)
+                new_variables.append(self.variables[i])
+                new_var_ids.append(var_id)
+
+        # Then other's variables (skip duplicates)
+        for i, var_id in enumerate(other_ids):
+            if var_id not in seen_ids:
+                seen_ids.add(var_id)
+                new_variables.append(other.variables[i])
+                new_var_ids.append(var_id)
+
+        # Update result with deduplicated variables
+        res.variables = tuple(new_variables)
+        res._var_ids = tuple(new_var_ids)
+
         return res
 
     def fixvariables(self):
@@ -239,10 +266,11 @@ class LazyTensor(GenericLazyTensor):
         var_ids = getattr(self, '_var_ids', ())
 
         # Build mapping: unique_id -> index in self.variables tuple
-        # Since _var_ids[i] is the unique_id for variables[i], this is straightforward
+        # Use FIRST occurrence of each unique_id
         id_to_tuple_idx = {}
         for tuple_idx, unique_id in enumerate(var_ids):
-            id_to_tuple_idx[unique_id] = tuple_idx
+            if unique_id not in id_to_tuple_idx:  # Only keep first occurrence
+                id_to_tuple_idx[unique_id] = tuple_idx
 
         # Replace Var(unique_id, dim, cat) with Var(tuple_idx, dim, cat)
         def replace_var(match):
