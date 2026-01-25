@@ -12,9 +12,11 @@ Tests cover:
 - Batched Operations
 - Higher-Order Gradients
 - Various Genred formulas
+- Complex Number Support
 """
 
 import sys
+import math
 import numpy as np
 
 import jax
@@ -30,7 +32,7 @@ from test_utils import (
 # =============================================================================
 
 try:
-    from pykeops.jax import Genred, LazyTensor
+    from pykeops.jax import Genred, LazyTensor, Vi, Vj
 
     KEOPS_JAX_AVAILABLE = True
 except ImportError as e:
@@ -328,6 +330,200 @@ def test_formula(name, n=100, m=80, d=3):
 
 
 # =============================================================================
+# 6. Complex Number Support
+# =============================================================================
+
+def test_complex_creation():
+    """Test basic complex LazyTensor creation."""
+    np.random.seed(42)
+    N, D = 10, 3
+
+    x_np = (np.random.randn(N, D) + 1j * np.random.randn(N, D)).astype(np.complex64)
+    x_jax = jnp.array(x_np)
+
+    # Create LazyTensor with complex data
+    x_lazy = LazyTensor(x_jax[:, None, :])
+
+    # Verify it's a ComplexLazyTensor
+    if not getattr(x_lazy, 'is_complex', False):
+        return False, "LazyTensor.is_complex should be True"
+
+    # Check formula has doubled dimension (real interleaved)
+    if "6" not in x_lazy.formula:  # 3 complex -> 6 real
+        return False, f"Formula dimension wrong: {x_lazy.formula}"
+
+    return True, 0.0
+
+
+def test_complex_multiplication(n=50, m=60, d=3):
+    """Test complex multiplication: x_i * y_j summed."""
+    np.random.seed(123)
+
+    x_np = (np.random.randn(n, d) + 1j * np.random.randn(n, d)).astype(np.complex64)
+    y_np = (np.random.randn(m, d) + 1j * np.random.randn(m, d)).astype(np.complex64)
+
+    # JAX KeOps
+    x_jax = jnp.array(x_np)
+    y_jax = jnp.array(y_np)
+
+    x_i_jax = Vi(x_jax)
+    y_j_jax = Vj(y_jax)
+
+    product_jax = x_i_jax * y_j_jax
+    result_jax = product_jax.sum(-1).sum(axis=1)
+
+    # PyTorch KeOps
+    x_torch = torch.tensor(x_np, device='cuda')
+    y_torch = torch.tensor(y_np, device='cuda')
+
+    x_i_torch = LazyTensor_torch(x_torch[:, None, :])
+    y_j_torch = LazyTensor_torch(y_torch[None, :, :])
+
+    product_torch = x_i_torch * y_j_torch
+    result_torch = product_torch.sum(-1).sum(dim=1)
+
+    result_jax_np = np.array(result_jax)
+    result_torch_np = result_torch.cpu().numpy()
+
+    max_diff = np.abs(result_jax_np - result_torch_np).max()
+    if max_diff < 1e-4:
+        return True, max_diff
+    return False, f"Max diff: {max_diff}"
+
+
+def test_complex_nudft(n=100, m=80, d=1):
+    """Test complex exponential (Non-Uniform DFT): sum_j x_j * exp(-2πi * p_j * f_i)."""
+    np.random.seed(456)
+
+    # Signal values (complex)
+    x_np = (np.random.randn(n, d) + 1j * np.random.randn(n, d)).astype(np.complex64)
+    # Sample positions (real)
+    p_np = np.random.rand(n, d).astype(np.float32)
+    # Frequencies (real)
+    f_np = np.random.rand(m, d).astype(np.float32)
+
+    # JAX KeOps
+    x_jax = jnp.array(x_np)
+    p_jax = jnp.array(p_np)
+    f_jax = jnp.array(f_np)
+
+    x_lazy = LazyTensor(x_jax[:, None, :])
+    p_lazy = LazyTensor(p_jax[:, None, :])
+    f_lazy = LazyTensor(f_jax[None, :, :])
+
+    phase = (-2 * math.pi * 1j * p_lazy * f_lazy).exp()
+    X = x_lazy * phase
+    result_jax = X.sum(axis=0)
+
+    # PyTorch KeOps
+    x_torch = torch.tensor(x_np, device='cuda')
+    p_torch = torch.tensor(p_np, device='cuda')
+    f_torch = torch.tensor(f_np, device='cuda')
+
+    x_lazy_torch = LazyTensor_torch(x_torch[:, None, :])
+    p_lazy_torch = LazyTensor_torch(p_torch[:, None, :])
+    f_lazy_torch = LazyTensor_torch(f_torch[None, :, :])
+
+    phase_torch = (-2 * math.pi * 1j * p_lazy_torch * f_lazy_torch).exp()
+    X_torch = x_lazy_torch * phase_torch
+    result_torch = X_torch.sum(dim=0)
+
+    result_jax_np = np.array(result_jax)
+    result_torch_np = result_torch.cpu().numpy()
+
+    max_diff = np.abs(result_jax_np - result_torch_np).max()
+    rel_error = max_diff / np.abs(result_torch_np).max()
+
+    if rel_error < 1e-4:
+        return True, rel_error
+    return False, f"Relative error: {rel_error}"
+
+
+def test_complex_gaussian(n=50, m=60, d=3):
+    """Test complex Gaussian kernel: exp(-|x-y|²) with complex positions."""
+    np.random.seed(789)
+
+    x_np = (np.random.randn(n, d) + 1j * np.random.randn(n, d)).astype(np.complex64)
+    y_np = (np.random.randn(m, d) + 1j * np.random.randn(m, d)).astype(np.complex64)
+
+    # JAX KeOps
+    x_jax = jnp.array(x_np)
+    y_jax = jnp.array(y_np)
+
+    x_i = Vi(x_jax)
+    y_j = Vj(y_jax)
+
+    diff = x_i - y_j
+    sq_dist = (diff * diff.conj()).sum(-1)
+    K = (-sq_dist).exp()
+    result_jax = K.sum(axis=1)
+
+    # PyTorch KeOps
+    x_torch = torch.tensor(x_np, device='cuda')
+    y_torch = torch.tensor(y_np, device='cuda')
+
+    x_i_torch = LazyTensor_torch(x_torch[:, None, :])
+    y_j_torch = LazyTensor_torch(y_torch[None, :, :])
+
+    diff_torch = x_i_torch - y_j_torch
+    sq_dist_torch = (diff_torch * diff_torch.conj()).sum(-1)
+    K_torch = (-sq_dist_torch).exp()
+    result_torch = K_torch.sum(dim=1)
+
+    result_jax_np = np.array(result_jax)
+    result_torch_np = result_torch.cpu().numpy()
+
+    max_diff = np.abs(result_jax_np - result_torch_np).max()
+    if max_diff < 1e-4:
+        return True, max_diff
+    return False, f"Max diff: {max_diff}"
+
+
+def test_complex_mixed_real(n=30, m=40, d=2):
+    """Test real * complex mixed operations: K(x,y) * a where K is real, a is complex."""
+    np.random.seed(321)
+
+    # Real positions, complex values
+    x_np = np.random.randn(n, d).astype(np.float32)
+    y_np = np.random.randn(m, d).astype(np.float32)
+    a_np = (np.random.randn(m, d) + 1j * np.random.randn(m, d)).astype(np.complex64)
+
+    # JAX KeOps
+    x_jax = jnp.array(x_np)
+    y_jax = jnp.array(y_np)
+    a_jax = jnp.array(a_np)
+
+    x_i = Vi(x_jax)
+    y_j = Vj(y_jax)
+    a_j = Vj(a_jax)
+
+    sq_dist = ((x_i - y_j) ** 2).sum(-1)
+    K = (-sq_dist).exp()
+    result_jax = (K * a_j).sum(axis=1)
+
+    # PyTorch KeOps
+    x_torch = torch.tensor(x_np, device='cuda')
+    y_torch = torch.tensor(y_np, device='cuda')
+    a_torch = torch.tensor(a_np, device='cuda')
+
+    x_i_torch = LazyTensor_torch(x_torch[:, None, :])
+    y_j_torch = LazyTensor_torch(y_torch[None, :, :])
+    a_j_torch = LazyTensor_torch(a_torch[None, :, :])
+
+    sq_dist_torch = ((x_i_torch - y_j_torch) ** 2).sum(-1)
+    K_torch = (-sq_dist_torch).exp()
+    result_torch = (K_torch * a_j_torch).sum(dim=1)
+
+    result_jax_np = np.array(result_jax)
+    result_torch_np = result_torch.cpu().numpy()
+
+    max_diff = np.abs(result_jax_np - result_torch_np).max()
+    if max_diff < 1e-4:
+        return True, max_diff
+    return False, f"Max diff: {max_diff}"
+
+
+# =============================================================================
 # Main Runner
 # =============================================================================
 
@@ -388,6 +584,14 @@ def main():
     run_test("Kernel: Laplacian", lambda: test_formula("Laplacian"), suite)
     run_test("Kernel: Cauchy", lambda: test_formula("Cauchy"), suite)
     run_test("Kernel: WeightedSum", lambda: test_formula("WeightedSum"), suite)
+
+    # 6. Complex Numbers
+    print_subheader("6. Complex Number Support")
+    run_test("Complex: LazyTensor Creation", test_complex_creation, suite)
+    run_test("Complex: Multiplication", test_complex_multiplication, suite)
+    run_test("Complex: NUDFT (exp)", test_complex_nudft, suite)
+    run_test("Complex: Gaussian Kernel", test_complex_gaussian, suite)
+    run_test("Complex: Real*Complex Mixed", test_complex_mixed_real, suite)
 
     # Summary
     suite.print_summary()

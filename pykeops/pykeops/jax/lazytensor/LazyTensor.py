@@ -4,6 +4,7 @@ KeOps JAX LazyTensor implementation
 FIXES APPLIED:
 1. Use monotonic counter instead of id() for variable uniqueness
    (id() can be reused when objects are deallocated)
+2. ComplexLazyTensor support for complex-valued arrays
 """
 
 import jax.numpy as jnp
@@ -103,7 +104,7 @@ class LazyTensor(GenericLazyTensor):
         self.tools = safe_tools
         self.Genred = Genred
         self.KernelSolve = None
-        
+
         # Initialize _var_ids
         self._var_ids = ()
 
@@ -134,12 +135,12 @@ class LazyTensor(GenericLazyTensor):
         else:
             # x is None - initialize empty
             super().__init__(x=None, axis=axis)
-    
+
     def _init_from_jax_array(self, x, axis):
         """Initialize LazyTensor from a JAX array with consistent ID scheme."""
         # Set the duck typing attribute (required for base class compatibility)
         self.__GenericLazyTensor__ = True
-        
+
         # Initialize attributes that base class would set
         self.batchdims = ()
         self.ni = None
@@ -184,7 +185,7 @@ class LazyTensor(GenericLazyTensor):
         # Use monotonic counter for unique ID
         unique_id = _get_unique_var_id()
         self.formula = f"Var({unique_id},{self.ndim},{self.axis})"
-        
+
         # Store the unique_id for this variable
         self._var_ids = (unique_id,)
 
@@ -214,37 +215,37 @@ class LazyTensor(GenericLazyTensor):
     def join(self, other, is_complex=False):
         """Override to merge _var_ids from both operands, deduplicating by ID."""
         res = super().join(other, is_complex=is_complex)
-        
+
         # Get _var_ids from both operands
         self_ids = getattr(self, '_var_ids', ())
         other_ids = getattr(other, '_var_ids', ())
-        
+
         # The base class concatenates variables: res.variables = self.variables + other.variables
         # We need to deduplicate by _var_id, keeping only the first occurrence
-        
+
         # Build deduplicated variables and _var_ids
         seen_ids = set()
         new_variables = []
         new_var_ids = []
-        
+
         # Process self's variables first
         for i, var_id in enumerate(self_ids):
             if var_id not in seen_ids:
                 seen_ids.add(var_id)
                 new_variables.append(self.variables[i])
                 new_var_ids.append(var_id)
-        
+
         # Then other's variables (skip duplicates)
         for i, var_id in enumerate(other_ids):
             if var_id not in seen_ids:
                 seen_ids.add(var_id)
                 new_variables.append(other.variables[i])
                 new_var_ids.append(var_id)
-        
+
         # Update result with deduplicated variables
         res.variables = tuple(new_variables)
         res._var_ids = tuple(new_var_ids)
-        
+
         return res
 
     def fixvariables(self):
@@ -254,7 +255,7 @@ class LazyTensor(GenericLazyTensor):
         When we manually initialize LazyTensors (in except block), we use
         Var(unique_id, dim, cat) for uniqueness. But Genred needs Var(0, dim, cat),
         Var(1, dim, cat), etc. This method does the conversion.
-        
+
         Uses _var_ids to correctly map each variable to its unique_id in the formula.
         """
         import re
@@ -264,7 +265,7 @@ class LazyTensor(GenericLazyTensor):
 
         # Get the _var_ids mapping (unique_id -> variable index in tuple)
         var_ids = getattr(self, '_var_ids', ())
-        
+
         # Build mapping: unique_id -> index in self.variables tuple
         # Use FIRST occurrence of each unique_id
         id_to_tuple_idx = {}
@@ -352,7 +353,7 @@ class LazyTensor(GenericLazyTensor):
             self.reduction_op,
             self.axis,
             dtype=dtype_str,
-            opt_arg=self.opt_arg,
+            opt_arg=getattr(self, 'opt_arg', None),
             formula2=self.formula2
         )
 
@@ -366,18 +367,227 @@ class ComplexLazyTensor(ComplexGenericLazyTensor):
         self.Genred = Genred
         self.KernelSolve = None
 
+        # Initialize _var_ids for consistency with LazyTensor
+        self._var_ids = ()
+
         if x is not None:
-            if isinstance(x, (int, float)):
+            if isinstance(x, (int, float, complex)):
                 x = jnp.array(x)
             elif hasattr(x, 'dtype') and not hasattr(x, 'shape'):
                 x = jnp.array(x)
             if hasattr(x, 'shape') and len(x.shape) == 0:
                 x = jnp.reshape(x, (1,))
 
-        super().__init__(x=x, axis=axis)
+        # Handle complex lists
+        if type(x) == complex:
+            x = [x]
+        if type(x) == list and len(x) > 0 and isinstance(x[0], complex):
+            x_ = [None] * (2 * len(x))
+            for i in range(len(x)):
+                x_[2 * i] = x[i].real
+                x_[2 * i + 1] = x[i].imag
+            x = x_
+
+        # Handle JAX complex arrays - convert to interleaved real
+        is_lazy_tensor = hasattr(x, '__GenericLazyTensor__')
+        if x is not None and not isinstance(x, (tuple, list)) and not is_lazy_tensor and safe_tools.is_tensor(x) and jnp.iscomplexobj(x):
+            # Convert complex to interleaved real: (N, D) complex -> (N, 2*D) real
+            x = jnp.stack([x.real, x.imag], axis=-1).reshape(x.shape[:-1] + (2 * x.shape[-1],))
+            self._init_from_jax_array_complex(x, axis)
+        elif x is not None and not isinstance(x, (tuple, list)) and not is_lazy_tensor and safe_tools.is_tensor(x):
+            # Real array passed to ComplexLazyTensor
+            self._init_from_jax_array_complex(x, axis)
+        else:
+            # Use base class for other types
+            super().__init__(x=x, axis=axis)
+
+        self.is_complex = True
+
+    def _init_from_jax_array_complex(self, x, axis):
+        """Initialize ComplexLazyTensor from a JAX array (already converted to real)."""
+        # Set the duck typing attribute
+        self.__GenericLazyTensor__ = True
+
+        # Initialize attributes
+        self.batchdims = ()
+        self.ni = None
+        self.nj = None
+        self.symbolic_variables = ()
+        self.ranges = None
+        self.backend = None
+        self.formula2 = None
+
+        # Handle 3D+ tensors
+        if len(x.shape) >= 3:
+            if len(x.shape) > 3:
+                self.batchdims = tuple(x.shape[:-3])
+
+            dim_i = x.shape[-3]
+            dim_j = x.shape[-2]
+
+            if axis is None:
+                if dim_i > 1 and dim_j == 1:
+                    axis = 0
+                elif dim_i == 1 and dim_j > 1:
+                    axis = 1
+                elif dim_i == 1 and dim_j == 1:
+                    axis = 1
+
+            if dim_i == 1 and dim_j == 1:
+                x = jnp.squeeze(x, axis=-3)
+                x = jnp.squeeze(x, axis=-2)
+            elif dim_i == 1:
+                x = jnp.squeeze(x, axis=-3)
+            elif dim_j == 1:
+                x = jnp.squeeze(x, axis=-2)
+
+        # Get dimensions
+        self.ndim = x.shape[-1]
+        self.axis = axis if axis is not None else (2 if len(x.shape) == 1 else None)
+
+        # Set ni/nj
+        if len(x.shape) >= 2:
+            if self.axis == 0:
+                self.ni = x.shape[-2]
+            elif self.axis == 1:
+                self.nj = x.shape[-2]
+
+        self._dtype = safe_tools.dtypename(x.dtype)
+
+        # Create unique variable ID
+        var_id = _get_unique_var_id()
+        self.formula = f"Var({var_id},{self.ndim},{self.axis})"
+        self.variables = (x,)
+        self._var_ids = (var_id,)
 
     def get_tools(self):
         pass
 
     def lt_constructor(self, x=None, axis=None, is_complex=True):
         return LazyTensor(x=x, axis=axis, is_complex=is_complex)
+
+    def init(self, is_complex=False):
+        """Override to propagate _var_ids."""
+        res = super().init(is_complex=True)
+        if hasattr(self, '_var_ids'):
+            res._var_ids = self._var_ids
+        return res
+
+    def join(self, other, is_complex=False):
+        """Override to merge _var_ids from both operands, deduplicating by ID."""
+        res = super().join(other, is_complex=True)
+
+        # Get _var_ids from both operands
+        self_ids = getattr(self, '_var_ids', ())
+        other_ids = getattr(other, '_var_ids', ())
+
+        # Deduplicate variables by _var_id
+        seen_ids = set()
+        new_variables = []
+        new_var_ids = []
+
+        for i, var_id in enumerate(self_ids):
+            if var_id not in seen_ids:
+                seen_ids.add(var_id)
+                new_variables.append(self.variables[i])
+                new_var_ids.append(var_id)
+
+        for i, var_id in enumerate(other_ids):
+            if var_id not in seen_ids:
+                seen_ids.add(var_id)
+                new_variables.append(other.variables[i])
+                new_var_ids.append(var_id)
+
+        res.variables = tuple(new_variables)
+        res._var_ids = tuple(new_var_ids)
+
+        return res
+
+    def fixvariables(self):
+        """Convert id-based variable names to index-based names."""
+        import re
+
+        combined = (self.formula or "") + (self.formula2 or "")
+        var_pattern = r'Var\((\d+),\s*(\d+),\s*(\d+|None)\)'
+
+        var_ids = getattr(self, '_var_ids', ())
+
+        id_to_tuple_idx = {}
+        for tuple_idx, unique_id in enumerate(var_ids):
+            if unique_id not in id_to_tuple_idx:
+                id_to_tuple_idx[unique_id] = tuple_idx
+
+        def replace_var(match):
+            var_id = int(match.group(1))
+            dim = match.group(2)
+            cat = match.group(3)
+
+            if var_id < 1000000:
+                return match.group(0)
+
+            tuple_idx = id_to_tuple_idx.get(var_id)
+            if tuple_idx is None:
+                return match.group(0)
+
+            if cat == "None":
+                cat = "2"
+
+            return f"Var({tuple_idx},{dim},{cat})"
+
+        if self.formula:
+            self.formula = re.sub(var_pattern, replace_var, self.formula)
+        if self.formula2:
+            self.formula2 = re.sub(var_pattern, replace_var, self.formula2)
+
+        return self
+
+    def __call__(self, *args, **kwargs):
+        """
+        Call the compiled KeOps kernel for complex operations.
+        Similar to LazyTensor.__call__ but converts result back to complex.
+        """
+        import re
+
+        # Convert id-based formulas to index-based
+        self.fixvariables()
+
+        # Build aliases from variables
+        combined = (self.formula or "") + (self.formula2 or "")
+        aliases = []
+
+        for i, v in enumerate(self.variables):
+            m = re.search(r"Var\({},\s*(\d+),\s*(\d+)\)".format(i), combined)
+            if m:
+                aliases.append(f"Var({i},{m.group(1)},{m.group(2)})")
+            else:
+                dim = v.shape[-1]
+                if len(v.shape) == 1:
+                    c = 2
+                elif len(v.shape) == 2:
+                    c = 2
+                elif len(v.shape) >= 3:
+                    if v.shape[-2] == 1:
+                        c = 0
+                    elif v.shape[-3] == 1:
+                        c = 1
+                    else:
+                        c = 2
+                else:
+                    c = 2
+                aliases.append(f"Var({i},{dim},{c})")
+
+        dtype_str = getattr(self, '_dtype', 'float32')
+
+        op = self.Genred(
+            self.formula,
+            aliases,
+            self.reduction_op,
+            self.axis,
+            dtype=dtype_str,
+            opt_arg=getattr(self, 'opt_arg', None),
+            formula2=self.formula2
+        )
+
+        # Execute and convert back to complex
+        res = op(*self.variables)
+        return safe_tools.view_as_complex(res)

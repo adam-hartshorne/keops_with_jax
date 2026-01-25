@@ -160,7 +160,7 @@ class KernelSolve:
         enable_chunks: Enable chunked computation mode
         use_fast_math: Use fast math optimizations
     """
-    
+
     def __init__(
         self,
         formula,
@@ -202,7 +202,7 @@ class KernelSolve:
             axis=self.axis,
             dtype=self.dtype,
         )
-    
+
     def __call__(self, *args, alpha=1e-10, eps=1e-6, max_iter=1000):
         """
         Solve the kernel linear system (αI + K)a = b.
