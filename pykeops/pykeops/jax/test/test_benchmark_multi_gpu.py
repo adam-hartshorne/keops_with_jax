@@ -82,9 +82,12 @@ class ScalingResult:
     total_batch_size: int
     bg: int
     n_gpus: int
-    time_ms: float
-    speedup: float
-    efficiency_pct: float
+    forward_ms: float
+    backward_ms: float
+    speedup_forward: float
+    speedup_backward: float
+    efficiency_forward_pct: float
+    efficiency_backward_pct: float
 
 
 # Benchmark Configurations
@@ -165,8 +168,8 @@ def create_sharded_data(config: ScalingConfig, n_gpus, total_batch_size, seed=42
 # Benchmarking Core
 # =============================================================================
 
-def benchmark_op(op, args, mesh):
-    """Run benchmark with visual progress bar."""
+def benchmark_op(op, args, mesh, mode="forward"):
+    """Run benchmark with visual progress bar. Mode can be 'forward' or 'backward'."""
 
     in_specs = []
     for i in range(len(args) - 1):
@@ -175,14 +178,26 @@ def benchmark_op(op, args, mesh):
 
     out_specs = P('batch', None, None)
 
-    # Compile
-    @jax.jit
-    @shard_map(mesh=mesh, in_specs=tuple(in_specs), out_specs=out_specs)
-    def compute(x_loc, y_loc, *others):
-        return op(x_loc, y_loc, *others)
+    if mode == "forward":
+        # Forward pass
+        @jax.jit
+        @shard_map(mesh=mesh, in_specs=tuple(in_specs), out_specs=out_specs)
+        def compute(x_loc, y_loc, *others):
+            return op(x_loc, y_loc, *others)
+    else:
+        # Backward pass (gradient w.r.t. first argument)
+        @jax.jit
+        @shard_map(mesh=mesh, in_specs=tuple(in_specs), out_specs=in_specs[0])
+        def compute(x_loc, y_loc, *others):
+            def loss_fn(x):
+                return op(x, y_loc, *others).sum()
+
+            return jax.grad(loss_fn)(x_loc)
 
     # Execution
     times = []
+    mode_str = "Forward" if mode == "forward" else "Backward"
+
     with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -193,14 +208,14 @@ def benchmark_op(op, args, mesh):
     ) as progress:
 
         # Warmup
-        task = progress.add_task("[yellow]Warming up...", total=N_WARMUP)
+        task = progress.add_task(f"[yellow]{mode_str} Warmup...", total=N_WARMUP)
         for _ in range(N_WARMUP):
             res = compute(*args)
             res.block_until_ready()
             progress.advance(task)
 
         # Timing
-        task = progress.add_task("[green]Benchmarking...", total=N_ITERS)
+        task = progress.add_task(f"[green]{mode_str} Benchmarking...", total=N_ITERS)
         n_loops = max(1, N_ITERS // TIMING_BATCH)
 
         for _ in range(n_loops):
@@ -229,9 +244,34 @@ def print_header():
         console.print(Panel(grid, style="bold white", border_style="blue"))
 
 
+def format_speedup(speedup):
+    """Format speedup with arrow and color."""
+    if speedup is None:
+        return "-"
+    if speedup > 1.05:
+        return f"[bold green]↑ {speedup:.2f}x[/bold green]"  # Faster
+    elif speedup < 0.95:
+        return f"[bold red]↓ {speedup:.2f}x[/bold red]"  # Slower
+    else:
+        return f"[bold yellow]→ {speedup:.2f}x[/bold yellow]"  # About the same
+
+
+def format_efficiency(eff_pct):
+    """Format efficiency with color."""
+    if eff_pct is None:
+        return "-"
+    if eff_pct >= 80:
+        return f"[bold green]{eff_pct:.0f}%[/bold green]"
+    elif eff_pct >= 50:
+        return f"[bold yellow]{eff_pct:.0f}%[/bold yellow]"
+    else:
+        return f"[bold red]{eff_pct:.0f}%[/bold red]"
+
+
 def run_scaling_test(config: ScalingConfig, gpu_counts: List[int], bg: int):
     results = []
-    baseline_time = None
+    baseline_forward = None
+    baseline_backward = None
     size_str = f"N={config.nx:,}"
 
     # Calculate Total Batch Size
@@ -254,73 +294,155 @@ def run_scaling_test(config: ScalingConfig, gpu_counts: List[int], bg: int):
             # 1. Prepare Data
             args, mesh = create_sharded_data(config, n_gpus, total_batch_size)
 
-            # 2. Benchmark
+            # 2. Benchmark Forward
             if RICH_AVAILABLE:
                 console.print(f"    Running on [bold magenta]{n_gpus} GPUs[/bold magenta]...", end="\r")
 
-            time_ms = benchmark_op(op, args, mesh)
+            forward_ms = benchmark_op(op, args, mesh, mode="forward")
+
+            # 3. Benchmark Backward
+            backward_ms = benchmark_op(op, args, mesh, mode="backward")
+
+            # Format arrows for inline display (with colors)
+            def inline_speedup(speedup):
+                if speedup > 1.05:
+                    return f"[bold green]↑{speedup:.2f}x[/bold green]"
+                elif speedup < 0.95:
+                    return f"[bold red]↓{speedup:.2f}x[/bold red]"
+                else:
+                    return f"[bold yellow]→{speedup:.2f}x[/bold yellow]"
+
+            if baseline_forward is None:
+                fwd_str = "[dim]baseline[/dim]"
+                bwd_str = "[dim]baseline[/dim]"
+            else:
+                speedup_fwd_tmp = baseline_forward / forward_ms
+                speedup_bwd_tmp = baseline_backward / backward_ms
+                fwd_str = inline_speedup(speedup_fwd_tmp)
+                bwd_str = inline_speedup(speedup_bwd_tmp)
 
             if RICH_AVAILABLE:
-                console.print(f"    [green]✓[/green] {n_gpus} GPUs: {time_ms:.2f} ms")
+                console.print(
+                    f"    [green]✓[/green] {n_gpus} GPUs: Fwd {forward_ms:.2f}ms ({fwd_str}), Bwd {backward_ms:.2f}ms ({bwd_str})")
 
-            # 3. Stats
-            if baseline_time is None:
-                baseline_time = time_ms
-                speedup = 1.0
+            # 4. Stats
+            if baseline_forward is None:
+                baseline_forward = forward_ms
+                baseline_backward = backward_ms
+                speedup_forward = 1.0
+                speedup_backward = 1.0
             else:
-                speedup = baseline_time / time_ms
+                speedup_forward = baseline_forward / forward_ms
+                speedup_backward = baseline_backward / backward_ms
 
-            efficiency = (speedup / n_gpus) * 100 if n_gpus > 1 else 100.0
+            efficiency_forward = (speedup_forward / n_gpus) * 100 if n_gpus > 1 else 100.0
+            efficiency_backward = (speedup_backward / n_gpus) * 100 if n_gpus > 1 else 100.0
 
             results.append(
-                ScalingResult(config.name, size_str, total_batch_size, bg, n_gpus, time_ms, speedup, efficiency))
+                ScalingResult(
+                    config_name=config.name,
+                    size_str=size_str,
+                    total_batch_size=total_batch_size,
+                    bg=bg,
+                    n_gpus=n_gpus,
+                    forward_ms=forward_ms,
+                    backward_ms=backward_ms,
+                    speedup_forward=speedup_forward,
+                    speedup_backward=speedup_backward,
+                    efficiency_forward_pct=efficiency_forward,
+                    efficiency_backward_pct=efficiency_backward,
+                ))
 
         except Exception as e:
             console.print(f"[red]Error on {n_gpus} GPUs: {e}[/red]")
+            import traceback
+            traceback.print_exc()
 
     return results
 
 
 def print_summary_table(all_results: Dict[str, List[ScalingResult]], max_gpus):
-    """Generates the single summary table requested."""
+    """Generates summary tables for forward and backward passes."""
     if not RICH_AVAILABLE: return
 
-    table = Table(title="Multi-GPU Performance Summary", box=box.ROUNDED)
-    table.add_column("Problem", style="cyan", justify="left")
-    table.add_column("Size", style="dim", justify="right")
-    table.add_column("Batch (B)", justify="right")
-    table.add_column("Single GPU (ms)", style="red", justify="right")
-    table.add_column(f"Multi GPU ({max_gpus}) (ms)", style="green", justify="right")
-    table.add_column("Speedup", style="bold white", justify="right")
-    table.add_column("Scaling Eff.", justify="right")
+    # Forward Pass Table
+    table_fwd = Table(title="[bold cyan]Forward Pass - Multi-GPU Performance[/bold cyan]", box=box.ROUNDED)
+    table_fwd.add_column("Problem", style="cyan", justify="left")
+    table_fwd.add_column("Size", style="dim", justify="right")
+    table_fwd.add_column("Batch (B)", justify="right")
+    table_fwd.add_column("1 GPU (ms)", style="yellow", justify="right")
+    table_fwd.add_column(f"{max_gpus} GPU (ms)", style="green", justify="right")
+    table_fwd.add_column("Speedup", justify="right")
+    table_fwd.add_column("Efficiency", justify="right")
 
     for config_name_bg, res_list in all_results.items():
-        # Find 1 GPU result
         r1 = next((r for r in res_list if r.n_gpus == 1), None)
-        # Find Max GPU result
         r_max = next((r for r in res_list if r.n_gpus == max_gpus), None)
 
         if r1 and r_max:
-            speedup_str = f"{r_max.speedup:.2f}x"
-            eff = r_max.efficiency_pct
-            eff_color = "green" if eff > 80 else ("yellow" if eff > 50 else "red")
-            eff_str = f"[{eff_color}]{eff:.0f}%[/{eff_color}]"
-
-            # Clean Config Name (remove unique ID suffix if needed, or keep clean)
-            display_name = r1.config_name
-
-            table.add_row(
-                display_name,
+            table_fwd.add_row(
+                r1.config_name,
                 r1.size_str,
                 str(r1.total_batch_size),
-                f"{r1.time_ms:.2f}",
-                f"{r_max.time_ms:.2f}",
-                speedup_str,
-                eff_str
+                f"{r1.forward_ms:.2f}",
+                f"{r_max.forward_ms:.2f}",
+                format_speedup(r_max.speedup_forward),
+                format_efficiency(r_max.efficiency_forward_pct),
             )
 
     console.print()
-    console.print(table)
+    console.print(table_fwd)
+
+    # Backward Pass Table
+    table_bwd = Table(title="[bold cyan]Backward Pass - Multi-GPU Performance[/bold cyan]", box=box.ROUNDED)
+    table_bwd.add_column("Problem", style="cyan", justify="left")
+    table_bwd.add_column("Size", style="dim", justify="right")
+    table_bwd.add_column("Batch (B)", justify="right")
+    table_bwd.add_column("1 GPU (ms)", style="yellow", justify="right")
+    table_bwd.add_column(f"{max_gpus} GPU (ms)", style="green", justify="right")
+    table_bwd.add_column("Speedup", justify="right")
+    table_bwd.add_column("Efficiency", justify="right")
+
+    for config_name_bg, res_list in all_results.items():
+        r1 = next((r for r in res_list if r.n_gpus == 1), None)
+        r_max = next((r for r in res_list if r.n_gpus == max_gpus), None)
+
+        if r1 and r_max:
+            table_bwd.add_row(
+                r1.config_name,
+                r1.size_str,
+                str(r1.total_batch_size),
+                f"{r1.backward_ms:.2f}",
+                f"{r_max.backward_ms:.2f}",
+                format_speedup(r_max.speedup_backward),
+                format_efficiency(r_max.efficiency_backward_pct),
+            )
+
+    console.print()
+    console.print(table_bwd)
+
+    # Summary Statistics
+    fwd_efficiencies = []
+    bwd_efficiencies = []
+    for res_list in all_results.values():
+        r_max = next((r for r in res_list if r.n_gpus == max_gpus), None)
+        if r_max:
+            fwd_efficiencies.append(r_max.efficiency_forward_pct)
+            bwd_efficiencies.append(r_max.efficiency_backward_pct)
+
+    if fwd_efficiencies:
+        avg_fwd_eff = np.mean(fwd_efficiencies)
+        avg_bwd_eff = np.mean(bwd_efficiencies)
+
+        console.print()
+        console.print(Panel(
+            f"[bold]Average Forward Scaling Efficiency ({max_gpus} GPUs):[/bold] {format_efficiency(avg_fwd_eff)}\n"
+            f"[bold]Average Backward Scaling Efficiency ({max_gpus} GPUs):[/bold] {format_efficiency(avg_bwd_eff)}\n\n"
+            f"[dim]↑ = Scaling well | → = Linear | ↓ = Sub-linear scaling[/dim]\n"
+            f"[dim]Efficiency: Green ≥80% | Yellow ≥50% | Red <50%[/dim]",
+            title="[bold]Summary[/bold]",
+            border_style="green"
+        ))
 
 
 def main():

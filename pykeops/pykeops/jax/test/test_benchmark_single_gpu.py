@@ -72,8 +72,12 @@ class BenchmarkResult:
     size_str: str  # Added size string
     jax_forward_ms: float
     jax_forward_std: float
+    jax_backward_ms: float = 0.0
+    jax_backward_std: float = 0.0
     torch_forward_ms: Optional[float] = None
-    speedup: Optional[float] = None
+    torch_backward_ms: Optional[float] = None
+    speedup_forward: Optional[float] = None
+    speedup_backward: Optional[float] = None
 
 
 BENCHMARK_CONFIGS = [
@@ -196,39 +200,90 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     else:
         aliases = [f"x=Vi({D})", f"y=Vj({D})", "s=Pm(1)"]
 
-    # --- JAX ---
+    # --- JAX Forward ---
     jax_args = [jnp.array(a) for a in arrays_np]
     op_jax = Genred_jax(config.formula, aliases, reduction_op='Sum', axis=1)
     jit_op = jax.jit(lambda *a: op_jax(*a))  # JIT compile the op
 
-    jax_ms, jax_std = time_func("JAX", lambda *a, sync=False: jax_run(jit_op, a, sync),
+    jax_ms, jax_std = time_func("JAX Forward", lambda *a, sync=False: jax_run(jit_op, a, sync),
                                 jax_args, N_WARMUP, N_ITERS, TIMING_BATCH)
 
-    # --- Torch ---
+    # --- JAX Backward ---
+    def jax_grad_fn(*args):
+        def loss(*a):
+            return op_jax(*a).sum()
+
+        return jax.grad(loss, argnums=0)(*args)
+
+    jit_grad_fn = jax.jit(jax_grad_fn)
+
+    jax_bwd_ms, jax_bwd_std = time_func("JAX Backward", lambda *a, sync=False: jax_run(jit_grad_fn, a, sync),
+                                        jax_args, N_WARMUP, N_ITERS, TIMING_BATCH)
+
+    # --- Torch Forward ---
     torch_ms = None
+    torch_bwd_ms = None
     if TORCH_AVAILABLE:
         torch_args = [torch.tensor(a, device='cuda') for a in arrays_np]
+        torch_args[0].requires_grad_(True)  # Enable grad for x
         op_torch = Genred_torch(config.formula, aliases, reduction_op='Sum', axis=1)
 
-        torch_ms, torch_std = time_func("PyTorch", lambda *a, sync=False: torch_run(op_torch, a, sync),
+        torch_ms, torch_std = time_func("PyTorch Forward", lambda *a, sync=False: torch_run(op_torch, a, sync),
                                         torch_args, N_WARMUP, N_ITERS, TIMING_BATCH)
 
+        # --- Torch Backward ---
+        def torch_backward_fn(*args, sync=False):
+            args[0].grad = None
+            result = op_torch(*args).sum()
+            result.backward()
+            if sync:
+                torch.cuda.synchronize()
+            return args[0].grad
+
+        torch_bwd_ms, torch_bwd_std = time_func("PyTorch Backward", torch_backward_fn,
+                                                torch_args, N_WARMUP, N_ITERS, TIMING_BATCH)
+
     # Report
-    speedup = torch_ms / jax_ms if torch_ms else None
+    speedup_fwd = torch_ms / jax_ms if torch_ms else None
+    speedup_bwd = torch_bwd_ms / jax_bwd_ms if torch_bwd_ms else None
+
+    def format_speedup_inline(speedup):
+        """Format speedup with arrow and color for inline display."""
+        if speedup is None:
+            return "-"
+        if speedup > 1.05:
+            return f"[bold green]↑ {speedup:.2f}x[/bold green]"
+        elif speedup < 0.95:
+            return f"[bold red]↓ {speedup:.2f}x[/bold red]"
+        else:
+            return f"[bold yellow]→ {speedup:.2f}x[/bold yellow]"
 
     if RICH_AVAILABLE:
         table = Table(box=box.SIMPLE, show_header=False)
         table.add_column("Metric", style="bold")
         table.add_column("Value", justify="right")
-        table.add_row("JAX Time", f"[green]{jax_ms:.3f} ms[/green] ± {jax_std:.3f}")
+        table.add_row("JAX Forward", f"[green]{jax_ms:.3f} ms[/green] ± {jax_std:.3f}")
+        table.add_row("JAX Backward", f"[green]{jax_bwd_ms:.3f} ms[/green] ± {jax_bwd_std:.3f}")
         if torch_ms:
-            table.add_row("PyTorch Time", f"[yellow]{torch_ms:.3f} ms[/yellow]")
-            val_col = "bold green" if speedup > 1.05 else "white"
-            table.add_row("Speedup (Torch/JAX)", f"[{val_col}]{speedup:.2f}x[/{val_col}]")
+            table.add_row("PyTorch Forward", f"[yellow]{torch_ms:.3f} ms[/yellow]")
+            table.add_row("PyTorch Backward", f"[yellow]{torch_bwd_ms:.3f} ms[/yellow]")
+            table.add_row("Speedup Forward", format_speedup_inline(speedup_fwd))
+            table.add_row("Speedup Backward", format_speedup_inline(speedup_bwd))
         console.print(table)
         console.print()
 
-    return BenchmarkResult(config.name, size_str, jax_ms, jax_std, torch_ms, speedup)
+    return BenchmarkResult(
+        config_name=config.name,
+        size_str=size_str,
+        jax_forward_ms=jax_ms,
+        jax_forward_std=jax_std,
+        jax_backward_ms=jax_bwd_ms,
+        jax_backward_std=jax_bwd_std,
+        torch_forward_ms=torch_ms,
+        torch_backward_ms=torch_bwd_ms,
+        speedup_forward=speedup_fwd,
+        speedup_backward=speedup_bwd,
+    )
 
 
 # =============================================================================
@@ -240,35 +295,67 @@ def print_summary(results: List[BenchmarkResult]):
     if not RICH_AVAILABLE:
         return
 
-    table = Table(title="Single GPU Performance Summary", box=box.ROUNDED)
+    def format_speedup(speedup):
+        """Format speedup with arrow and color."""
+        if speedup is None:
+            return "-"
+        if speedup > 1.05:
+            return f"[bold green]↑ {speedup:.2f}x[/bold green]"  # JAX faster
+        elif speedup < 0.95:
+            return f"[bold red]↓ {speedup:.2f}x[/bold red]"  # JAX slower
+        else:
+            return f"[bold yellow]→ {speedup:.2f}x[/bold yellow]"  # About the same
+
+    # Forward Pass Table
+    table = Table(title="[bold cyan]Forward Pass Performance[/bold cyan]", box=box.ROUNDED)
     table.add_column("Configuration", style="cyan", justify="left")
-    table.add_column("Size", style="dim", justify="right")  # Added Size Column
+    table.add_column("Size", style="dim", justify="right")
     table.add_column("JAX (ms)", style="green", justify="right")
     table.add_column("PyTorch (ms)", style="yellow", justify="right")
-    table.add_column("Speedup", style="bold white", justify="right")
+    table.add_column("Speedup", justify="right")
 
     for r in results:
-        # JAX
         jax_str = f"{r.jax_forward_ms:.2f}"
-
-        # Torch
-        if r.torch_forward_ms:
-            torch_str = f"{r.torch_forward_ms:.2f}"
-        else:
-            torch_str = "-"
-
-        # Speedup
-        if r.speedup:
-            # Color coding: Green if JAX is faster (>1.05x), Red if slower (<0.95x)
-            color = "green" if r.speedup > 1.05 else ("red" if r.speedup < 0.95 else "white")
-            speedup_str = f"[{color}]{r.speedup:.2f}x[/{color}]"
-        else:
-            speedup_str = "-"
-
+        torch_str = f"{r.torch_forward_ms:.2f}" if r.torch_forward_ms else "-"
+        speedup_str = format_speedup(r.speedup_forward)
         table.add_row(r.config_name, r.size_str, jax_str, torch_str, speedup_str)
 
     console.print()
     console.print(table)
+
+    # Backward Pass Table
+    table2 = Table(title="[bold cyan]Backward Pass Performance[/bold cyan]", box=box.ROUNDED)
+    table2.add_column("Configuration", style="cyan", justify="left")
+    table2.add_column("Size", style="dim", justify="right")
+    table2.add_column("JAX (ms)", style="green", justify="right")
+    table2.add_column("PyTorch (ms)", style="yellow", justify="right")
+    table2.add_column("Speedup", justify="right")
+
+    for r in results:
+        jax_str = f"{r.jax_backward_ms:.2f}"
+        torch_str = f"{r.torch_backward_ms:.2f}" if r.torch_backward_ms else "-"
+        speedup_str = format_speedup(r.speedup_backward)
+        table2.add_row(r.config_name, r.size_str, jax_str, torch_str, speedup_str)
+
+    console.print()
+    console.print(table2)
+
+    # Summary Statistics
+    if any(r.speedup_forward for r in results):
+        fwd_speedups = [r.speedup_forward for r in results if r.speedup_forward]
+        bwd_speedups = [r.speedup_backward for r in results if r.speedup_backward]
+
+        avg_fwd = np.mean(fwd_speedups) if fwd_speedups else 0
+        avg_bwd = np.mean(bwd_speedups) if bwd_speedups else 0
+
+        console.print()
+        console.print(Panel(
+            f"[bold]Average Forward Speedup:[/bold] {format_speedup(avg_fwd)}\n"
+            f"[bold]Average Backward Speedup:[/bold] {format_speedup(avg_bwd)}\n\n"
+            f"[dim]↑ = JAX faster | → = Similar | ↓ = PyTorch faster[/dim]",
+            title="[bold]Summary[/bold]",
+            border_style="green"
+        ))
 
 
 def main():
