@@ -74,7 +74,12 @@ class jaxtools:
 
     @staticmethod
     def long(x):
-        return x.astype(jnp.int64)
+        # Use int32 by default since JAX doesn't enable X64 by default
+        # This avoids the "int64 will be truncated to int32" warning
+        if jax.config.x64_enabled:
+            return x.astype(jnp.int64)
+        else:
+            return x.astype(jnp.int32)
 
     @staticmethod
     def dtype(x):
