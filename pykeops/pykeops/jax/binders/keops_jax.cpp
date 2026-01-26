@@ -490,8 +490,12 @@ ffi::Error KeOpsKernelImpl(
         return ffi::Error::Internal("Output pointer is null");
     }
 
-    // CRITICAL FIX: Pass actual batch_size, not just a flag
-    int64_t ranges_enc_value = (batch_size > 1) ? batch_size : 0;
+    // For 3D tensors, always enable ranges by passing batch_size
+    // batch_size >= 1 for 3D tensors (is_batched=True in Python)
+    // batch_size = 1 for 2D tensors (is_batched=False in Python)
+    // The kernel was compiled with use_ranges=(len(shape)==3), so we must
+    // pass batch_size consistently to match the compiled kernel's expectations
+    int64_t ranges_enc_value = batch_size;
     void* ranges_enc_ptr = (void*)ranges_enc_value;
 
     void* argshapes_ptr = (void*)kernel.var_counts_packed;

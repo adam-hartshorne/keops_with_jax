@@ -210,6 +210,12 @@ class Cuda_link_compile(LinkCompile):
         # Generate the mapping as a static array
         mapping_array = ', '.join(str(x) for x in sorted_mapping) if sorted_mapping else '0'
 
+        # FIX: Compute compile-time variable counts to avoid runtime mismatch
+        # These MUST match what the compiled kernel expects
+        compile_time_nvi = len(indsi)
+        compile_time_nvj = len(indsj)
+        compile_time_nvp = len(indsp)
+
         preamble = '''
 #include <stdio.h>
 #include <cuda_runtime.h>
@@ -223,6 +229,10 @@ using std::min;
 #define KEOPS_DTYPE_BYTES ''' + str(dtype_bytes) + '''
 #define PRECOMPUTED_SPARSE_ARGS_COUNT ''' + str(sparse_args_count) + '''
 #define PRECOMPUTED_TOTAL_ARGS ''' + str(total_args) + '''
+// FIX: Use compile-time variable counts to match kernel expectations
+#define PRECOMPUTED_NVI ''' + str(compile_time_nvi) + '''
+#define PRECOMPUTED_NVJ ''' + str(compile_time_nvj) + '''
+#define PRECOMPUTED_NVP ''' + str(compile_time_nvp) + '''
 static const int PRECOMPUTED_MAPPING[''' + str(max(1, total_args)) + '''] = {''' + mapping_array + '''};
 
 #define CHECK_CUDA_LAUNCH(err) \\
@@ -274,16 +284,23 @@ struct LaunchCache {
     int ny = -1;
     int batch_size = -1;
     int cuda_block_size = -1;
+    int nvi = -1;
+    int nvj = -1;
+    int nvp = -1;
+    int tagI = -1;  // FIX: Include tagI in cache key to distinguish swapped kernels
     std::vector<char> cached_tables;
     size_t tables_size = 0;
 
-    bool is_valid(int _nx, int _ny, int _batch_size, int _cuda_block_size) const {
-        return nx == _nx && ny == _ny && batch_size == _batch_size && 
-               cuda_block_size == _cuda_block_size && !cached_tables.empty();
+    bool is_valid(int _nx, int _ny, int _batch_size, int _cuda_block_size, int _nvi, int _nvj, int _nvp, int _tagI) const {
+        return nx == _nx && ny == _ny && batch_size == _batch_size &&
+               cuda_block_size == _cuda_block_size &&
+               nvi == _nvi && nvj == _nvj && nvp == _nvp &&
+               tagI == _tagI &&  // FIX: Check tagI
+               !cached_tables.empty();
     }
 
     void invalidate() {
-        nx = ny = batch_size = cuda_block_size = -1;
+        nx = ny = batch_size = cuda_block_size = nvi = nvj = nvp = tagI = -1;
         cached_tables.clear();
         tables_size = 0;
     }
@@ -325,10 +342,12 @@ extern "C" int launch_keops_kernel(
     int batch_size = (int)(long long)ranges;
     if (batch_size == 0) batch_size = 1;
 
-    int64_t var_counts = (int64_t)argshapes;
-    int nvi = var_counts & 0xFF;
-    int nvj = (var_counts >> 8) & 0xFF;
-    int nvp = (var_counts >> 16) & 0xFF;
+    // FIX: Use compile-time variable counts instead of runtime values
+    // Runtime values from argshapes can mismatch when axis is swapped (tagI=1)
+    // Compile-time values are always correct for this specific kernel
+    constexpr int nvi = PRECOMPUTED_NVI;
+    constexpr int nvj = PRECOMPUTED_NVJ;
+    constexpr int nvp = PRECOMPUTED_NVP;
 
     // Dynamically adjust block size to fit shared memory constraints (48KB limit)
     // This matches the NVRTC behavior in keops_nvrtc.cpp line 454
@@ -342,8 +361,7 @@ extern "C" int launch_keops_kernel(
     dim3 gridSize(((nx + blockSize.x - 1) / blockSize.x) * batch_size);
     size_t nblocks = gridSize.x;
 
-    int total_offsets = nvi + nvj + nvp;
-    if (total_offsets == 0) total_offsets = 2;
+    constexpr int total_offsets = (nvi + nvj + nvp > 0) ? (nvi + nvj + nvp) : 2;
 
     // Use precomputed values instead of runtime computation
     constexpr int sparse_args_count = PRECOMPUTED_SPARSE_ARGS_COUNT;
@@ -373,7 +391,7 @@ extern "C" int launch_keops_kernel(
     signed long int* ranges_y  = (signed long int*)(device_ptr + size_offsets + size_lookup + size_slices);
     float** args_d             = (float**)(device_ptr + tables_size);
 
-    bool cache_hit = cache.is_valid(nx, ny, batch_size, cuda_block_size);
+    bool cache_hit = cache.is_valid(nx, ny, batch_size, cuda_block_size, nvi, nvj, nvp, tagI);
 
     void* pinned_ptr = g_pinned_buffer.ensure(total_upload_size);
     if (!pinned_ptr) {
@@ -423,6 +441,10 @@ extern "C" int launch_keops_kernel(
         cache.ny = ny;
         cache.batch_size = batch_size;
         cache.cuda_block_size = cuda_block_size;
+        cache.nvi = nvi;
+        cache.nvj = nvj;
+        cache.nvp = nvp;
+        cache.tagI = tagI;  // FIX: Store tagI for cache validation
         cache.tables_size = tables_size;
         
         cache.cached_tables.resize(tables_size);
@@ -449,7 +471,7 @@ extern "C" int launch_keops_kernel(
     cudaMemcpyAsync(device_ptr, h_ptr, total_upload_size, cudaMemcpyHostToDevice, stream);
 
     size_t shared_mem = effective_block_size * dimy * KEOPS_DTYPE_BYTES;
-    
+
     GpuConv1DOnDevice_ranges<<<gridSize, blockSize, shared_mem, stream>>>(
         nx, ny, nbatchdims, offsets_d, lookup_d, slices_x, ranges_y, out, args_d);
 
