@@ -344,11 +344,11 @@ extern "C" int launch_keops_kernel(
     constexpr int nvj = PRECOMPUTED_NVJ;
     constexpr int nvp = PRECOMPUTED_NVP;
 
-    // Dynamically adjust block size to fit shared memory constraints (48KB limit)
-    // This matches the NVRTC behavior in keops_nvrtc.cpp line 454
+    // Dynamically adjust block size to fit shared memory constraints
+    // Use 49152 bytes (48KB) to match SHAREDMEMPERBLOCK in CudaSizes.h
     int effective_block_size = std::min(
         cuda_block_size,
-        (int)(48000 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
+        (int)(49152 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
     );
 
     int nbatchdims = 1;
@@ -506,10 +506,10 @@ extern "C" int launch_keops_kernel(
     float** args_d = (float**)scratch_ptr;
 
     // Block size adjustment for shared memory
-    // Calculate max threads that fit in shared memory: 48KB / (dimy * 4 bytes)
+    // Use 49152 bytes (48KB) to match SHAREDMEMPERBLOCK in CudaSizes.h
     int effective_block_size = std::min(
         cuda_block_size,
-        (int)(48000 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
+        (int)(49152 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
     );
 
     // FIX: Use identity mapping - copy args directly to device
