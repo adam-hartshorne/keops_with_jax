@@ -26,5 +26,5 @@ def clear_all_keops_caches():
     try:
         ext = generic_ops._get_keops_ext()
         ext.cleanup_all_kernels()
-    except:
+    except Exception:
         pass

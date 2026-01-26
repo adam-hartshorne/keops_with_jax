@@ -179,7 +179,7 @@ class jaxtools:
             try:
                 idx = int(device_str.split(':')[-1])
                 return "cuda", idx
-            except:
+            except (ValueError, IndexError):
                 return "cuda", 0
         return "cpu", None
 

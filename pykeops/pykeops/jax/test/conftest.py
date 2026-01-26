@@ -31,7 +31,7 @@ def pytest_collection_modifyitems(config, items):
     try:
         devices = jax.devices('gpu')
         n_gpus = len(devices)
-    except:
+    except RuntimeError:
         n_gpus = 0
     
     # Check PyTorch availability
