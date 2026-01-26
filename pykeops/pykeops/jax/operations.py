@@ -206,45 +206,31 @@ class KernelSolve:
     def __call__(self, *args, alpha=1e-10, eps=1e-6, max_iter=1000):
         """
         Solve the kernel linear system (αI + K)a = b.
-        
+
+        This method is JIT-compatible and can be used inside jax.jit, jax.grad,
+        and jax.vmap transformations.
+
         Args:
             *args: Input arrays matching the aliases. The array at position
                    `varinvpos` is the right-hand side `b`.
             alpha (float): Ridge regularization parameter. Default 1e-10.
             eps (float): Convergence tolerance. Default 1e-6.
             max_iter (int): Maximum CG iterations. Default 1000.
-            
+
         Returns:
             Solution array `a` with same shape as `b`.
         """
         # Get the right-hand side b (at varinvpos)
         b = args[self.varinvpos]
-        
+
         # Define the linear operator: linop(v) = K @ v + alpha * v
         def linop(v):
             # Replace the varinv argument with v
             new_args = args[:self.varinvpos] + (v,) + args[self.varinvpos + 1:]
             Kv = self._genred(*new_args)
             return Kv + alpha * v
-        
-        # Solve using conjugate gradient
-        # Use the Python loop version for now (more debuggable)
-        # Can switch to conjugate_gradient_jax_lax for JIT compatibility
-        solution = conjugate_gradient_jax(linop, b, eps=eps, max_iter=max_iter)
-        
+
+        # Solve using JAX-native conjugate gradient (JIT-compatible)
+        solution = conjugate_gradient_jax_lax(linop, b, eps=eps, max_iter=max_iter)
+
         return solution
-    
-    def __call_jittable__(self, *args, alpha=1e-10, eps=1e-6, max_iter=1000):
-        """
-        JIT-compatible version using lax.while_loop.
-        
-        Note: This requires the linop to be JIT-compatible.
-        """
-        b = args[self.varinvpos]
-        
-        def linop(v):
-            new_args = args[:self.varinvpos] + (v,) + args[self.varinvpos + 1:]
-            Kv = self._genred(*new_args)
-            return Kv + alpha * v
-        
-        return conjugate_gradient_jax_lax(linop, b, eps=eps, max_iter=max_iter)
