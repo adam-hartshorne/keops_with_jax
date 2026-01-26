@@ -4,6 +4,9 @@ KeOps JAX API Tests
 ===================
 Unit tests for the JAX KeOps API.
 
+All tests compare JAX KeOps against PyTorch KeOps as the ground truth reference.
+Since both use the same underlying CUDA kernels, results should be identical.
+
 Tests cover:
 - Genred interface (basic operations)
 - LazyTensor interface (symbolic operations)
@@ -30,10 +33,23 @@ from test_utils import (
 
 try:
     from pykeops.jax import Genred, LazyTensor, Vi, Vj, Pm
-
     KEOPS_AVAILABLE = True
 except ImportError as e:
     print(f"Error: pykeops.jax not found: {e}")
+    sys.exit(1)
+
+# Import PyTorch KeOps for ground truth - REQUIRED for all tests
+try:
+    import torch
+    from pykeops.torch import Genred as Genred_torch, LazyTensor as LazyTensor_torch
+    TORCH_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
+
+if not TORCH_AVAILABLE:
+    print("Error: PyTorch KeOps with CUDA is required for these tests")
+    print("All tests compare against PyTorch KeOps as ground truth")
     sys.exit(1)
 
 # =============================================================================
@@ -41,10 +57,8 @@ except ImportError as e:
 # =============================================================================
 
 SEED = 42
-RTOL = 1e-4
-ATOL = 1e-5
-RTOL_LOOSE = 1e-3
-ATOL_LOOSE = 1e-3
+RTOL = 1e-5
+ATOL = 1e-6
 
 
 # =============================================================================
@@ -52,46 +66,27 @@ ATOL_LOOSE = 1e-3
 # =============================================================================
 
 def get_test_data(n, m, d, dtype='float32', seed=SEED):
-    """Generate test data."""
+    """Generate test data as numpy arrays."""
     np.random.seed(seed)
     np_dtype = np.float32 if dtype == 'float32' else np.float64
 
     return {
-        'x': jnp.array(np.random.randn(n, d).astype(np_dtype)),
-        'y': jnp.array(np.random.randn(m, d).astype(np_dtype)),
-        'b': jnp.array(np.random.randn(m, d).astype(np_dtype)),
-        'sigma': jnp.array([0.5], dtype=jnp.float32 if dtype == 'float32' else jnp.float64),
+        'x': np.random.randn(n, d).astype(np_dtype),
+        'y': np.random.randn(m, d).astype(np_dtype),
+        'b': np.random.randn(m, d).astype(np_dtype),
+        'sigma': np.array([0.5], dtype=np_dtype),
     }
 
 
 def get_batched_data(batch, n, m, d, dtype='float32', seed=SEED):
-    """Generate batched test data."""
+    """Generate batched test data as numpy arrays."""
     np.random.seed(seed)
     np_dtype = np.float32 if dtype == 'float32' else np.float64
 
     return {
-        'x': jnp.array(np.random.randn(batch, n, d).astype(np_dtype)),
-        'y': jnp.array(np.random.randn(batch, m, d).astype(np_dtype)),
+        'x': np.random.randn(batch, n, d).astype(np_dtype),
+        'y': np.random.randn(batch, m, d).astype(np_dtype),
     }
-
-
-# =============================================================================
-# Reference Implementations (Pure JAX)
-# =============================================================================
-
-def pure_jax_sqdist_sum(x, y, axis=1):
-    """Pure JAX reference for squared distance sum."""
-    diff = x[:, None, :] - y[None, :, :]
-    sqdist = jnp.sum(diff ** 2, axis=-1)
-    return jnp.sum(sqdist, axis=axis, keepdims=True)
-
-
-def pure_jax_gaussian_sum(x, y, sigma):
-    """Pure JAX reference for Gaussian kernel sum."""
-    diff = x[:, None, :] - y[None, :, :]
-    sqdist = jnp.sum(diff ** 2, axis=-1)
-    K = jnp.exp(-sqdist * sigma)
-    return jnp.sum(K, axis=1, keepdims=True)
 
 
 # =============================================================================
@@ -103,21 +98,22 @@ def test_genred_sqdist_sum(axis=1):
     formula = "SqDist(x, y)"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
-    op = Genred(formula, aliases, reduction_op='Sum', axis=axis)
-    result = op(data['x'], data['y'])
+    # JAX KeOps
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=axis)
+    result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
-    # Compare vs Pure JAX
-    if axis == 1:
-        expected = pure_jax_sqdist_sum(data['x'], data['y'])
-        target_shape = (100, 1)
-    else:
-        expected = pure_jax_sqdist_sum(data['x'], data['y'], axis=0).T
-        target_shape = (80, 1)
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=axis)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda'),
+        torch.tensor(data['y'], device='cuda')
+    ).cpu().numpy()
 
-    match, diff = compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
-    if result.shape != target_shape:
-        return False, 0.0  # Return float to match format specifier
-    return match, diff
+    target_shape = (100, 1) if axis == 1 else (80, 1)
+    if result_jax.shape != target_shape:
+        return False, float('inf')
+
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_genred_gaussian():
@@ -125,11 +121,19 @@ def test_genred_gaussian():
     formula = "Exp(-SqNorm2(x-y) * s)"
     aliases = ["x=Vi(3)", "y=Vj(3)", "s=Pm(1)"]
 
-    op = Genred(formula, aliases, reduction_op='Sum', axis=1)
-    result = op(data['x'], data['y'], data['sigma'])
+    # JAX KeOps
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']), jnp.array(data['sigma']))
 
-    expected = pure_jax_gaussian_sum(data['x'], data['y'], data['sigma'])
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda'),
+        torch.tensor(data['y'], device='cuda'),
+        torch.tensor(data['sigma'], device='cuda')
+    ).cpu().numpy()
+
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_genred_reductions(reduction_op):
@@ -137,19 +141,18 @@ def test_genred_reductions(reduction_op):
     formula = "SqDist(x, y)"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
-    op = Genred(formula, aliases, reduction_op=reduction_op, axis=1)
-    result = op(data['x'], data['y'])
+    # JAX KeOps
+    op_jax = Genred(formula, aliases, reduction_op=reduction_op, axis=1)
+    result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
-    # Pure JAX Ref
-    diff = data['x'][:, None, :] - data['y'][None, :, :]
-    sqdist = jnp.sum(diff ** 2, axis=-1)
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op=reduction_op, axis=1)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda'),
+        torch.tensor(data['y'], device='cuda')
+    ).cpu().numpy()
 
-    if reduction_op == 'Min':
-        expected = jnp.min(sqdist, axis=1, keepdims=True)
-    elif reduction_op == 'Max':
-        expected = jnp.max(sqdist, axis=1, keepdims=True)
-
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 # =============================================================================
@@ -161,14 +164,18 @@ def test_formula_laplacian():
     formula = "Exp(-Norm2(x-y))"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
-    op = Genred(formula, aliases, reduction_op='Sum', axis=1)
-    result = op(data['x'], data['y'])
+    # JAX KeOps
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
-    diff = data['x'][:, None, :] - data['y'][None, :, :]
-    dist = jnp.sqrt(jnp.sum(diff ** 2, axis=-1))
-    expected = jnp.sum(jnp.exp(-dist), axis=1, keepdims=True)
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda'),
+        torch.tensor(data['y'], device='cuda')
+    ).cpu().numpy()
 
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_formula_cauchy():
@@ -176,14 +183,18 @@ def test_formula_cauchy():
     formula = "Inv(IntCst(1) + SqNorm2(x-y))"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
-    op = Genred(formula, aliases, reduction_op='Sum', axis=1)
-    result = op(data['x'], data['y'])
+    # JAX KeOps
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
-    diff = data['x'][:, None, :] - data['y'][None, :, :]
-    sqdist = jnp.sum(diff ** 2, axis=-1)
-    expected = jnp.sum(1.0 / (1.0 + sqdist), axis=1, keepdims=True)
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda'),
+        torch.tensor(data['y'], device='cuda')
+    ).cpu().numpy()
 
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_formula_weighted_sum():
@@ -191,16 +202,23 @@ def test_formula_weighted_sum():
     formula = "Exp(-SqNorm2(x-y) * s) * b"
     aliases = ["x=Vi(3)", "y=Vj(3)", "b=Vj(3)", "s=Pm(1)"]
 
-    op = Genred(formula, aliases, reduction_op='Sum', axis=1)
-    result = op(data['x'], data['y'], data['b'], data['sigma'])
+    # JAX KeOps
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    result_jax = op_jax(
+        jnp.array(data['x']), jnp.array(data['y']),
+        jnp.array(data['b']), jnp.array(data['sigma'])
+    )
 
-    # Reference
-    diff = data['x'][:, None, :] - data['y'][None, :, :]
-    sqdist = jnp.sum(diff ** 2, axis=-1)
-    K = jnp.exp(-sqdist * data['sigma'])
-    expected = jnp.sum(K[:, :, None] * data['b'][None, :, :], axis=1)
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda'),
+        torch.tensor(data['y'], device='cuda'),
+        torch.tensor(data['b'], device='cuda'),
+        torch.tensor(data['sigma'], device='cuda')
+    ).cpu().numpy()
 
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 # =============================================================================
@@ -209,55 +227,98 @@ def test_formula_weighted_sum():
 
 def test_lazytensor_basic():
     data = get_test_data(100, 80, 3)
-    x_i = LazyTensor(data['x'][:, None, :])
-    y_j = LazyTensor(data['y'][None, :, :])
 
+    # JAX KeOps
+    x_jax = jnp.array(data['x'])
+    y_jax = jnp.array(data['y'])
+    x_i = LazyTensor(x_jax[:, None, :])
+    y_j = LazyTensor(y_jax[None, :, :])
     D_ij = ((x_i - y_j) ** 2).sum(-1)
-    result = D_ij.sum(axis=1)
+    result_jax = D_ij.sum(axis=1)
 
-    expected = pure_jax_sqdist_sum(data['x'], data['y'])
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    # PyTorch KeOps (ground truth)
+    x_torch = torch.tensor(data['x'], device='cuda')
+    y_torch = torch.tensor(data['y'], device='cuda')
+    x_i_t = LazyTensor_torch(x_torch[:, None, :])
+    y_j_t = LazyTensor_torch(y_torch[None, :, :])
+    D_ij_t = ((x_i_t - y_j_t) ** 2).sum(-1)
+    result_torch = D_ij_t.sum(axis=1).cpu().numpy()
+
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_lazytensor_gaussian():
     data = get_test_data(100, 80, 3)
-    x_i = LazyTensor(data['x'][:, None, :])
-    y_j = LazyTensor(data['y'][None, :, :])
 
+    # JAX KeOps
+    x_jax = jnp.array(data['x'])
+    y_jax = jnp.array(data['y'])
+    sigma_jax = jnp.array(data['sigma'])
+    x_i = LazyTensor(x_jax[:, None, :])
+    y_j = LazyTensor(y_jax[None, :, :])
     D_ij = ((x_i - y_j) ** 2).sum(-1)
-    K_ij = (-D_ij * data['sigma']).exp()
-    result = K_ij.sum(axis=1)
+    K_ij = (-D_ij * sigma_jax).exp()
+    result_jax = K_ij.sum(axis=1)
 
-    expected = pure_jax_gaussian_sum(data['x'], data['y'], data['sigma'])
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    # PyTorch KeOps (ground truth)
+    x_torch = torch.tensor(data['x'], device='cuda')
+    y_torch = torch.tensor(data['y'], device='cuda')
+    sigma_torch = torch.tensor(data['sigma'], device='cuda')
+    x_i_t = LazyTensor_torch(x_torch[:, None, :])
+    y_j_t = LazyTensor_torch(y_torch[None, :, :])
+    D_ij_t = ((x_i_t - y_j_t) ** 2).sum(-1)
+    K_ij_t = (-D_ij_t * sigma_torch).exp()
+    result_torch = K_ij_t.sum(axis=1).cpu().numpy()
+
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_lazytensor_scalar_mult(side='left'):
     data = get_test_data(100, 80, 3)
-    x_i = LazyTensor(data['x'][:, None, :])
-    y_j = LazyTensor(data['y'][None, :, :])
 
+    # JAX KeOps
+    x_jax = jnp.array(data['x'])
+    y_jax = jnp.array(data['y'])
+    x_i = LazyTensor(x_jax[:, None, :])
+    y_j = LazyTensor(y_jax[None, :, :])
     if side == 'left':
-        result = (2.0 * (x_i - y_j)).sum(-1).sum(axis=1)
+        result_jax = (2.0 * (x_i - y_j)).sum(-1).sum(axis=1)
     else:
-        result = ((x_i - y_j) * 2.0).sum(-1).sum(axis=1)
+        result_jax = ((x_i - y_j) * 2.0).sum(-1).sum(axis=1)
 
-    expected = jnp.sum(2.0 * (data['x'][:, None, :] - data['y'][None, :, :]), axis=(1, 2))[:, None]
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE)
+    # PyTorch KeOps (ground truth)
+    x_torch = torch.tensor(data['x'], device='cuda')
+    y_torch = torch.tensor(data['y'], device='cuda')
+    x_i_t = LazyTensor_torch(x_torch[:, None, :])
+    y_j_t = LazyTensor_torch(y_torch[None, :, :])
+    if side == 'left':
+        result_torch = (2.0 * (x_i_t - y_j_t)).sum(-1).sum(axis=1).cpu().numpy()
+    else:
+        result_torch = ((x_i_t - y_j_t) * 2.0).sum(-1).sum(axis=1).cpu().numpy()
+
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_lazytensor_batched():
     data = get_batched_data(4, 50, 40, 3)
-    x_i = LazyTensor(data['x'][:, :, None, :])
-    y_j = LazyTensor(data['y'][:, None, :, :])
 
+    # JAX KeOps
+    x_jax = jnp.array(data['x'])
+    y_jax = jnp.array(data['y'])
+    x_i = LazyTensor(x_jax[:, :, None, :])
+    y_j = LazyTensor(y_jax[:, None, :, :])
     D_ij = ((x_i - y_j) ** 2).sum(-1)
-    result = D_ij.sum(axis=2)
+    result_jax = D_ij.sum(axis=2)
 
-    diff = data['x'][:, :, None, :] - data['y'][:, None, :, :]
-    expected = jnp.sum(jnp.sum(diff ** 2, axis=-1), axis=2, keepdims=True)
+    # PyTorch KeOps (ground truth)
+    x_torch = torch.tensor(data['x'], device='cuda')
+    y_torch = torch.tensor(data['y'], device='cuda')
+    x_i_t = LazyTensor_torch(x_torch[:, :, None, :])
+    y_j_t = LazyTensor_torch(y_torch[:, None, :, :])
+    D_ij_t = ((x_i_t - y_j_t) ** 2).sum(-1)
+    result_torch = D_ij_t.sum(axis=2).cpu().numpy()
 
-    return compare_arrays(result, expected, rtol=RTOL_LOOSE, atol=ATOL_LOOSE, squeeze=True)
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL, squeeze=True)
 
 
 # =============================================================================
@@ -270,60 +331,87 @@ def test_gradient_var(var_name):
     if var_name == 'x':
         formula = "SqDist(x, y)"
         aliases = ["x=Vi(3)", "y=Vj(3)"]
-        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
 
-        def forward(x):
-            return op(x, data['y']).sum()
+        # JAX KeOps gradient
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        def forward_jax(x):
+            return op_jax(x, jnp.array(data['y'])).sum()
+        grad_jax = jax.grad(forward_jax)(jnp.array(data['x']))
 
-        grad = jax.grad(forward)(data['x'])
+        # PyTorch KeOps gradient (ground truth)
+        op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+        x_torch = torch.tensor(data['x'], device='cuda', requires_grad=True)
+        y_torch = torch.tensor(data['y'], device='cuda')
+        result_torch = op_torch(x_torch, y_torch).sum()
+        result_torch.backward()
+        grad_torch = x_torch.grad.cpu().numpy()
 
-        if grad.shape != data['x'].shape: return False, 0.0
-        if not jnp.any(grad != 0): return False, 0.0
-        return True, 0.0
+        return compare_arrays(np.array(grad_jax), grad_torch, rtol=RTOL, atol=ATOL)
 
     elif var_name == 'y':
         formula = "SqDist(x, y)"
         aliases = ["x=Vi(3)", "y=Vj(3)"]
-        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
 
-        def forward(y):
-            return op(data['x'], y).sum()
+        # JAX KeOps gradient
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        def forward_jax(y):
+            return op_jax(jnp.array(data['x']), y).sum()
+        grad_jax = jax.grad(forward_jax)(jnp.array(data['y']))
 
-        grad = jax.grad(forward)(data['y'])
+        # PyTorch KeOps gradient (ground truth)
+        op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+        x_torch = torch.tensor(data['x'], device='cuda')
+        y_torch = torch.tensor(data['y'], device='cuda', requires_grad=True)
+        result_torch = op_torch(x_torch, y_torch).sum()
+        result_torch.backward()
+        grad_torch = y_torch.grad.cpu().numpy()
 
-        if grad.shape != data['y'].shape: return False, 0.0
-        if not jnp.any(grad != 0): return False, 0.0
-        return True, 0.0
+        return compare_arrays(np.array(grad_jax), grad_torch, rtol=RTOL, atol=ATOL)
 
     elif var_name == 'pm':
         formula = "Exp(-SqNorm2(x-y) * s)"
         aliases = ["x=Vi(3)", "y=Vj(3)", "s=Pm(1)"]
-        op = Genred(formula, aliases, reduction_op='Sum', axis=1)
 
-        def forward(s):
-            return op(data['x'], data['y'], s).sum()
+        # JAX KeOps gradient
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        def forward_jax(s):
+            return op_jax(jnp.array(data['x']), jnp.array(data['y']), s).sum()
+        grad_jax = jax.grad(forward_jax)(jnp.array(data['sigma']))
 
-        grad = jax.grad(forward)(data['sigma'])
+        # PyTorch KeOps gradient (ground truth)
+        op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+        x_torch = torch.tensor(data['x'], device='cuda')
+        y_torch = torch.tensor(data['y'], device='cuda')
+        s_torch = torch.tensor(data['sigma'], device='cuda', requires_grad=True)
+        result_torch = op_torch(x_torch, y_torch, s_torch).sum()
+        result_torch.backward()
+        grad_torch = s_torch.grad.cpu().numpy()
 
-        if grad.shape != data['sigma'].shape: return False, 0.0
-        if not jnp.isfinite(grad).all(): return False, 0.0
-        return True, 0.0
+        return compare_arrays(np.array(grad_jax), grad_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_gradient_lazytensor():
     data = get_test_data(50, 40, 3)
 
-    def forward(x):
+    # JAX KeOps gradient
+    def forward_jax(x):
         x_i = LazyTensor(x[:, None, :])
-        y_j = LazyTensor(data['y'][None, :, :])
+        y_j = LazyTensor(jnp.array(data['y'])[None, :, :])
         D_ij = ((x_i - y_j) ** 2).sum(-1)
         return D_ij.sum(axis=1).sum()
+    grad_jax = jax.grad(forward_jax)(jnp.array(data['x']))
 
-    grad = jax.grad(forward)(data['x'])
+    # PyTorch KeOps gradient (ground truth)
+    x_torch = torch.tensor(data['x'], device='cuda', requires_grad=True)
+    y_torch = torch.tensor(data['y'], device='cuda')
+    x_i_t = LazyTensor_torch(x_torch[:, None, :])
+    y_j_t = LazyTensor_torch(y_torch[None, :, :])
+    D_ij_t = ((x_i_t - y_j_t) ** 2).sum(-1)
+    result_torch = D_ij_t.sum(axis=1).sum()
+    result_torch.backward()
+    grad_torch = x_torch.grad.cpu().numpy()
 
-    if grad.shape != data['x'].shape: return False, 0.0
-    if not jnp.any(grad != 0): return False, 0.0
-    return True, 0.0
+    return compare_arrays(np.array(grad_jax), grad_torch, rtol=RTOL, atol=ATOL)
 
 
 # =============================================================================
@@ -334,47 +422,66 @@ def test_jit_genred():
     data = get_test_data(100, 80, 3)
     formula = "SqDist(x, y)"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
-    op = Genred(formula, aliases, reduction_op='Sum', axis=1)
 
+    # JAX KeOps with JIT
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
     @jax.jit
     def compute(x, y):
-        return op(x, y)
+        return op_jax(x, y)
+    result_jax = compute(jnp.array(data['x']), jnp.array(data['y']))
 
-    # First call (compile)
-    res1 = compute(data['x'], data['y'])
-    # Second call (cached)
-    res2 = compute(data['x'], data['y'])
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda'),
+        torch.tensor(data['y'], device='cuda')
+    ).cpu().numpy()
 
-    return compare_arrays(res1, res2, rtol=0, atol=0)
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_jit_lazytensor():
     data = get_test_data(100, 80, 3)
 
+    # JAX KeOps with JIT
     @jax.jit
     def compute(x, y):
         x_i = LazyTensor(x[:, None, :])
         y_j = LazyTensor(y[None, :, :])
         return ((x_i - y_j) ** 2).sum(-1).sum(axis=1)
+    result_jax = compute(jnp.array(data['x']), jnp.array(data['y']))
 
-    res1 = compute(data['x'], data['y'])
-    res2 = compute(data['x'], data['y'])
-    return compare_arrays(res1, res2, rtol=0, atol=0)
+    # PyTorch KeOps (ground truth)
+    x_torch = torch.tensor(data['x'], device='cuda')
+    y_torch = torch.tensor(data['y'], device='cuda')
+    x_i_t = LazyTensor_torch(x_torch[:, None, :])
+    y_j_t = LazyTensor_torch(y_torch[None, :, :])
+    result_torch = ((x_i_t - y_j_t) ** 2).sum(-1).sum(axis=1).cpu().numpy()
+
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 def test_jit_gradient():
     data = get_test_data(50, 40, 3)
     formula = "SqDist(x, y)"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
-    op = Genred(formula, aliases, reduction_op='Sum', axis=1)
 
+    # JAX KeOps with JIT gradient
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
     @jax.jit
     def forward_and_grad(x, y):
-        return jax.grad(lambda x: op(x, y).sum())(x)
+        return jax.grad(lambda x: op_jax(x, y).sum())(x)
+    grad_jax = forward_and_grad(jnp.array(data['x']), jnp.array(data['y']))
 
-    grad1 = forward_and_grad(data['x'], data['y'])
-    grad2 = forward_and_grad(data['x'], data['y'])
-    return compare_arrays(grad1, grad2, rtol=0, atol=0)
+    # PyTorch KeOps gradient (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    x_torch = torch.tensor(data['x'], device='cuda', requires_grad=True)
+    y_torch = torch.tensor(data['y'], device='cuda')
+    result_torch = op_torch(x_torch, y_torch).sum()
+    result_torch.backward()
+    grad_torch = x_torch.grad.cpu().numpy()
+
+    return compare_arrays(np.array(grad_jax), grad_torch, rtol=RTOL, atol=ATOL)
 
 
 # =============================================================================
@@ -387,19 +494,30 @@ def test_dtype(dtype_str):
         from jax import config
         if not config.read('jax_enable_x64'):
             print_warning("JAX float64 not enabled")
-            return True, 0.0  # Return success but with warning to avoid failure in formatting
+            return True, 0.0  # Skip test
 
     data = get_test_data(50, 40, 3, dtype=dtype_str)
     formula = "SqDist(x, y)"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
-    op = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=dtype_str)
-    result = op(data['x'], data['y'])
+    torch_dtype = torch.float64 if dtype_str == 'float64' else torch.float32
+
+    # JAX KeOps
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=dtype_str)
+    result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
+
+    # PyTorch KeOps (ground truth)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1, dtype=dtype_str)
+    result_torch = op_torch(
+        torch.tensor(data['x'], device='cuda', dtype=torch_dtype),
+        torch.tensor(data['y'], device='cuda', dtype=torch_dtype)
+    ).cpu().numpy()
 
     expected_dtype = jnp.float64 if dtype_str == 'float64' else jnp.float32
-    if result.dtype != expected_dtype:
-        return False, 0.0
-    return True, 0.0
+    if result_jax.dtype != expected_dtype:
+        return False, float('inf')
+
+    return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
 # =============================================================================
@@ -407,7 +525,7 @@ def test_dtype(dtype_str):
 # =============================================================================
 
 def main():
-    print_header("KeOps JAX API Tests", "Unit tests for Genred, LazyTensor, and Helpers")
+    print_header("KeOps JAX API Tests", "Comparing JAX KeOps vs PyTorch KeOps (ground truth)")
     print_environment_info()
 
     suite = TestSuite("API Tests", "Core Functionality")
