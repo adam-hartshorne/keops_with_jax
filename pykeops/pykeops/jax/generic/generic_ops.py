@@ -613,8 +613,11 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
         args_with_eta = args_stopped + (g,)
 
         eta_dim = g.shape[-1]
-        formula_key = id(keops_jax_op)
-        cache_key = (formula_key, eta_dim, tuple(arg.shape for arg in args))
+        # Use formula content as key instead of id() to avoid cache collisions
+        # when function objects are garbage collected and addresses reused
+        # Convert aliases to tuple to ensure hashability
+        formula_key = (formula, tuple(aliases), reduction_op, axis, dtype_str)
+        cache_key = (formula_key, eta_dim, tuple(tuple(arg.shape) for arg in args))
 
         # Use bounded global cache instead of unbounded function attribute
         cached = _grad_cache.get(cache_key)
@@ -675,10 +678,10 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                     # This is the key fix: for Pm params, we sum gradients, not reshape
                     if raw_grad.shape != input_shape:
                         axes_to_sum = []
-                        for axis in range(len(raw_grad.shape)):
-                            if axis < len(input_shape):
-                                if input_shape[axis] == 1 and raw_grad.shape[axis] > 1:
-                                    axes_to_sum.append(axis)
+                        for ax in range(len(raw_grad.shape)):
+                            if ax < len(input_shape):
+                                if input_shape[ax] == 1 and raw_grad.shape[ax] > 1:
+                                    axes_to_sum.append(ax)
                         
                         # Sum over all mismatched axes at once, keeping dims
                         if axes_to_sum:
