@@ -40,6 +40,10 @@ import keopscore.formulas.GetReduction as GetReductionModule
 # Global lock for FFI registration
 _registration_lock = threading.Lock()
 
+# Track which FFI targets have been registered (JAX side)
+# This is separate from C++ kernel registry
+_registered_ffi_targets = set()
+
 # Module-level extension cache
 _keops_ext_cache = None
 _keops_ext_lock = threading.Lock()
@@ -301,27 +305,48 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
         def ffi_wrapper(*jax_args):
             keops_jax_ext = _get_keops_ext()
 
-            if not keops_jax_ext.is_kernel_registered(kernel_id):
+            # Check both C++ registry AND FFI target registry
+            cpp_registered = keops_jax_ext.is_kernel_registered(kernel_id)
+            ffi_registered = target_name in _registered_ffi_targets
+
+            if not cpp_registered or not ffi_registered:
                 with _registration_lock:
-                    if not keops_jax_ext.is_kernel_registered(kernel_id):
+                    # Re-check under lock
+                    cpp_registered = keops_jax_ext.is_kernel_registered(kernel_id)
+                    ffi_registered = target_name in _registered_ffi_targets
+
+                    # Register C++ kernel if needed
+                    if not cpp_registered:
                         try:
                             is_batched_inner = len(jax_args[0].shape) == 3
                             myconv_grad = _create_keops_backend(
                                 grad_formula, list(grad_aliases), reduction_op, grad_axis, dtype_str,
                                 jax_args, use_ranges=is_batched_inner
                             )
-
                             keops_jax_ext.register_keops_kernel(kernel_id, myconv_grad)
-                            jax.ffi.register_ffi_target(target_name, keops_jax_ext.get_ffi_handler(), platform="CUDA")
-
                         except Exception as e:
                             raise RuntimeError(
-                                f"[KeOps JAX] Gradient kernel registration failed.\n"
+                                f"[KeOps JAX] Gradient C++ kernel registration failed.\n"
                                 f"  Gradient formula: {grad_formula}\n"
                                 f"  Gradient aliases: {grad_aliases}\n"
-                                f"  Target: {target_name}\n"
                                 f"  Original error: {e}"
                             ) from e
+
+                    # Register FFI target if needed (separate step)
+                    if not ffi_registered:
+                        try:
+                            jax.ffi.register_ffi_target(target_name, keops_jax_ext.get_ffi_handler(), platform="CUDA")
+                            _registered_ffi_targets.add(target_name)
+                        except Exception as e:
+                            # Check if it's already registered (idempotent)
+                            if "already registered" in str(e).lower():
+                                _registered_ffi_targets.add(target_name)
+                            else:
+                                raise RuntimeError(
+                                    f"[KeOps JAX] Gradient FFI target registration failed.\n"
+                                    f"  Target: {target_name}\n"
+                                    f"  Original error: {e}"
+                                ) from e
 
             reordered_args = jax_args
             dimout = input_dim
@@ -483,42 +508,69 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                             keops_jax_ext.is_kernel_registered(kernel_id)
                         )
 
+                        # Check if FFI target is already registered (separate from C++ registry)
+                        ffi_target_registered = ffi_state.get('ffi_target_registered', False)
+
                         # OPTIMIZATION: Try to get dimout from C++ first
                         if already_registered and hasattr(keops_jax_ext, 'get_kernel_dimout'):
                             cached_dimout = keops_jax_ext.get_kernel_dimout(kernel_id)
                             if cached_dimout > 0:
                                 dimout = cached_dimout
                                 ffi_state['dimout'] = dimout
-                                ffi_state['registered'] = True
-                                # Skip Python backend creation entirely!
+                                # Only skip if FFI target is also registered
+                                if ffi_target_registered:
+                                    ffi_state['registered'] = True
 
                         if not ffi_state['registered']:
                             # Need to create backend (either for registration or to get dimout)
-                            myconv_orig = _create_keops_backend(
-                                formula, list(aliases), reduction_op, axis, dtype_str,
-                                jax_args, use_ranges=is_batched_inner,
-                                opt_arg=opt_arg, formula2=formula2
-                            )
+                            if dimout is None:
+                                myconv_orig = _create_keops_backend(
+                                    formula, list(aliases), reduction_op, axis, dtype_str,
+                                    jax_args, use_ranges=is_batched_inner,
+                                    opt_arg=opt_arg, formula2=formula2
+                                )
+                                dimout = getattr(myconv_orig, 'dim', getattr(myconv_orig, 'dimout', 1))
+                                ffi_state['dimout'] = dimout
+                            else:
+                                myconv_orig = None
 
-                            dimout = getattr(myconv_orig, 'dim', getattr(myconv_orig, 'dimout', 1))
-                            ffi_state['dimout'] = dimout
-
+                            # Register C++ kernel if needed
                             if not already_registered:
+                                if myconv_orig is None:
+                                    myconv_orig = _create_keops_backend(
+                                        formula, list(aliases), reduction_op, axis, dtype_str,
+                                        jax_args, use_ranges=is_batched_inner,
+                                        opt_arg=opt_arg, formula2=formula2
+                                    )
                                 try:
                                     keops_jax_ext.register_keops_kernel(kernel_id, myconv_orig)
+                                except Exception as e:
+                                    raise RuntimeError(
+                                        f"[KeOps JAX] C++ kernel registration failed.\n"
+                                        f"  Formula: {formula}\n"
+                                        f"  Aliases: {aliases}\n"
+                                        f"  Original error: {e}"
+                                    ) from e
+
+                            # Register FFI target if needed (separate step)
+                            if not ffi_target_registered:
+                                try:
                                     jax.ffi.register_ffi_target(
                                         target_name,
                                         keops_jax_ext.get_ffi_handler(),
                                         platform="CUDA"
                                     )
+                                    ffi_state['ffi_target_registered'] = True
                                 except Exception as e:
-                                    raise RuntimeError(
-                                        f"[KeOps JAX] Kernel registration failed.\n"
-                                        f"  Formula: {formula}\n"
-                                        f"  Aliases: {aliases}\n"
-                                        f"  Target: {target_name}\n"
-                                        f"  Original error: {e}"
-                                    ) from e
+                                    # Check if it's already registered (idempotent)
+                                    if "already registered" in str(e).lower():
+                                        ffi_state['ffi_target_registered'] = True
+                                    else:
+                                        raise RuntimeError(
+                                            f"[KeOps JAX] FFI target registration failed.\n"
+                                            f"  Target: {target_name}\n"
+                                            f"  Original error: {e}"
+                                        ) from e
 
                             ffi_state['registered'] = True
 
@@ -655,6 +707,7 @@ def cleanup_registry():
         keops_jax_ext = _get_keops_ext()
         keops_jax_ext.cleanup_all_kernels()
         _grad_cache.clear()
+        _registered_ffi_targets.clear()
     except Exception:
         pass
 
@@ -667,11 +720,13 @@ def get_registry_info():
             'unique_kernels': keops_jax_ext.get_unique_kernel_count() if hasattr(keops_jax_ext, 'get_unique_kernel_count') else 'N/A',
             'max_kernels': 5000,
             'grad_cache_size': len(_grad_cache.cache),
+            'ffi_targets_registered': len(_registered_ffi_targets),
             'note': 'Thread-safe registry with shared_ptr lifetime management'
         }
     except Exception:
         return {
             'num_kernels': 0,
             'max_kernels': 5000,
+            'ffi_targets_registered': len(_registered_ffi_targets),
             'note': 'Extension not loaded'
         }
