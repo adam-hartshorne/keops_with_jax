@@ -524,10 +524,18 @@ ffi::Error KeOpsKernelImpl(
     );
 
     if (result != 0) return ffi::Error::Internal("Kernel launch failed: " + std::to_string(result));
-    
+
     cuda_err = cudaGetLastError();
     if (cuda_err != cudaSuccess) {
         return ffi::Error::Internal("CUDA error: " + std::string(cudaGetErrorString(cuda_err)));
+    }
+
+    // Synchronize stream to ensure kernel completes before returning
+    // This is critical for correct behavior when multiple FFI calls
+    // are executed in sequence by XLA
+    cuda_err = cudaStreamSynchronize(stream);
+    if (cuda_err != cudaSuccess) {
+        return ffi::Error::Internal("CUDA stream sync error: " + std::string(cudaGetErrorString(cuda_err)));
     }
 
     return ffi::Error::Success();

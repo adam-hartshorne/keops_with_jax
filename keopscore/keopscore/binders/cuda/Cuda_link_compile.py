@@ -186,29 +186,26 @@ class Cuda_link_compile(LinkCompile):
         """Add a C-compatible launcher function that can be called from C++ via dlopen."""
         is_ranges = "GpuConv1DOnDevice_ranges" in kernel_code
 
-        # Precompute index mapping at code generation time
-        # This avoids sorting/mapping on every kernel launch
+        # Get the number of argument slots needed from varloader
+        # nminargs is max(variable_index) + 1, which accounts for all variables including gaps
+        # FIX: Use nminargs instead of len(all_indices) to handle sparse variable indices
+        # This is crucial for gradient formulas where some variables drop out (e.g., d(K*v)/dv = K, v drops)
         indsi = list(getattr(self.varloader, 'indsi', []))
         indsj = list(getattr(self.varloader, 'indsj', []))
         indsp = list(getattr(self.varloader, 'indsp', []))
 
         all_indices = indsi + indsj + indsp
-        total_args = len(all_indices)
 
-        if total_args > 0:
-            # Compute sparse_args_count (max index + 1)
+        if all_indices:
+            # sparse_args_count = max(variable_index) + 1 to handle gaps in indices
             sparse_args_count = max(all_indices) + 1
-
-            # Create sorted mapping: sorted_indices[i] = original index that maps to position i
-            # We need: h_args[sorted_indices[dense_idx]] = args[dense_idx]
-            sorted_pairs = sorted(enumerate(all_indices), key=lambda x: x[1])
-            sorted_mapping = [p[1] for p in sorted_pairs]  # Target positions in sorted order
         else:
             sparse_args_count = 0
-            sorted_mapping = []
 
-        # Generate the mapping as a static array
-        mapping_array = ', '.join(str(x) for x in sorted_mapping) if sorted_mapping else '0'
+        # FIX: Use identity mapping - FFI arguments are passed in alias index order [0, 1, 2, ...]
+        # and the kernel expects arguments at those same indices. No reordering needed.
+        # The old code incorrectly used len(all_indices) which caused misalignment when
+        # some variables were not used in the formula (e.g., gradient formulas)
 
         # FIX: Compute compile-time variable counts to avoid runtime mismatch
         # These MUST match what the compiled kernel expects
@@ -228,12 +225,10 @@ using std::min;
 
 #define KEOPS_DTYPE_BYTES ''' + str(dtype_bytes) + '''
 #define PRECOMPUTED_SPARSE_ARGS_COUNT ''' + str(sparse_args_count) + '''
-#define PRECOMPUTED_TOTAL_ARGS ''' + str(total_args) + '''
 // FIX: Use compile-time variable counts to match kernel expectations
 #define PRECOMPUTED_NVI ''' + str(compile_time_nvi) + '''
 #define PRECOMPUTED_NVJ ''' + str(compile_time_nvj) + '''
 #define PRECOMPUTED_NVP ''' + str(compile_time_nvp) + '''
-static const int PRECOMPUTED_MAPPING[''' + str(max(1, total_args)) + '''] = {''' + mapping_array + '''};
 
 #define CHECK_CUDA_LAUNCH(err) \\
     if (err != cudaSuccess) { \\
@@ -363,9 +358,8 @@ extern "C" int launch_keops_kernel(
 
     constexpr int total_offsets = (nvi + nvj + nvp > 0) ? (nvi + nvj + nvp) : 2;
 
-    // Use precomputed values instead of runtime computation
+    // Use precomputed value for argument array size
     constexpr int sparse_args_count = PRECOMPUTED_SPARSE_ARGS_COUNT;
-    constexpr int total_args = PRECOMPUTED_TOTAL_ARGS;
 
     int device_id;
     cudaError_t cuda_err = cudaGetDevice(&device_id);
@@ -455,18 +449,11 @@ extern "C" int launch_keops_kernel(
 
     float** h_args = (float**)(h_ptr + tables_size);
 
-    // Use precomputed mapping instead of runtime sorting
-    float* sparse_buffer[256];
-    float** sparse_args = (sparse_args_count <= 256) ? sparse_buffer : new float*[sparse_args_count];
-    for (int i = 0; i < sparse_args_count; i++) sparse_args[i] = nullptr;
-
-    // Apply precomputed mapping: sparse_args[PRECOMPUTED_MAPPING[i]] = args[i]
-    for (int i = 0; i < total_args; i++) {
-        sparse_args[PRECOMPUTED_MAPPING[i]] = args[i];
-    }
-
-    memcpy(h_args, sparse_args, size_args);
-    if (sparse_args_count > 256) delete[] sparse_args;
+    // FIX: Use identity mapping - FFI passes arguments in order [0, 1, 2, ...],
+    // and kernel expects them at the same indices. This correctly handles cases
+    // where some variables are not used in the formula (e.g., gradient formulas).
+    // Simply copy all arguments directly to h_args.
+    memcpy(h_args, args, size_args);
 
     cudaMemcpyAsync(device_ptr, h_ptr, total_upload_size, cudaMemcpyHostToDevice, stream);
 
@@ -486,9 +473,6 @@ extern "C" int launch_keops_kernel(
         else:
             launcher_code = preamble + '''
 // Ultra-minimal launcher - all overhead removed
-// Thread-local buffer for args pointers (static allocation, no runtime checks)
-static thread_local float* g_args_buffer[64];
-
 extern "C" int launch_keops_kernel(
     int tagHostDevice,
     int dimy,
@@ -520,30 +504,27 @@ extern "C" int launch_keops_kernel(
     float* out = (float*)out_ptr;
     float** args = (float**)args_ptr;
     float** args_d = (float**)scratch_ptr;
-    
-    // Block size adjustment for shared memory (compile-time when possible)
-    int effective_block_size = (dimy * KEOPS_DTYPE_BYTES > 48000) ?
-        (48000 / (dimy * KEOPS_DTYPE_BYTES)) : cuda_block_size;
-    
-    // Apply precomputed mapping directly to thread-local buffer
-    // PRECOMPUTED_MAPPING[i] gives the kernel's expected position for args[i]
-    #pragma unroll
-    for (int i = 0; i < PRECOMPUTED_TOTAL_ARGS; i++) {
-        g_args_buffer[PRECOMPUTED_MAPPING[i]] = args[i];
-    }
 
-    // Single async copy of args pointers to device
-    cudaMemcpyAsync(args_d, g_args_buffer, 
+    // Block size adjustment for shared memory
+    // Calculate max threads that fit in shared memory: 48KB / (dimy * 4 bytes)
+    int effective_block_size = std::min(
+        cuda_block_size,
+        (int)(48000 / std::max(1, dimy * KEOPS_DTYPE_BYTES))
+    );
+
+    // FIX: Use identity mapping - copy args directly to device
+    // FFI passes arguments in order [0, 1, 2, ...] and kernel expects same indices
+    cudaMemcpyAsync(args_d, args,
                     sizeof(float*) * PRECOMPUTED_SPARSE_ARGS_COUNT,
                     cudaMemcpyHostToDevice, stream);
-    
+
     // Launch kernel - no error checking in hot path
     dim3 blockSize(effective_block_size);
     dim3 gridSize((nx + effective_block_size - 1) / effective_block_size);
     size_t shared_mem = effective_block_size * dimy * KEOPS_DTYPE_BYTES;
-    
+
     GpuConv1DOnDevice<<<gridSize, blockSize, shared_mem, stream>>>(nx, ny, out, args_d);
-    
+
     return 0;
 }
 '''

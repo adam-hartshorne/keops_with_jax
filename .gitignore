@@ -38,6 +38,9 @@
 *__pycache__*
 *.pyc
 
+# Compiled c++ modules
+*.so
+
 # coverage data files
 *.coverage*
 htmlcov

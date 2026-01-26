@@ -490,7 +490,7 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
             opt_arg_str = str(opt_arg) if opt_arg is not None else ""
             formula2_str = formula2 if formula2 else ""
             extended_batch_key = f"{batch_key}_{opt_arg_str}_{formula2_str}"
-            
+
             kernel_id, target_name = _compute_kernel_hash(
                 formula, aliases, reduction_op, axis, dtype_str, extended_batch_key
             )
