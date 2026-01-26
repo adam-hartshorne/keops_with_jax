@@ -39,7 +39,8 @@ class Cuda_link_compile(LinkCompile):
                 "Trying to compile cuda code... but we detected that the system has no properly configured cuda lib."
             )
 
-        LinkCompile.__init__(self, lang=None)
+        # FIXED: Pass lang parameter to base class (was hardcoded to None)
+        LinkCompile.__init__(self, lang=lang)
 
         self.low_level_code_file = "".encode("utf-8")
 
@@ -52,6 +53,15 @@ class Cuda_link_compile(LinkCompile):
         self.file_to_check = self.so_file
 
     def save_info(self):
+        """
+        Save info file using base class's info_file path for consistency.
+
+        FIXED: Previously wrote to self.so_file + ".info" but read_info()
+        reads from self.info_file (.nfo). Now uses consistent path.
+        Uses atomic write pattern for reliability.
+        """
+        import tempfile
+
         red_formula = getattr(self, 'red_formula_string', "Unknown")
         dim = getattr(self, 'dim', getattr(self, 'dimout', getattr(self, 'dimy', 0)))
         tagI = getattr(self, 'tagI', 0)
@@ -59,9 +69,24 @@ class Cuda_link_compile(LinkCompile):
 
         info_str = f"red_formula={red_formula}\ndim={dim}\ntagI={tagI}\ndimy={dimy}"
 
-        info_file = self.so_file + ".info"
-        with open(info_file, "w") as f:
-            f.write(info_str)
+        # Use base class's info_file path for consistency with read_info()
+        info_dir = os.path.dirname(self.info_file)
+
+        # Atomic write: write to temp file then rename
+        fd, temp_path = tempfile.mkstemp(dir=info_dir, prefix=".tmp_info_", suffix=".nfo")
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(info_str)
+            # Atomic rename (on POSIX systems)
+            os.replace(temp_path, self.info_file)
+        except Exception as e:
+            # Clean up temp file on failure
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            raise e
 
     def generate_code(self):
         self.get_code()
