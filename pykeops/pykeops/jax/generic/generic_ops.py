@@ -26,7 +26,7 @@ from collections import OrderedDict
 DEBUG = os.environ.get('JAX_KEOPS_DEBUG', '0') == '1'
 
 # Module-level sys.path setup
-_JAX_DIR = os.path.dirname(os.path.abspath(__file__))
+_JAX_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Parent dir where .so lives
 if _JAX_DIR not in sys.path:
     sys.path.insert(0, _JAX_DIR)
 
@@ -96,20 +96,21 @@ def _get_keops_ext():
             return _keops_ext_cache
 
         keops_jax_ext = None
+        import_errors = []
 
         # Try: Import as pykeops.jax.keops_jax_ext
         try:
             keops_jax_ext = importlib.import_module('pykeops.jax.keops_jax_ext')
-        except ImportError:
-            pass
+        except ImportError as e:
+            import_errors.append(f"  1. import pykeops.jax.keops_jax_ext: {e}")
 
         # Try: Import as keops_jax_ext
         if keops_jax_ext is None:
             try:
                 import keops_jax_ext as kext
                 keops_jax_ext = kext
-            except ImportError:
-                pass
+            except ImportError as e:
+                import_errors.append(f"  2. import keops_jax_ext: {e}")
 
         # Try: Look for .so file in current directory
         if keops_jax_ext is None:
@@ -117,13 +118,24 @@ def _get_keops_ext():
 
             if so_files:
                 so_path = os.path.join(_JAX_DIR, so_files[0])
-                spec = importlib.util.spec_from_file_location("keops_jax_ext", so_path)
-                if spec and spec.loader:
-                    keops_jax_ext = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(keops_jax_ext)
+                try:
+                    spec = importlib.util.spec_from_file_location("keops_jax_ext", so_path)
+                    if spec and spec.loader:
+                        keops_jax_ext = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(keops_jax_ext)
+                except Exception as e:
+                    import_errors.append(f"  3. load {so_path}: {e}")
+            else:
+                import_errors.append(f"  3. No .so files found in {_JAX_DIR}")
 
         if keops_jax_ext is None:
-            raise ImportError("KeOps JAX extension not found")
+            error_details = "\n".join(import_errors)
+            raise ImportError(
+                f"KeOps JAX extension not found. Tried:\n{error_details}\n\n"
+                f"To build the extension, reinstall pykeops with JAX dependencies:\n"
+                f"  pip install -e . --no-build-isolation\n"
+                f"Or ensure jax, jaxlib, nanobind, cmake, and nvcc are available."
+            )
 
         # Register cleanup on first import
         if not hasattr(keops_jax_ext, '_atexit_registered'):
