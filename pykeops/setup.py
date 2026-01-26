@@ -85,8 +85,16 @@ with open(path.join(here, "pykeops", "readme.md"), encoding="utf-8") as f:
 # JAX Extension Builder
 # =============================================================================
 
+_jax_extension_built = False
+
 def build_jax_extension(install_dir=None):
     """Build the JAX extension using CMake."""
+    global _jax_extension_built
+
+    if _jax_extension_built:
+        print("[KeOps] JAX extension already built, skipping")
+        return True
+
     print("[KeOps] build_jax_extension() called")
 
     jax_binder_source = os.path.join(here, "pykeops", "jax", "binders")
@@ -165,6 +173,7 @@ def build_jax_extension(install_dir=None):
 
         so_files = glob.glob(os.path.join(install_dir, "keops_jax_ext*.so"))
         print(f"\n[KeOps] SUCCESS! Built: {so_files}\n")
+        _jax_extension_built = True
         return True
 
     except subprocess.CalledProcessError as e:
