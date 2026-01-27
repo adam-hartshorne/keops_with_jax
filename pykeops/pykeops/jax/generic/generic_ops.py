@@ -73,7 +73,8 @@ class BoundedLRUCache:
                 if len(self.cache) >= self.maxsize:
                     # Remove oldest item
                     self.cache.popitem(last=False)
-                self.cache[key] = value
+            # Always set the value (both for new keys and updates to existing keys)
+            self.cache[key] = value
 
     def clear(self):
         with self.lock:

@@ -1,0 +1,74 @@
+[
+  {
+    "config_name": "Small (SqDist)",
+    "size_str": "N=5,000",
+    "jax_forward_ms": 0.0846954993903637,
+    "jax_forward_std": 0.015028933057577866,
+    "jax_backward_ms": 0.09952750115189701,
+    "jax_backward_std": 0.02432603762645864,
+    "torch_forward_ms": 0.13882849889341742,
+    "torch_backward_ms": 0.5274830007692799,
+    "speedup_forward": 1.6391484776960032,
+    "speedup_backward": 5.299871841092897
+  },
+  {
+    "config_name": "Medium (SqDist)",
+    "size_str": "N=20,000",
+    "jax_forward_ms": 0.2987207000842318,
+    "jax_forward_std": 0.0654646414269769,
+    "jax_backward_ms": 0.2810899983160198,
+    "jax_backward_std": 0.08533685417817927,
+    "torch_forward_ms": 0.2979494980536401,
+    "torch_backward_ms": 1.0188181011471897,
+    "speedup_forward": 0.997418317410296,
+    "speedup_backward": 3.624526334095202
+  },
+  {
+    "config_name": "Large (SqDist)",
+    "size_str": "N=50,000",
+    "jax_forward_ms": 0.8671661984408274,
+    "jax_forward_std": 0.052125536266867674,
+    "jax_backward_ms": 0.852911701076664,
+    "jax_backward_std": 0.0632250652717159,
+    "torch_forward_ms": 0.8003949013072997,
+    "torch_backward_ms": 2.3727659980067983,
+    "speedup_forward": 0.9230005767595841,
+    "speedup_backward": 2.781959721049157
+  },
+  {
+    "config_name": "Huge (SqDist)",
+    "size_str": "N=500,000",
+    "jax_forward_ms": 59.46639280009549,
+    "jax_forward_std": 0.2114848903582407,
+    "jax_backward_ms": 69.64621499937493,
+    "jax_backward_std": 0.1821151204003433,
+    "torch_forward_ms": 59.25556659931317,
+    "torch_backward_ms": 132.14256270148326,
+    "speedup_forward": 0.9964547000271053,
+    "speedup_backward": 1.8973401885898498
+  },
+  {
+    "config_name": "Large (Varifold)",
+    "size_str": "N=50,000",
+    "jax_forward_ms": 1.46243869967293,
+    "jax_forward_std": 0.06778097483921884,
+    "jax_backward_ms": 2.0931456005200744,
+    "jax_backward_std": 0.05941259300210067,
+    "torch_forward_ms": 1.4394064986845478,
+    "torch_backward_ms": 4.260964400600642,
+    "speedup_forward": 0.9842508263809394,
+    "speedup_backward": 2.0356751100076074
+  },
+  {
+    "config_name": "Huge (Varifold)",
+    "size_str": "N=500,000",
+    "jax_forward_ms": 117.04509209957905,
+    "jax_forward_std": 0.6435329487572778,
+    "jax_backward_ms": 181.81262420257553,
+    "jax_backward_std": 0.707814242671877,
+    "torch_forward_ms": 115.62115809938405,
+    "torch_backward_ms": 295.3115890006302,
+    "speedup_forward": 0.9878343126170249,
+    "speedup_backward": 1.6242633881770177
+  }
+]
