@@ -307,8 +307,9 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
         throw std::runtime_error("No CUDA devices available");
     }
 
-    // RAII guard to restore CUDA device on scope exit (even if exception thrown)
-    CudaDeviceGuard device_guard;
+    // Note: No CudaDeviceGuard needed here - this function doesn't change the CUDA device.
+    // Avoiding unnecessary save/restore prevents potential interference with JAX's
+    // device management during multi-GPU/sharding operations.
 
     // Check if already registered on ALL devices
     bool all_registered = true;
@@ -401,8 +402,6 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
 
         g_registry_version.fetch_add(1, std::memory_order_release);
     }
-
-    // Device automatically restored by CudaDeviceGuard destructor
 }
 
 // =============================================================================
