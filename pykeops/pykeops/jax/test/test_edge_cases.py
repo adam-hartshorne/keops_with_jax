@@ -24,14 +24,18 @@ import numpy as np
 # Imports and Setup
 # =============================================================================
 
-import jax
-import jax.numpy as jnp
-
 from test_utils import (
     TestSuite, TestResult, Status,
     print_header, print_subheader, print_info, print_success, print_error,
-    compare_arrays, run_test, print_environment_info
+    compare_arrays, run_test, print_environment_info,
+    setup_jax_float64, get_np_dtype, get_dtype_str, is_float64_mode
 )
+
+# Setup float64 mode BEFORE importing JAX
+setup_jax_float64()
+
+import jax
+import jax.numpy as jnp
 
 # Import JAX KeOps
 try:
@@ -96,8 +100,8 @@ def test_scalar_multiplication_sizes():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
 
         # JAX KeOps
         x_jax = jnp.array(x_np)
@@ -137,8 +141,8 @@ def test_scalar_multiplication_batched():
             np.random.seed(SEED)
             D = 3
 
-            x_np = np.random.randn(B, N, D).astype(np.float32)
-            y_np = np.random.randn(B, M, D).astype(np.float32)
+            x_np = np.random.randn(B, N, D).astype(get_np_dtype())
+            y_np = np.random.randn(B, M, D).astype(get_np_dtype())
 
             # JAX KeOps
             x_jax = jnp.array(x_np)
@@ -180,8 +184,8 @@ def test_gaussian_kernel_sizes():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
 
         # JAX KeOps
         x_jax = jnp.array(x_np)
@@ -221,8 +225,8 @@ def test_gaussian_kernel_gradient_sizes():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
 
         # JAX KeOps gradient
         x_jax = jnp.array(x_np)
@@ -273,9 +277,9 @@ def test_kernel_matmul_sizes():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
-        v_np = np.random.randn(M, 1).astype(np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
+        v_np = np.random.randn(M, 1).astype(get_np_dtype())
 
         # JAX KeOps
         x_jax = jnp.array(x_np)
@@ -322,9 +326,9 @@ def test_kernel_matmul_gradient_sizes():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32) * 0.1
-        y_np = np.random.randn(M, D).astype(np.float32) * 0.1
-        v_np = np.abs(np.random.randn(M, 1).astype(np.float32)) + 0.1
+        x_np = np.random.randn(N, D).astype(get_np_dtype()) * 0.1
+        y_np = np.random.randn(M, D).astype(get_np_dtype()) * 0.1
+        v_np = np.abs(np.random.randn(M, 1).astype(get_np_dtype())) + 0.1
 
         # JAX KeOps gradient
         x_jax = jnp.array(x_np)
@@ -377,12 +381,12 @@ def test_varifold_forward():
         for n_i, n_j in [(10, 8), (50, 40), (200, 150)]:
             np.random.seed(SEED)
 
-            x_np = np.random.randn(B, n_i, 3).astype(np.float32)
-            y_np = np.random.randn(B, n_j, 3).astype(np.float32)
-            nx_np = np.random.randn(B, n_i, 3).astype(np.float32)
-            ny_np = np.random.randn(B, n_j, 3).astype(np.float32)
-            wi_np = np.random.randn(B, n_i, 1).astype(np.float32)
-            wj_np = np.random.randn(B, n_j, 1).astype(np.float32)
+            x_np = np.random.randn(B, n_i, 3).astype(get_np_dtype())
+            y_np = np.random.randn(B, n_j, 3).astype(get_np_dtype())
+            nx_np = np.random.randn(B, n_i, 3).astype(get_np_dtype())
+            ny_np = np.random.randn(B, n_j, 3).astype(get_np_dtype())
+            wi_np = np.random.randn(B, n_i, 1).astype(get_np_dtype())
+            wj_np = np.random.randn(B, n_j, 1).astype(get_np_dtype())
 
             nx_np = nx_np / (np.linalg.norm(nx_np, axis=-1, keepdims=True) + 1e-8)
             ny_np = ny_np / (np.linalg.norm(ny_np, axis=-1, keepdims=True) + 1e-8)
@@ -448,12 +452,12 @@ def test_varifold_gradient():
         for n_i, n_j in [(10, 8), (50, 40), (150, 120)]:
             np.random.seed(SEED)
 
-            x_np = np.random.randn(B, n_i, 3).astype(np.float32)
-            y_np = np.random.randn(B, n_j, 3).astype(np.float32)
-            nx_np = np.random.randn(B, n_i, 3).astype(np.float32)
-            ny_np = np.random.randn(B, n_j, 3).astype(np.float32)
-            wi_np = np.random.randn(B, n_i, 1).astype(np.float32)
-            wj_np = np.random.randn(B, n_j, 1).astype(np.float32)
+            x_np = np.random.randn(B, n_i, 3).astype(get_np_dtype())
+            y_np = np.random.randn(B, n_j, 3).astype(get_np_dtype())
+            nx_np = np.random.randn(B, n_i, 3).astype(get_np_dtype())
+            ny_np = np.random.randn(B, n_j, 3).astype(get_np_dtype())
+            wi_np = np.random.randn(B, n_i, 1).astype(get_np_dtype())
+            wj_np = np.random.randn(B, n_j, 1).astype(get_np_dtype())
 
             nx_np = nx_np / (np.linalg.norm(nx_np, axis=-1, keepdims=True) + 1e-8)
             ny_np = ny_np / (np.linalg.norm(ny_np, axis=-1, keepdims=True) + 1e-8)
@@ -528,8 +532,8 @@ def test_pm_gradient():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
 
         formula = "Exp(-SqNorm2(x-y) * s)"
         aliases = [f"x=Vi({D})", f"y=Vj({D})", "s=Pm(1)"]
@@ -537,17 +541,18 @@ def test_pm_gradient():
         # JAX KeOps
         x_jax = jnp.array(x_np)
         y_jax = jnp.array(y_np)
-        sigma_jax = jnp.array([0.5])
+        sigma_jax = jnp.array([0.5], dtype=x_jax.dtype)
 
-        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         grad_jax = jax.grad(lambda s: op_jax(x_jax, y_jax, s).sum())(sigma_jax)
 
         # PyTorch KeOps
-        x_torch = torch.tensor(x_np, device='cuda')
-        y_torch = torch.tensor(y_np, device='cuda')
-        sigma_torch = torch.tensor([0.5], device='cuda', requires_grad=True)
+        torch_dtype = torch.float64 if is_float64_mode() else torch.float32
+        x_torch = torch.tensor(x_np, device='cuda', dtype=torch_dtype)
+        y_torch = torch.tensor(y_np, device='cuda', dtype=torch_dtype)
+        sigma_torch = torch.tensor([0.5], device='cuda', dtype=torch_dtype, requires_grad=True)
 
-        op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+        op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         result_torch = op_torch(x_torch, y_torch, sigma_torch).sum()
         result_torch.backward()
         grad_torch = sigma_torch.grad
@@ -578,10 +583,10 @@ def test_genred_forward_sizes():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
-        b_np = np.random.randn(M, D).astype(np.float32)
-        sigma_np = np.array([0.5], dtype=np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
+        b_np = np.random.randn(M, D).astype(get_np_dtype())
+        sigma_np = np.array([0.5], dtype=get_np_dtype())
 
         formula = "Exp(-SqNorm2(x-y) * s) * b"
         aliases = [f"x=Vi({D})", f"y=Vj({D})", f"b=Vj({D})", "s=Pm(1)"]
@@ -592,7 +597,7 @@ def test_genred_forward_sizes():
         b_jax = jnp.array(b_np)
         sigma_jax = jnp.array(sigma_np)
 
-        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         result_jax = op_jax(x_jax, y_jax, b_jax, sigma_jax)
 
         # PyTorch KeOps
@@ -626,10 +631,10 @@ def test_genred_gradient_sizes():
         np.random.seed(SEED)
         D = 3
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
-        b_np = np.random.randn(M, D).astype(np.float32)
-        sigma_np = np.array([0.5], dtype=np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
+        b_np = np.random.randn(M, D).astype(get_np_dtype())
+        sigma_np = np.array([0.5], dtype=get_np_dtype())
 
         formula = "Exp(-SqNorm2(x-y) * s) * b"
         aliases = [f"x=Vi({D})", f"y=Vj({D})", f"b=Vj({D})", "s=Pm(1)"]
@@ -640,7 +645,7 @@ def test_genred_gradient_sizes():
         b_jax = jnp.array(b_np)
         sigma_jax = jnp.array(sigma_np)
 
-        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         grad_jax = jax.grad(lambda x: op_jax(x, y_jax, b_jax, sigma_jax).sum())(x_jax)
 
         # PyTorch KeOps gradient
@@ -680,8 +685,8 @@ def test_high_dim_forward():
         for N, M in [(100, 80), (300, 250), (500, 400)]:
             np.random.seed(SEED)
 
-            x_np = np.random.randn(N, D).astype(np.float32)
-            y_np = np.random.randn(M, D).astype(np.float32)
+            x_np = np.random.randn(N, D).astype(get_np_dtype())
+            y_np = np.random.randn(M, D).astype(get_np_dtype())
 
             formula = "SqNorm2(x-y)"
             aliases = [f"x=Vi({D})", f"y=Vj({D})"]
@@ -689,7 +694,7 @@ def test_high_dim_forward():
             # JAX KeOps
             x_jax = jnp.array(x_np)
             y_jax = jnp.array(y_np)
-            op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+            op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
             result_jax = op_jax(x_jax, y_jax)
 
             # PyTorch KeOps
@@ -729,8 +734,8 @@ def test_high_dim_gradient():
         for N, M in [(100, 80), (300, 250)]:
             np.random.seed(SEED)
 
-            x_np = np.random.randn(N, D).astype(np.float32)
-            y_np = np.random.randn(M, D).astype(np.float32)
+            x_np = np.random.randn(N, D).astype(get_np_dtype())
+            y_np = np.random.randn(M, D).astype(get_np_dtype())
 
             formula = "SqNorm2(x-y)"
             aliases = [f"x=Vi({D})", f"y=Vj({D})"]
@@ -738,7 +743,7 @@ def test_high_dim_gradient():
             # JAX KeOps gradient
             x_jax = jnp.array(x_np)
             y_jax = jnp.array(y_np)
-            op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+            op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
 
             def jax_forward(x_var):
                 return op_jax(x_var, y_jax).sum()
@@ -813,8 +818,8 @@ def test_high_dim_odd_sizes():
     for D in problematic_dims:
         np.random.seed(SEED)
 
-        x_np = np.random.randn(N, D).astype(np.float32)
-        y_np = np.random.randn(M, D).astype(np.float32)
+        x_np = np.random.randn(N, D).astype(get_np_dtype())
+        y_np = np.random.randn(M, D).astype(get_np_dtype())
 
         formula = "SqNorm2(x-y)"
         aliases = [f"x=Vi({D})", f"y=Vj({D})"]
@@ -822,7 +827,7 @@ def test_high_dim_odd_sizes():
         # JAX KeOps
         x_jax = jnp.array(x_np)
         y_jax = jnp.array(y_np)
-        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         result_jax = op_jax(x_jax, y_jax)
 
         # PyTorch KeOps
@@ -853,9 +858,9 @@ def test_sparse_variable_forward():
     np.random.seed(SEED)
     B, N, M = 2, 15, 20
 
-    x_np = np.random.randn(B, N, 3).astype(np.float32) * 0.1
-    y_np = np.random.randn(B, M, 3).astype(np.float32) * 0.1
-    v_np = np.abs(np.random.randn(B, M, 1).astype(np.float32)) * 0.01 + 0.001
+    x_np = np.random.randn(B, N, 3).astype(get_np_dtype()) * 0.1
+    y_np = np.random.randn(B, M, 3).astype(get_np_dtype()) * 0.1
+    v_np = np.abs(np.random.randn(B, M, 1).astype(get_np_dtype())) * 0.01 + 0.001
 
     # JAX KeOps
     x_jax = jnp.array(x_np)
@@ -895,9 +900,9 @@ def test_sparse_variable_gradient():
         for N, M in [(15, 20), (100, 80), (200, 150), (400, 300)]:
             np.random.seed(SEED)
 
-            x_np = np.random.randn(B, N, 3).astype(np.float32) * 0.1
-            y_np = np.random.randn(B, M, 3).astype(np.float32) * 0.1
-            v_np = np.abs(np.random.randn(B, M, 1).astype(np.float32)) * 0.01 + 0.001
+            x_np = np.random.randn(B, N, 3).astype(get_np_dtype()) * 0.1
+            y_np = np.random.randn(B, M, 3).astype(get_np_dtype()) * 0.1
+            v_np = np.abs(np.random.randn(B, M, 1).astype(get_np_dtype())) * 0.01 + 0.001
 
             # JAX KeOps gradient
             x_jax = jnp.array(x_np)
@@ -946,8 +951,8 @@ def test_jit_forward():
     np.random.seed(SEED)
     N, M, D = 200, 150, 3
 
-    x_np = np.random.randn(N, D).astype(np.float32)
-    y_np = np.random.randn(M, D).astype(np.float32)
+    x_np = np.random.randn(N, D).astype(get_np_dtype())
+    y_np = np.random.randn(M, D).astype(get_np_dtype())
 
     formula = "SqNorm2(x-y)"
     aliases = [f"x=Vi({D})", f"y=Vj({D})"]
@@ -955,7 +960,7 @@ def test_jit_forward():
     # JAX KeOps with JIT
     x_jax = jnp.array(x_np)
     y_jax = jnp.array(y_np)
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
 
     @jax.jit
     def compute_jax(x, y):
@@ -980,8 +985,8 @@ def test_jit_gradient():
     np.random.seed(SEED)
     N, M, D = 200, 150, 3
 
-    x_np = np.random.randn(N, D).astype(np.float32)
-    y_np = np.random.randn(M, D).astype(np.float32)
+    x_np = np.random.randn(N, D).astype(get_np_dtype())
+    y_np = np.random.randn(M, D).astype(get_np_dtype())
 
     formula = "SqNorm2(x-y)"
     aliases = [f"x=Vi({D})", f"y=Vj({D})"]
@@ -989,7 +994,7 @@ def test_jit_gradient():
     # JAX KeOps with JIT
     x_jax = jnp.array(x_np)
     y_jax = jnp.array(y_np)
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
 
     @jax.jit
     def compute_grad_jax(x, y):

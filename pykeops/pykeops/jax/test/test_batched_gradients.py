@@ -23,8 +23,12 @@ import numpy as np
 
 from test_utils import (
     TestSuite, print_header, print_subheader, print_info, print_warning,
-    compare_arrays, run_test, print_environment_info, RICH_AVAILABLE, Status
+    compare_arrays, run_test, print_environment_info, RICH_AVAILABLE, Status,
+    setup_jax_float64, get_np_dtype, get_dtype_str, is_float64_mode
 )
+
+# Setup float64 mode BEFORE importing JAX
+setup_jax_float64()
 
 # =============================================================================
 # Import Frameworks
@@ -43,7 +47,7 @@ except ImportError as e:
 # PyTorch
 try:
     import torch
-    torch.set_default_dtype(torch.float32)
+    torch.set_default_dtype(torch.float64 if is_float64_mode() else torch.float32)
     TORCH_AVAILABLE = torch.cuda.is_available()
     if not TORCH_AVAILABLE:
         print("Warning: PyTorch CUDA not available")
@@ -77,8 +81,8 @@ ATOL = 1e-5
 def get_test_data(B, N, D, seed=SEED):
     """Generate identical test data for both frameworks."""
     np.random.seed(seed)
-    x_np = np.random.randn(B, N, D).astype(np.float32)
-    y_np = np.random.randn(B, N, D).astype(np.float32)
+    x_np = np.random.randn(B, N, D).astype(get_np_dtype())
+    y_np = np.random.randn(B, N, D).astype(get_np_dtype())
     return x_np, y_np
 
 
@@ -142,11 +146,11 @@ def jax_forward_and_grad(x_np, y_np, formula='sqdist'):
     if formula == 'sqdist':
         keops_formula = "Square(x - y)"
         aliases = [f"x=Vi({D})", f"y=Vj({D})"]
-        op = JaxGenred(keops_formula, aliases, reduction_op='Sum', axis=1)
+        op = JaxGenred(keops_formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     elif formula == 'gaussian':
         keops_formula = "Exp(-SqNorm2(x-y))"
         aliases = [f"x=Vi({D})", f"y=Vj({D})"]
-        op = JaxGenred(keops_formula, aliases, reduction_op='Sum', axis=1)
+        op = JaxGenred(keops_formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     else:
         raise ValueError(f"Unknown formula: {formula}")
 

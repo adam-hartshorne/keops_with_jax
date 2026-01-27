@@ -13,12 +13,47 @@ Features:
 """
 
 import sys
+import os
 import time
 from typing import List, Tuple, Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from contextlib import contextmanager
 import numpy as np
+
+
+# =============================================================================
+# Float64 Mode Support
+# =============================================================================
+
+def is_float64_mode() -> bool:
+    """Check if tests should run in float64 mode."""
+    return os.environ.get('KEOPS_TEST_FLOAT64', '0') == '1'
+
+
+def get_np_dtype():
+    """Get the numpy dtype to use for tests (float32 or float64)."""
+    return np.float64 if is_float64_mode() else np.float32
+
+
+def get_dtype_str() -> str:
+    """Get the dtype string for KeOps ('float32' or 'float64')."""
+    return 'float64' if is_float64_mode() else 'float32'
+
+
+def setup_jax_float64():
+    """
+    Configure JAX for float64 if in float64 mode.
+    Call this at the start of test scripts.
+    """
+    if is_float64_mode():
+        # Set environment variable before JAX import
+        os.environ['JAX_ENABLE_X64'] = '1'
+        try:
+            import jax
+            jax.config.update('jax_enable_x64', True)
+        except ImportError:
+            pass
 
 # =============================================================================
 # Try to import Rich for beautiful output

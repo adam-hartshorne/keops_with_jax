@@ -186,6 +186,14 @@ class Cuda_link_compile(LinkCompile):
         """Add a C-compatible launcher function that can be called from C++ via dlopen."""
         is_ranges = "GpuConv1DOnDevice_ranges" in kernel_code
 
+        # Map dtype_bytes to C++ type for proper pointer casting
+        if dtype_bytes == 8:
+            cpp_dtype = "double"
+        elif dtype_bytes == 2:
+            cpp_dtype = "__half"  # CUDA half-precision type
+        else:
+            cpp_dtype = "float"
+
         # Get the number of argument slots needed from varloader
         # nminargs is max(variable_index) + 1, which accounts for all variables including gaps
         # FIX: Use nminargs instead of len(all_indices) to handle sparse variable indices
@@ -331,8 +339,8 @@ extern "C" int launch_keops_kernel(
     cudaStream_t stream,
     void* scratch_ptr
 ) {
-    float* out = (float*)out_ptr;
-    float** args = (float**)args_ptr;
+    ''' + cpp_dtype + '''* out = (''' + cpp_dtype + '''*)out_ptr;
+    ''' + cpp_dtype + '''** args = (''' + cpp_dtype + '''**)args_ptr;
 
     int batch_size = (int)(long long)ranges;
     if (batch_size == 0) batch_size = 1;
@@ -375,7 +383,7 @@ extern "C" int launch_keops_kernel(
     size_t size_lookup  = sizeof(signed long int) * 3 * nblocks;
     size_t size_slices  = sizeof(signed long int) * batch_size;
     size_t size_ranges  = sizeof(signed long int) * 2 * batch_size;
-    size_t size_args    = sizeof(float*) * sparse_args_count;
+    size_t size_args    = sizeof(''' + cpp_dtype + '''*) * sparse_args_count;
     size_t tables_size  = size_offsets + size_lookup + size_slices + size_ranges;
     size_t total_upload_size = tables_size + size_args;
 
@@ -383,7 +391,7 @@ extern "C" int launch_keops_kernel(
     signed long int* lookup_d  = (signed long int*)(device_ptr + size_offsets);
     signed long int* slices_x  = (signed long int*)(device_ptr + size_offsets + size_lookup);
     signed long int* ranges_y  = (signed long int*)(device_ptr + size_offsets + size_lookup + size_slices);
-    float** args_d             = (float**)(device_ptr + tables_size);
+    ''' + cpp_dtype + '''** args_d = (''' + cpp_dtype + '''**)(device_ptr + tables_size);
 
     bool cache_hit = cache.is_valid(nx, ny, batch_size, cuda_block_size, nvi, nvj, nvp, tagI);
 
@@ -447,7 +455,7 @@ extern "C" int launch_keops_kernel(
         memcpy(h_ptr, cache.cached_tables.data(), tables_size);
     }
 
-    float** h_args = (float**)(h_ptr + tables_size);
+    ''' + cpp_dtype + '''** h_args = (''' + cpp_dtype + '''**)(h_ptr + tables_size);
 
     // FIX: Use identity mapping - FFI passes arguments in order [0, 1, 2, ...],
     // and kernel expects them at the same indices. This correctly handles cases
@@ -501,9 +509,9 @@ extern "C" int launch_keops_kernel(
     void* scratch_ptr
 ) {
     // Direct pointer casts - no validation
-    float* out = (float*)out_ptr;
-    float** args = (float**)args_ptr;
-    float** args_d = (float**)scratch_ptr;
+    ''' + cpp_dtype + '''* out = (''' + cpp_dtype + '''*)out_ptr;
+    ''' + cpp_dtype + '''** args = (''' + cpp_dtype + '''**)args_ptr;
+    ''' + cpp_dtype + '''** args_d = (''' + cpp_dtype + '''**)scratch_ptr;
 
     // Block size adjustment for shared memory
     // Use 49152 bytes (48KB) to match SHAREDMEMPERBLOCK in CudaSizes.h
@@ -515,7 +523,7 @@ extern "C" int launch_keops_kernel(
     // FIX: Use identity mapping - copy args directly to device
     // FFI passes arguments in order [0, 1, 2, ...] and kernel expects same indices
     cudaMemcpyAsync(args_d, args,
-                    sizeof(float*) * PRECOMPUTED_SPARSE_ARGS_COUNT,
+                    sizeof(''' + cpp_dtype + '''*) * PRECOMPUTED_SPARSE_ARGS_COUNT,
                     cudaMemcpyHostToDevice, stream);
 
     // Launch kernel - no error checking in hot path

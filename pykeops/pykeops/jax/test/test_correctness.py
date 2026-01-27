@@ -21,15 +21,19 @@ import numpy as np
 # Imports
 # =============================================================================
 
-import jax
-import jax.numpy as jnp
-
 from test_utils import (
     TestSuite, TestResult, Status,
     print_header, print_subheader, print_info, print_success, print_error, print_warning,
     compare_arrays, run_test, print_environment_info,
-    print_benchmark_table, RICH_AVAILABLE
+    print_benchmark_table, RICH_AVAILABLE,
+    setup_jax_float64, get_np_dtype, get_dtype_str, is_float64_mode
 )
+
+# Setup float64 mode BEFORE importing JAX
+setup_jax_float64()
+
+import jax
+import jax.numpy as jnp
 
 if RICH_AVAILABLE:
     from test_utils import console
@@ -101,10 +105,10 @@ def generate_test_data(n, m, d, seed=SEED):
     """Generate matching test data for JAX and PyTorch."""
     np.random.seed(seed)
     
-    x_np = np.random.randn(n, d).astype(np.float32)
-    y_np = np.random.randn(m, d).astype(np.float32)
-    b_np = np.random.randn(m, d).astype(np.float32)
-    s_np = np.array([0.5], dtype=np.float32)
+    x_np = np.random.randn(n, d).astype(get_np_dtype())
+    y_np = np.random.randn(m, d).astype(get_np_dtype())
+    b_np = np.random.randn(m, d).astype(get_np_dtype())
+    s_np = np.array([0.5], dtype=get_np_dtype())
     
     return {
         'x_np': x_np, 'y_np': y_np, 'b_np': b_np, 's_np': s_np,
@@ -135,7 +139,7 @@ def test_forward_genred(formula_name, formula, alias_templates, has_param, has_b
     data = generate_test_data(n, m, d)
     
     # JAX
-    op_jax = Genred_jax(formula, aliases, reduction_op=reduction, axis=axis)
+    op_jax = Genred_jax(formula, aliases, reduction_op=reduction, axis=axis, dtype=get_dtype_str())
     if has_b:
         result_jax = op_jax(data['x_jax'], data['y_jax'], data['b_jax'], data['s_jax'])
     elif has_param:
@@ -144,7 +148,7 @@ def test_forward_genred(formula_name, formula, alias_templates, has_param, has_b
         result_jax = op_jax(data['x_jax'], data['y_jax'])
     
     # PyTorch
-    op_torch = Genred_torch(formula, aliases, reduction_op=reduction, axis=axis)
+    op_torch = Genred_torch(formula, aliases, reduction_op=reduction, axis=axis, dtype=get_dtype_str())
     if has_b:
         result_torch = op_torch(data['x_torch'], data['y_torch'], data['b_torch'], data['s_torch'])
     elif has_param:
@@ -187,7 +191,7 @@ def test_gradient_vi(formula_name, formula, alias_templates, has_param, has_b, n
     data = generate_test_data(n, m, d)
     
     # JAX gradient
-    op_jax = Genred_jax(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred_jax(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     
     def forward_jax(x):
         if has_b:
@@ -201,7 +205,7 @@ def test_gradient_vi(formula_name, formula, alias_templates, has_param, has_b, n
     
     # PyTorch gradient
     x_torch = data['x_torch'].clone().requires_grad_(True)
-    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     
     if has_b:
         result_torch = op_torch(x_torch, data['y_torch'], data['b_torch'], data['s_torch']).sum()
@@ -222,7 +226,7 @@ def test_gradient_vj(formula_name, formula, alias_templates, has_param, has_b, n
     data = generate_test_data(n, m, d)
     
     # JAX gradient
-    op_jax = Genred_jax(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred_jax(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     
     def forward_jax(y):
         if has_b:
@@ -236,7 +240,7 @@ def test_gradient_vj(formula_name, formula, alias_templates, has_param, has_b, n
     
     # PyTorch gradient
     y_torch = data['y_torch'].clone().requires_grad_(True)
-    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     
     if has_b:
         result_torch = op_torch(data['x_torch'], y_torch, data['b_torch'], data['s_torch']).sum()
@@ -259,12 +263,12 @@ def test_gradient_pm(n, m, d):
     aliases = make_aliases(["x=Vi(D)", "y=Vj(D)", "s=Pm(1)"], d)
     
     # JAX gradient
-    op_jax = Genred_jax(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred_jax(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     grad_jax = jax.grad(lambda s: op_jax(data['x_jax'], data['y_jax'], s).sum())(data['s_jax'])
     
     # PyTorch gradient
     s_torch = data['s_torch'].clone().requires_grad_(True)
-    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     result_torch = op_torch(data['x_torch'], data['y_torch'], s_torch).sum()
     result_torch.backward()
     grad_torch = s_torch.grad
@@ -309,11 +313,11 @@ def test_reduction(reduction, n, m, d, axis=1):
     aliases = make_aliases(["x=Vi(D)", "y=Vj(D)"], d)
     
     # JAX
-    op_jax = Genred_jax(formula, aliases, reduction_op=reduction, axis=axis)
+    op_jax = Genred_jax(formula, aliases, reduction_op=reduction, axis=axis, dtype=get_dtype_str())
     result_jax = op_jax(data['x_jax'], data['y_jax'])
     
     # PyTorch
-    op_torch = Genred_torch(formula, aliases, reduction_op=reduction, axis=axis)
+    op_torch = Genred_torch(formula, aliases, reduction_op=reduction, axis=axis, dtype=get_dtype_str())
     result_torch = op_torch(data['x_torch'], data['y_torch'])
     
     return compare_arrays(result_jax, result_torch.cpu().numpy(), rtol=RTOL, atol=ATOL)

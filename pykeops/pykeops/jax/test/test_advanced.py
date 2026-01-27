@@ -19,13 +19,17 @@ import sys
 import math
 import numpy as np
 
-import jax
-import jax.numpy as jnp
-
 from test_utils import (
     TestSuite, print_header, print_subheader, print_warning,
-    compare_arrays, run_test, print_environment_info, RICH_AVAILABLE
+    compare_arrays, run_test, print_environment_info, RICH_AVAILABLE,
+    setup_jax_float64, get_np_dtype, get_dtype_str, is_float64_mode
 )
+
+# Setup float64 mode BEFORE importing JAX
+setup_jax_float64()
+
+import jax
+import jax.numpy as jnp
 
 # =============================================================================
 # Import KeOps
@@ -74,9 +78,9 @@ def generate_data_np(n, m, d, batch=None, seed=SEED):
         shape_y = (m, d)
 
     return {
-        'x': np.random.randn(*shape_x).astype(np.float32),
-        'y': np.random.randn(*shape_y).astype(np.float32),
-        'sigma': np.array([0.5], dtype=np.float32),
+        'x': np.random.randn(*shape_x).astype(get_np_dtype()),
+        'y': np.random.randn(*shape_y).astype(get_np_dtype()),
+        'sigma': np.array([0.5], dtype=get_np_dtype()),
     }
 
 
@@ -108,11 +112,11 @@ def test_reduction(reduction_op, n, m, d, opt_arg=None, extra_args=False):
     # Additional B array for weights if needed
     if extra_args:
         np.random.seed(SEED + 100)
-        b_np = np.random.randn(m, d).astype(np.float32)
+        b_np = np.random.randn(m, d).astype(get_np_dtype())
 
     # --- JAX ---
     op_jax = Genred(formula, aliases, reduction_op=reduction_op, axis=1,
-                    opt_arg=opt_arg, formula2=formula2)
+                    opt_arg=opt_arg, formula2=formula2, dtype=get_dtype_str())
 
     if extra_args:
         result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']), jnp.array(b_np))
@@ -121,7 +125,7 @@ def test_reduction(reduction_op, n, m, d, opt_arg=None, extra_args=False):
 
     # --- PyTorch ---
     op_torch = Genred_torch(formula, aliases, reduction_op=reduction_op, axis=1,
-                            opt_arg=opt_arg, formula2=formula2)
+                            opt_arg=opt_arg, formula2=formula2, dtype=get_dtype_str())
 
     if extra_args:
         result_torch = op_torch(
@@ -171,8 +175,8 @@ def test_lazy_math(op_name, n=50, m=40, d=3):
     np.random.seed(SEED)
 
     # Generate data
-    x_np = np.random.randn(n, d).astype(np.float32)
-    y_np = np.random.randn(m, d).astype(np.float32)
+    x_np = np.random.randn(n, d).astype(get_np_dtype())
+    y_np = np.random.randn(m, d).astype(get_np_dtype())
 
     # Adjust domains for specific ops to avoid NaNs
     if op_name in ["Sqrt", "Log"]:
@@ -272,7 +276,7 @@ def test_hessian():
     y_jax = jnp.array(data['y'])
     v_jax = jnp.ones_like(x_jax)
 
-    op_jax = Genred("SqDist(x, y)", ["x=Vi(3)", "y=Vj(3)"], reduction_op='Sum', axis=1)
+    op_jax = Genred("SqDist(x, y)", ["x=Vi(3)", "y=Vj(3)"], reduction_op='Sum', axis=1, dtype=get_dtype_str())
 
     def grad_fn(x):
         return jax.grad(lambda x_in: jnp.sum(op_jax(x_in, y_jax)))(x)
@@ -310,16 +314,16 @@ def test_formula(name, n=100, m=80, d=3):
         aliases = ["x=Vi(3)", "y=Vj(3)", "b=Vj(3)", "s=Pm(1)"]
         # Make dummy b
         np.random.seed(SEED + 1)
-        b = np.random.randn(m, d).astype(np.float32)
+        b = np.random.randn(m, d).astype(get_np_dtype())
         extra_args_jax = [jnp.array(b), jnp.array(data['sigma'])]
         extra_args_torch = [torch.tensor(b, device='cuda'), torch.tensor(data['sigma'], device='cuda')]
 
     # JAX
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     res_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']), *extra_args_jax)
 
     # PyTorch
-    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1)
+    op_torch = Genred_torch(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     res_torch = op_torch(
         torch.tensor(data['x'], device='cuda'),
         torch.tensor(data['y'], device='cuda'),
@@ -398,9 +402,9 @@ def test_complex_nudft(n=100, m=80, d=1):
     # Signal values (complex)
     x_np = (np.random.randn(n, d) + 1j * np.random.randn(n, d)).astype(np.complex64)
     # Sample positions (real)
-    p_np = np.random.rand(n, d).astype(np.float32)
+    p_np = np.random.rand(n, d).astype(get_np_dtype())
     # Frequencies (real)
-    f_np = np.random.rand(m, d).astype(np.float32)
+    f_np = np.random.rand(m, d).astype(get_np_dtype())
 
     # JAX KeOps
     x_jax = jnp.array(x_np)
@@ -484,8 +488,8 @@ def test_complex_mixed_real(n=30, m=40, d=2):
     np.random.seed(321)
 
     # Real positions, complex values
-    x_np = np.random.randn(n, d).astype(np.float32)
-    y_np = np.random.randn(m, d).astype(np.float32)
+    x_np = np.random.randn(n, d).astype(get_np_dtype())
+    y_np = np.random.randn(m, d).astype(get_np_dtype())
     a_np = (np.random.randn(m, d) + 1j * np.random.randn(m, d)).astype(np.complex64)
 
     # JAX KeOps

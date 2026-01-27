@@ -19,13 +19,18 @@ Tests cover:
 
 import sys
 import numpy as np
-import jax
-import jax.numpy as jnp
 
 from test_utils import (
     TestSuite, print_header, print_subheader, print_info, print_warning,
-    compare_arrays, run_test, print_environment_info, RICH_AVAILABLE
+    compare_arrays, run_test, print_environment_info, RICH_AVAILABLE,
+    setup_jax_float64, get_np_dtype, get_dtype_str, is_float64_mode
 )
+
+# Setup float64 mode BEFORE importing JAX
+setup_jax_float64()
+
+import jax
+import jax.numpy as jnp
 
 # =============================================================================
 # Import KeOps
@@ -65,10 +70,10 @@ ATOL = 1e-6
 # Test Data Generators
 # =============================================================================
 
-def get_test_data(n, m, d, dtype='float32', seed=SEED):
+def get_test_data(n, m, d, dtype=None, seed=SEED):
     """Generate test data as numpy arrays."""
     np.random.seed(seed)
-    np_dtype = np.float32 if dtype == 'float32' else np.float64
+    np_dtype = get_np_dtype() if dtype is None else getattr(np, dtype)
 
     return {
         'x': np.random.randn(n, d).astype(np_dtype),
@@ -78,10 +83,10 @@ def get_test_data(n, m, d, dtype='float32', seed=SEED):
     }
 
 
-def get_batched_data(batch, n, m, d, dtype='float32', seed=SEED):
+def get_batched_data(batch, n, m, d, dtype=None, seed=SEED):
     """Generate batched test data as numpy arrays."""
     np.random.seed(seed)
-    np_dtype = np.float32 if dtype == 'float32' else np.float64
+    np_dtype = get_np_dtype() if dtype is None else getattr(np, dtype)
 
     return {
         'x': np.random.randn(batch, n, d).astype(np_dtype),
@@ -99,7 +104,7 @@ def test_genred_sqdist_sum(axis=1):
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
     # JAX KeOps
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=axis)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=axis, dtype=get_dtype_str())
     result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
     # PyTorch KeOps (ground truth)
@@ -122,7 +127,7 @@ def test_genred_gaussian():
     aliases = ["x=Vi(3)", "y=Vj(3)", "s=Pm(1)"]
 
     # JAX KeOps
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']), jnp.array(data['sigma']))
 
     # PyTorch KeOps (ground truth)
@@ -142,7 +147,7 @@ def test_genred_reductions(reduction_op):
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
     # JAX KeOps
-    op_jax = Genred(formula, aliases, reduction_op=reduction_op, axis=1)
+    op_jax = Genred(formula, aliases, reduction_op=reduction_op, axis=1, dtype=get_dtype_str())
     result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
     # PyTorch KeOps (ground truth)
@@ -165,7 +170,7 @@ def test_formula_laplacian():
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
     # JAX KeOps
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
     # PyTorch KeOps (ground truth)
@@ -184,7 +189,7 @@ def test_formula_cauchy():
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
     # JAX KeOps
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     result_jax = op_jax(jnp.array(data['x']), jnp.array(data['y']))
 
     # PyTorch KeOps (ground truth)
@@ -203,7 +208,7 @@ def test_formula_weighted_sum():
     aliases = ["x=Vi(3)", "y=Vj(3)", "b=Vj(3)", "s=Pm(1)"]
 
     # JAX KeOps
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     result_jax = op_jax(
         jnp.array(data['x']), jnp.array(data['y']),
         jnp.array(data['b']), jnp.array(data['sigma'])
@@ -333,7 +338,7 @@ def test_gradient_var(var_name):
         aliases = ["x=Vi(3)", "y=Vj(3)"]
 
         # JAX KeOps gradient
-        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         def forward_jax(x):
             return op_jax(x, jnp.array(data['y'])).sum()
         grad_jax = jax.grad(forward_jax)(jnp.array(data['x']))
@@ -353,7 +358,7 @@ def test_gradient_var(var_name):
         aliases = ["x=Vi(3)", "y=Vj(3)"]
 
         # JAX KeOps gradient
-        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         def forward_jax(y):
             return op_jax(jnp.array(data['x']), y).sum()
         grad_jax = jax.grad(forward_jax)(jnp.array(data['y']))
@@ -373,7 +378,7 @@ def test_gradient_var(var_name):
         aliases = ["x=Vi(3)", "y=Vj(3)", "s=Pm(1)"]
 
         # JAX KeOps gradient
-        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+        op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
         def forward_jax(s):
             return op_jax(jnp.array(data['x']), jnp.array(data['y']), s).sum()
         grad_jax = jax.grad(forward_jax)(jnp.array(data['sigma']))
@@ -424,7 +429,7 @@ def test_jit_genred():
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
     # JAX KeOps with JIT
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     @jax.jit
     def compute(x, y):
         return op_jax(x, y)
@@ -467,7 +472,7 @@ def test_jit_gradient():
     aliases = ["x=Vi(3)", "y=Vj(3)"]
 
     # JAX KeOps with JIT gradient
-    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1)
+    op_jax = Genred(formula, aliases, reduction_op='Sum', axis=1, dtype=get_dtype_str())
     @jax.jit
     def forward_and_grad(x, y):
         return jax.grad(lambda x: op_jax(x, y).sum())(x)

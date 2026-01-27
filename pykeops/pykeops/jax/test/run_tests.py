@@ -10,6 +10,7 @@ Main entry point for running the test suite.
 
 
 import sys
+import os
 import argparse
 import subprocess
 from pathlib import Path
@@ -32,7 +33,7 @@ def get_script_dir():
     return Path(__file__).parent
 
 
-def run_script(script_name: str, extra_args: list = None) -> int:
+def run_script(script_name: str, extra_args: list = None, env: dict = None) -> int:
     """Run a test script and return exit code."""
     script_path = get_script_dir() / script_name
 
@@ -44,7 +45,12 @@ def run_script(script_name: str, extra_args: list = None) -> int:
     if extra_args:
         cmd.extend(extra_args)
 
-    return subprocess.call(cmd)
+    # Merge custom env with current environment
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    return subprocess.call(cmd, env=run_env)
 
 
 def print_summary_table(results):
@@ -120,6 +126,8 @@ Test Suites:
     parser.add_argument('--no-pytorch', action='store_true', help='Skip PyTorch comparison tests')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     parser.add_argument('--save', '-s', action='store_true', help='Save results to file')
+    parser.add_argument('--float64', action='store_true',
+                       help='Run tests using float64 precision (default: float32)')
 
     args = parser.parse_args()
 
@@ -148,15 +156,25 @@ Test Suites:
             print(f"Unknown suite: {suite}")
             return 1
 
+    # Set up environment for float64 mode
+    test_env = {}
+    if args.float64:
+        test_env['KEOPS_TEST_FLOAT64'] = '1'
+        test_env['JAX_ENABLE_X64'] = '1'
+
     # Print Header
+    precision_str = "float64" if args.float64 else "float32"
     if RICH_AVAILABLE:
         console.rule("[bold blue]KeOps JAX Test Suite[/bold blue]")
-        console.print(f"Running suites: [cyan]{', '.join(suites)}[/cyan]\n")
+        precision_style = "[bold yellow]" if args.float64 else "[dim]"
+        console.print(f"Running suites: [cyan]{', '.join(suites)}[/cyan]")
+        console.print(f"Precision: {precision_style}{precision_str}[/]\n")
     else:
         print("=" * 70)
         print("KeOps JAX Test Suite".center(70))
         print("=" * 70)
-        print(f"Running: {', '.join(suites)}\n")
+        print(f"Running: {', '.join(suites)}")
+        print(f"Precision: {precision_str}\n")
 
     # Run tests
     results = {}
@@ -177,7 +195,7 @@ Test Suites:
         if args.verbose: extra_args.append('--verbose')
         if args.save: extra_args.append('--save')
 
-        exit_code = run_script(script, extra_args)
+        exit_code = run_script(script, extra_args, env=test_env)
         results[suite] = exit_code
 
         if exit_code != 0:
