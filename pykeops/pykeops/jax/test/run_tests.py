@@ -115,6 +115,7 @@ Test Suites:
   edge            Edge case tests (bugs found during development)
   advanced        Advanced features (Reductions, Math, Batches)
   batched         Batched (3D tensor) gradient tests vs PyTorch
+  helpers         Helper functions (generic_sum, generic_logsumexp, etc.)
   benchmark       Single-GPU performance benchmarks
   benchmark-multi Multi-GPU scaling benchmarks
   quick           Quick sanity check (subset of api tests)
@@ -138,13 +139,14 @@ Test Suites:
         'edge': 'test_edge_cases.py',
         'advanced': 'test_advanced.py',
         'batched': 'test_batched_gradients.py',
+        'helpers': 'test_helpers.py',
         'benchmark': 'test_benchmark_single_gpu.py',
         'benchmark-multi': 'test_benchmark_multi_gpu.py',
     }
 
     # Handle 'all' and 'quick'
     if 'all' in args.suites:
-        suites = ['edge', 'api', 'correctness', 'advanced', 'batched']
+        suites = ['edge', 'api', 'correctness', 'advanced', 'batched', 'helpers']
     elif 'quick' in args.suites:
         suites = ['edge']
     else:
