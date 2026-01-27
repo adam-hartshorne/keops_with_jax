@@ -542,7 +542,15 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                                     jax_args, use_ranges=is_batched_inner,
                                     opt_arg=opt_arg, formula2=formula2
                                 )
-                                dimout = getattr(myconv_orig, 'dim', getattr(myconv_orig, 'dimout', 1))
+                                dimout = getattr(myconv_orig, 'dim', None)
+                                if dimout is None:
+                                    dimout = getattr(myconv_orig, 'dimout', None)
+                                if dimout is None:
+                                    raise RuntimeError(
+                                        f"[KeOps JAX] Backend object has no 'dim' or 'dimout' attribute.\n"
+                                        f"  Formula: {formula}\n"
+                                        f"  This is an internal error - please report it."
+                                    )
                                 ffi_state['dimout'] = dimout
                             else:
                                 myconv_orig = None
@@ -588,7 +596,14 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                             ffi_state['registered'] = True
 
             if dimout is None:
-                dimout = ffi_state.get('dimout', 1)
+                dimout = ffi_state.get('dimout')
+                if dimout is None:
+                    raise RuntimeError(
+                        f"[KeOps JAX] Could not determine output dimension (dimout) for kernel.\n"
+                        f"  Formula: {formula}\n"
+                        f"  Aliases: {aliases}\n"
+                        f"  This is an internal error - please report it."
+                    )
 
             first_shape = jax_args[0].shape
             batch_size = int(first_shape[0]) if len(first_shape) == 3 else 1
