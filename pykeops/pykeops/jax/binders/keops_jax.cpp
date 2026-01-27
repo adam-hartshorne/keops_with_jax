@@ -462,6 +462,26 @@ ffi::Error KeOpsKernelImpl(
     size_t total_offsets = kernel.nvi_count + kernel.nvj_count + kernel.nvp_count;
     if (total_offsets == 0) total_offsets = 2;
 
+    // Overflow protection: limit scratch allocation to 4GB
+    // This prevents integer overflow in size calculations for extremely large inputs
+    constexpr size_t MAX_SCRATCH_BYTES = 4ULL * 1024 * 1024 * 1024;  // 4GB
+    constexpr size_t MAX_SAFE_MULTIPLY = MAX_SCRATCH_BYTES / sizeof(int64_t);
+
+    // Check for potential overflow before computing sizes
+    if (nblocks > 0 && total_offsets > MAX_SAFE_MULTIPLY / nblocks) {
+        return ffi::Error::Internal(
+            "Scratch size overflow: nblocks=" + std::to_string(nblocks) +
+            " * total_offsets=" + std::to_string(total_offsets) + " exceeds safe limit");
+    }
+    if (nblocks > MAX_SAFE_MULTIPLY / 3) {
+        return ffi::Error::Internal(
+            "Scratch size overflow: nblocks=" + std::to_string(nblocks) + " * 3 exceeds safe limit");
+    }
+    if (batch_size > MAX_SAFE_MULTIPLY / 2) {
+        return ffi::Error::Internal(
+            "Scratch size overflow: batch_size=" + std::to_string(batch_size) + " * 2 exceeds safe limit");
+    }
+
     // USE int64_t (64-bit) to match kernel signature
     size_t size_offsets = sizeof(int64_t) * nblocks * total_offsets;
     size_t size_lookup  = sizeof(int64_t) * 3 * nblocks;
