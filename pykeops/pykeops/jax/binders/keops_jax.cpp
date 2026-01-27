@@ -37,6 +37,53 @@ static const bool KEOPS_DEBUG = []() {
 }();
 
 // =============================================================================
+// CUDA Device Guard (RAII for safe device restoration)
+// =============================================================================
+
+/**
+ * CudaDeviceGuard - RAII wrapper for CUDA device context management.
+ *
+ * Saves the current CUDA device on construction and restores it on destruction,
+ * ensuring proper cleanup even if exceptions are thrown. This prevents silent
+ * device context corruption where a thread remains on the wrong GPU.
+ */
+class CudaDeviceGuard {
+public:
+    CudaDeviceGuard() : original_device_(-1), valid_(false) {
+        cudaError_t err = cudaGetDevice(&original_device_);
+        if (err == cudaSuccess) {
+            valid_ = true;
+        } else if (KEOPS_DEBUG) {
+            std::cerr << "[KeOps] Warning: cudaGetDevice failed in CudaDeviceGuard: "
+                      << cudaGetErrorString(err) << std::endl;
+        }
+    }
+
+    ~CudaDeviceGuard() {
+        if (valid_) {
+            cudaError_t err = cudaSetDevice(original_device_);
+            if (err != cudaSuccess && KEOPS_DEBUG) {
+                std::cerr << "[KeOps] Warning: Failed to restore CUDA device "
+                          << original_device_ << ": " << cudaGetErrorString(err) << std::endl;
+            }
+        }
+    }
+
+    // Non-copyable, non-movable
+    CudaDeviceGuard(const CudaDeviceGuard&) = delete;
+    CudaDeviceGuard& operator=(const CudaDeviceGuard&) = delete;
+    CudaDeviceGuard(CudaDeviceGuard&&) = delete;
+    CudaDeviceGuard& operator=(CudaDeviceGuard&&) = delete;
+
+    bool is_valid() const { return valid_; }
+    int original_device() const { return original_device_; }
+
+private:
+    int original_device_;
+    bool valid_;
+};
+
+// =============================================================================
 // CUDA Kernel Function Signature
 // =============================================================================
 
@@ -260,9 +307,8 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
         throw std::runtime_error("No CUDA devices available");
     }
 
-    // Save current device to restore later
-    int original_device;
-    cudaGetDevice(&original_device);
+    // RAII guard to restore CUDA device on scope exit (even if exception thrown)
+    CudaDeviceGuard device_guard;
 
     // Check if already registered on ALL devices
     bool all_registered = true;
@@ -356,8 +402,7 @@ void register_keops_kernel(uint64_t kernel_id, nb::object myconv) {
         g_registry_version.fetch_add(1, std::memory_order_release);
     }
 
-    // Restore original device
-    cudaSetDevice(original_device);
+    // Device automatically restored by CudaDeviceGuard destructor
 }
 
 // =============================================================================
