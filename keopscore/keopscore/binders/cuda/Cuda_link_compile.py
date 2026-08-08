@@ -108,8 +108,63 @@ class Cuda_link_compile(LinkCompile):
 
         cuda_include = cuda_config.get_cuda_include_path()
 
+        # Resolve nvcc to an absolute path so the subprocess shell
+        # doesn't need /usr/local/cuda/bin in $PATH. Some launchers
+        # (PyCharm/IDE run-configs, restricted login shells) start
+        # the Python process with a PATH that omits CUDA — causing
+        # `/bin/sh: 1: nvcc: not found` followed by a misleading
+        # "CMake compilation succeeded but .so file not found" error.
+        #
+        # Defence in depth:
+        # 1. Try `shutil.which("nvcc")` — works when CUDA is on PATH.
+        # 2. If that returns None, inject common CUDA bin dirs into
+        #    `os.environ['PATH']` and retry. This also fixes the
+        #    subprocess shell's PATH because subprocess inherits the
+        #    parent's environment.
+        # 3. As a final fallback, scan a hardcoded list of common
+        #    install locations for an `nvcc` binary that exists +
+        #    is executable.
+        import shutil as _shutil
+        import os as _os
+        _nvcc_path = _shutil.which("nvcc")
+        if _nvcc_path is None:
+            _candidate_bins = [
+                "/usr/local/cuda/bin",
+                "/usr/local/cuda-13.0/bin",
+                "/usr/local/cuda-12.8/bin",
+                "/usr/local/cuda-12.6/bin",
+                "/usr/local/cuda-12.4/bin",
+                "/usr/local/cuda-12.2/bin",
+                "/usr/local/cuda-12.1/bin",
+                "/usr/local/cuda-12.0/bin",
+                "/opt/cuda/bin",
+            ]
+            _existing = [p for p in _candidate_bins if _os.path.isdir(p)]
+            if _existing:
+                # Inject into the parent's PATH so the subprocess
+                # shell inherits them too.
+                _cur = _os.environ.get("PATH", "")
+                _missing = [p for p in _existing
+                            if p not in _cur.split(_os.pathsep)]
+                if _missing:
+                    _os.environ["PATH"] = _os.pathsep.join(
+                        _missing + ([_cur] if _cur else []))
+                _nvcc_path = _shutil.which("nvcc")
+            if _nvcc_path is None:
+                # Last-ditch: probe candidates directly for an
+                # executable file.
+                for _bin_dir in _candidate_bins:
+                    _candidate = _os.path.join(_bin_dir, "nvcc")
+                    if (_os.path.isfile(_candidate)
+                            and _os.access(_candidate, _os.X_OK)):
+                        _nvcc_path = _candidate
+                        break
+                else:
+                    _nvcc_path = "nvcc"  # final fallback — will fail
+                                          # the same way as before
+
         compile_flags = [
-            "nvcc",
+            _nvcc_path,
             "-shared",
             "-Xcompiler", "-fPIC",
             "-O3",
