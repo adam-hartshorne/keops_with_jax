@@ -302,15 +302,33 @@ can fix that, unlike the case above. `pykeops.torch` handles it. It now raises
 `NotImplementedError` rather than returning a wrong answer; the real fix is
 per-argument strides in the launcher.
 
-### 2. No vmap batching rule on the JAX primitive
+### 2. jax.vmap is refused (decided 2026-09-03)
 
-`jax.vmap` over a KeOps reduction is silently wrong (GSED's `gsed/varifold.py` records "~7000x
-wrong and negative" on a quantity that cannot be negative). Both `ffi_call` sites pass
-`vmap_method="broadcast_all"` (`generic_ops.py:455` and `:699`), so JAX maps happily over a handler
-that knows nothing about the extra axis. KeOps batch dimensions are the correct route and work.
-A rule that raises `NotImplementedError` would turn the silent wrong answer into an error; a real
-rule mapping vmap onto batch dimensions would be the full fix. The `KernelSolve.__call__` docstring
-claims vmap compatibility and should be corrected along with it.
+`jax.vmap` over a KeOps reduction used to return an array of the right shape holding the wrong
+numbers: max error 4.9 against numpy on a 3x5x7 Gaussian, and GSED's `gsed/varifold.py` records
+"~7000x wrong and negative" on a quantity that cannot be negative. The FFI call has no batching
+rule, so JAX mapped over a handler that knows nothing about the extra axis.
+
+It is refused in two places, and it needs both:
+
+- `_reject_vmap` (`generic_ops.py:259`) raises `NotImplementedError` naming KeOps batch dimensions
+  as the route. It spots the vmap tracer by class name, since `BatchTracer` moved to `jax._src` in
+  JAX 0.11 and is no longer re-exported from `jax.interpreters.batching`.
+- Both `ffi_call` sites pass `vmap_method=None` (`generic_ops.py:483` and `:730`), which makes JAX
+  itself refuse to batch the primitive.
+
+The guard alone is not enough. It only sees the arguments handed to the Python wrapper, so under
+`vmap(jit(op))` those are jit tracers, the batching happens outside on the compiled jaxpr, and with
+the previous `vmap_method="broadcast_all"` that route returned wrong numbers with max error 5.05.
+`vmap_method=None` closes it. Measured across `vmap(Genred)`, `vmap(jit(...))`, `jit(vmap(...))`,
+LazyTensor, KernelSolve and `jacrev`: all refuse.
+
+Refusing rather than fixing is a decision. `vmap_method="sequential"` makes vmap correct in one
+word, measured, but calls the kernel once per sample: 3.24 ms against 0.17 ms for the same work
+through batch dimensions at B=32, N=M=4000. That trades a wrong answer for a quiet 19x slowdown,
+and batch dimensions are both correct and faster. `jax.jacrev` maps internally and now raises where
+it was silently wrong; `jax.jacfwd` already failed on `custom_vjp` for a separate reason. Covered
+by `test_advanced.py`, section 4.
 
 ### 3. Async dispatch (planned, not started)
 

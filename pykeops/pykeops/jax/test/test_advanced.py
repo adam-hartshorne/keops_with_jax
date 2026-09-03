@@ -266,7 +266,94 @@ def test_batched(mode, n=50, m=40, d=3, batch=3):
 
 
 # =============================================================================
-# 4. Higher Order Grads
+# 4. Unsupported transformations
+# =============================================================================
+
+def _vmap_fail(message):
+    """run_test formats the second element as a float, so print the detail rather than return it."""
+    print_warning(message)
+    return False, float("inf")
+
+
+def test_vmap_raises():
+    """jax.vmap over a KeOps reduction must raise, not answer wrongly.
+
+    The FFI call knows nothing about a mapped axis, so until it was refused vmap returned an array
+    of the right shape with the wrong numbers in it: max error 4.9 against numpy on B=3, M=5, N=7.
+    KeOps batch dimensions are the supported route, and are ~19x faster than the sequential vmap
+    JAX can offer, so this is refused rather than made to work slowly.
+    """
+    data = generate_data_np(20, 15, 3, batch=3)
+    x, y = jnp.array(data['x']), jnp.array(data['y'])
+    op = Genred("Exp(-SqDist(x,y))", ["x=Vi(3)", "y=Vj(3)"], reduction_op='Sum', axis=1,
+                dtype=get_dtype_str())
+    try:
+        jax.vmap(op)(x, y)
+    except NotImplementedError as e:
+        if "batch dimension" not in str(e):
+            return _vmap_fail(f"raised without naming batch dimensions: {str(e)[:70]}")
+        return True, 0.0
+    except Exception as e:
+        return _vmap_fail(f"raised {type(e).__name__}, expected NotImplementedError")
+    return _vmap_fail("jax.vmap silently returned a result")
+
+
+def test_vmap_of_jit_raises():
+    """A jit between vmap and the reduction must not smuggle it past the guard.
+
+    _reject_vmap only sees the arguments handed to the Python wrapper. Under vmap(jit(op)) those
+    are jit tracers, and the batching happens outside on the compiled jaxpr, so the guard never
+    fires and the ffi_call batching rule decides. With vmap_method="broadcast_all" that returned
+    the right shape holding the wrong numbers, max error 5.05 against numpy.
+    """
+    data = generate_data_np(20, 15, 3, batch=3)
+    x, y = jnp.array(data['x']), jnp.array(data['y'])
+    op = Genred("Exp(-SqDist(x,y))", ["x=Vi(3)", "y=Vj(3)"], reduction_op='Sum', axis=1,
+                dtype=get_dtype_str())
+    try:
+        jax.vmap(jax.jit(op))(x, y)
+    except NotImplementedError:
+        return True, 0.0
+    except Exception as e:
+        return _vmap_fail(f"raised {type(e).__name__}, expected NotImplementedError")
+    return _vmap_fail("jax.vmap(jax.jit(op)) silently returned a result")
+
+
+def test_vmap_of_grad_raises():
+    """The gradient path must refuse it too, which is also what jax.jacrev and jacfwd hit."""
+    data = generate_data_np(20, 15, 3, batch=3)
+    x, y = jnp.array(data['x']), jnp.array(data['y'])
+    op = Genred("Exp(-SqDist(x,y))", ["x=Vi(3)", "y=Vj(3)"], reduction_op='Sum', axis=1,
+                dtype=get_dtype_str())
+
+    def loss(a, b):
+        return jnp.sum(op(a, b))
+
+    try:
+        jax.vmap(jax.grad(loss))(x, y)
+    except NotImplementedError:
+        return True, 0.0
+    except Exception as e:
+        return _vmap_fail(f"raised {type(e).__name__}, expected NotImplementedError")
+    return _vmap_fail("jax.vmap of grad silently returned a result")
+
+
+def test_batch_dims_still_work():
+    """The route the error points at must keep working: same formula, leading batch axis."""
+    data = generate_data_np(20, 15, 3, batch=3)
+    x, y = jnp.array(data['x']), jnp.array(data['y'])
+    op = Genred("Exp(-SqDist(x,y))", ["x=Vi(3)", "y=Vj(3)"], reduction_op='Sum', axis=1,
+                dtype=get_dtype_str())
+    got = np.asarray(op(x, y))
+
+    op_t = Genred_torch("Exp(-SqDist(x,y))", ["x=Vi(3)", "y=Vj(3)"], reduction_op='Sum', axis=1)
+    ref = op_t(torch.tensor(data['x'], device='cuda'),
+               torch.tensor(data['y'], device='cuda')).cpu().numpy()
+    return compare_arrays(got, ref, rtol=RTOL, atol=ATOL)
+
+
+# =============================================================================
+# 5. Higher Order Grads
 # =============================================================================
 
 def test_hessian():
@@ -579,8 +666,14 @@ def main():
     run_test("Batched SqDist", lambda: test_batched("SqDist"), suite)
     run_test("Batched Gaussian", lambda: test_batched("Gaussian"), suite)
 
-    # 4. Higher Order
-    print_subheader("4. Higher Order Gradients")
+    print_subheader("4. Unsupported Transformations")
+    run_test("jax.vmap raises", test_vmap_raises, suite)
+    run_test("jax.vmap of grad raises", test_vmap_of_grad_raises, suite)
+    run_test("jax.vmap of jit raises", test_vmap_of_jit_raises, suite)
+    run_test("batch dimensions still work", test_batch_dims_still_work, suite)
+
+    # 5. Higher Order
+    print_subheader("5. Higher Order Gradients")
     run_test("Hessian-Vector (Limitation Check)", test_hessian, suite)
 
     # 5. Formulas

@@ -256,6 +256,30 @@ def _batch_info(args, var_cats):
     return True, batch_size
 
 
+def _reject_vmap(args):
+    """Refuse jax.vmap over a KeOps reduction instead of answering wrongly.
+
+    The FFI call has no batching rule. Under vmap it used to run with `vmap_method="broadcast_all"`,
+    which returned an array of the right shape holding the wrong numbers (max error 4.9 against
+    numpy on a 3x5x7 Gaussian). JAX can offer `vmap_method="sequential"`, which is correct but calls
+    the kernel once per sample: measured 3.24 ms against 0.17 ms for the same work through KeOps
+    batch dimensions, so it would trade a wrong answer for a quiet 19x slowdown. Batch dimensions
+    are the supported route, so say so.
+
+    Detected by class name: BatchTracer moved to jax._src in JAX 0.11 and is no longer re-exported
+    from jax.interpreters.batching, so importing it would pin this to a private path.
+    """
+    for arg in args:
+        if type(arg).__name__ == "BatchTracer":
+            raise NotImplementedError(
+                "[KeOps JAX] jax.vmap over a KeOps reduction is not supported: the FFI call has no "
+                "batching rule, so it would return a plausible-looking wrong answer. Use a KeOps "
+                "batch dimension instead, passing (B, M, D) arrays straight to the reduction, which "
+                "is correct and about 19x faster than a per-sample vmap. jax.jacrev and jax.jacfwd "
+                "map internally and reach this too."
+            )
+
+
 def _broadcast_batch_dims(args, var_cats):
     """Expand size-one batch axes so every batched argument shares one batch size.
 
@@ -268,6 +292,7 @@ def _broadcast_batch_dims(args, var_cats):
     Call this outside the custom_vjp. jnp.broadcast_to is differentiable, so JAX
     sums the cotangent of an expanded argument back to its own shape.
     """
+    _reject_vmap(args)
     is_batched, batch_size = _batch_info(args, var_cats)
     if not is_batched or batch_size == 1:
         return tuple(args)
@@ -452,7 +477,10 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
             output = jax.ffi.ffi_call(
                 target_name,
                 result,
-                vmap_method="broadcast_all",
+                # None, so JAX refuses to batch this call. "broadcast_all" returned the right
+                # shape holding the wrong numbers (max error 5.05) whenever a jit sat between
+                # vmap and the reduction, where _reject_vmap cannot see the batch tracer.
+                vmap_method=None,
                 has_side_effect=False
             )(*reordered_args, kernel_id=int(kernel_id), batch_size=int(batch_size))
 
@@ -696,7 +724,10 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
             output = jax.ffi.ffi_call(
                 target_name,
                 result,
-                vmap_method="broadcast_all",
+                # None, so JAX refuses to batch this call. "broadcast_all" returned the right
+                # shape holding the wrong numbers (max error 5.05) whenever a jit sat between
+                # vmap and the reduction, where _reject_vmap cannot see the batch tracer.
+                vmap_method=None,
                 has_side_effect=False
             )(*jax_args,
               kernel_id=int(kernel_id),

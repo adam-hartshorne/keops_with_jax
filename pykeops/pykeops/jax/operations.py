@@ -207,8 +207,9 @@ class KernelSolve:
         """
         Solve the kernel linear system (αI + K)a = b.
 
-        This method is JIT-compatible and can be used inside jax.jit, jax.grad,
-        and jax.vmap transformations.
+        This method is JIT-compatible and can be used inside jax.jit and jax.grad.
+        jax.vmap is not supported and raises: use a KeOps batch dimension, passing
+        (B, M, D) arrays, which is the faster route anyway.
 
         Args:
             *args: Input arrays matching the aliases. The array at position
