@@ -332,6 +332,13 @@ and batch dimensions are both correct and faster. `jax.jacrev` maps internally a
 it was silently wrong; `jax.jacfwd` already failed on `custom_vjp` for a separate reason. Covered
 by `test_advanced.py`, section 4.
 
+A scan of every project importing `pykeops.jax` on 2026-09-03 found exactly one caller that
+vmaps a KeOps kernel, `toy_neural_process/erwin_varifold_weight_learner.py:472`, whose RKHS
+errors have therefore always been wrong. It is deliberately left alone: it is a different
+project, and failing loudly there is the point of this change. Everything else (GSED,
+gmtools, flow_to_glow, pptf) already uses batch dimensions and carries its own notes saying
+so.
+
 ### 3. Async dispatch (planned, not started)
 
 `PLAN_JAX_ASYNC_DISPATCH.md` (2026-09-02) makes the binder's end-of-handler
