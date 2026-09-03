@@ -204,6 +204,81 @@ def _parse_aliases(aliases: List[str]) -> Tuple[List[str], List[int], List[int]]
     return var_names, var_dims, var_cats
 
 
+def _batch_info(args, var_cats):
+    """Inspect the batch axis of every argument. Returns (is_batched, batch_size).
+
+    "i" and "j" variables carry their batch size in axis 0 of a 3D array.
+    Parameters are allowed to keep a lower rank, since they do not vary with the
+    batch, so they are ignored here.
+
+    Raises when the shapes cannot be reconciled, rather than letting the kernel
+    read whatever happens to sit past the end of a buffer.
+    """
+    var_shapes = [tuple(getattr(a, "shape", ())) for a, c in zip(args, var_cats) if c != 2]
+    if not var_shapes:
+        return False, 1
+
+    ranks = {len(s) for s in var_shapes}
+    if max(ranks) < 3:
+        return False, 1
+    if max(ranks) > 3:
+        raise NotImplementedError(
+            f"[KeOps JAX] Only one batch dimension is supported: the 'i' and 'j' "
+            f"variables have shapes {var_shapes}. Flatten the leading axes into a "
+            f"single batch dimension before the reduction."
+        )
+    if len(ranks) > 1:
+        raise ValueError(
+            f"[KeOps JAX] Cannot mix batched and unbatched arguments: the 'i' and 'j' "
+            f"variables have shapes {var_shapes}. KeOps supports broadcasting on the "
+            f"batch dimension but still expects explicit unit dimensions, so pass "
+            f"(1, M, D) rather than (M, D)."
+        )
+
+    batches = {s[0] for s in var_shapes}
+    batch_size = max(batches)
+    if batches - {1, batch_size}:
+        raise ValueError(
+            f"[KeOps JAX] Incompatible batch dimensions: {sorted(batches)}. Every "
+            f"batched argument must have batch size 1 or {batch_size}."
+        )
+
+    for arg, cat in zip(args, var_cats):
+        shape = tuple(getattr(arg, "shape", ()))
+        if cat == 2 and len(shape) == 3 and shape[0] != 1:
+            raise NotImplementedError(
+                f"[KeOps JAX] A parameter (Pm) that varies along the batch dimension is "
+                f"not supported: got shape {shape}. The ranges launcher reads "
+                f"every parameter at offset 0, so only a shared parameter is correct here. "
+                f"Pass it with batch size 1, or turn it into a Vi/Vj variable."
+            )
+
+    return True, batch_size
+
+
+def _broadcast_batch_dims(args, var_cats):
+    """Expand size-one batch axes so every batched argument shares one batch size.
+
+    NumPy and pykeops.torch reuse a batch axis of size one for every sample. The
+    JAX ranges launcher cannot: it gives each 'i' variable a batch stride of nx
+    and each 'j' variable a stride of ny, so it is only correct when all batched
+    arguments have the same batch size. Expanding here gives the same answer and
+    keeps that assumption true.
+
+    Call this outside the custom_vjp. jnp.broadcast_to is differentiable, so JAX
+    sums the cotangent of an expanded argument back to its own shape.
+    """
+    is_batched, batch_size = _batch_info(args, var_cats)
+    if not is_batched or batch_size == 1:
+        return tuple(args)
+
+    out = list(args)
+    for i, (arg, cat) in enumerate(zip(args, var_cats)):
+        if cat != 2 and arg.shape[0] == 1:
+            out[i] = jnp.broadcast_to(arg, (batch_size,) + tuple(arg.shape[1:]))
+    return tuple(out)
+
+
 @lru_cache(maxsize=1024)
 def _compute_kernel_hash(formula: str, aliases: tuple, reduction_op: str,
                          axis: int, dtype_str: str, batch_key: str, is_grad: bool = False) -> Tuple[int, str]:
@@ -219,8 +294,14 @@ def _compute_kernel_hash(formula: str, aliases: tuple, reduction_op: str,
 
 @lru_cache(maxsize=2048)
 def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
-                                  axis: int, dimout: int, target_cat: int = None) -> Tuple[int, ...]:
-    """Cached version of output shape computation."""
+                                  axis: int, dimout: int, target_cat: int = None,
+                                  is_batched: bool = False, batch_size: int = 1) -> Tuple[int, ...]:
+    """Cached version of output shape computation.
+
+    `is_batched` and `batch_size` come from _batch_info, which looks at every
+    'i' and 'j' variable. Reading them off args_shapes[0] instead would give the
+    wrong batch whenever the first argument is the broadcast one.
+    """
     if not args_shapes:
         raise ValueError(
             "[KeOps JAX] No input shapes provided for output shape computation. "
@@ -234,12 +315,9 @@ def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
             "Check formula syntax and variable dimensions."
         )
 
-    first_shape = args_shapes[0]
-    ndims = len(first_shape)
     num_args = len(args_shapes)
 
-    if ndims == 3:
-        batch_size = first_shape[0]
+    if is_batched:
         # For Pm (parameter) gradients, we should NOT use target_cat to determine
         # the output size. The kernel still outputs over the non-reduced dimension.
         if target_cat is not None and target_cat != 2:
@@ -297,18 +375,21 @@ def _compute_output_shape_cached(args_shapes: tuple, var_cats: tuple,
             return (args_shapes[0][0], dimout)
 
 
-def _compute_output_shape(args, var_cats, axis, dimout, target_cat=None):
+def _compute_output_shape(args, var_cats, axis, dimout, target_cat=None,
+                          is_batched=False, batch_size=1):
     """Wrapper for cached shape computation."""
     args_shapes = tuple(tuple(arg.shape) for arg in args)
-    return _compute_output_shape_cached(args_shapes, tuple(var_cats), axis, dimout, target_cat)
+    return _compute_output_shape_cached(args_shapes, tuple(var_cats), axis, dimout,
+                                        target_cat, is_batched, batch_size)
 
 
 def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dtype_str, input_dim, var_cat, enable_vjp=True):
     """Create gradient operator."""
 
+    _, _, var_cats_grad = _parse_aliases(list(grad_aliases))
+
     def grad_op_impl(*args):
-        first_shape = args[0].shape
-        is_batched = len(first_shape) == 3
+        is_batched, batch_size = _batch_info(args, var_cats_grad)
         batch_key = "3d" if is_batched else "2d"
 
         kernel_id, target_name = _compute_kernel_hash(
@@ -331,10 +412,9 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
                     # Register C++ kernel if needed
                     if not cpp_registered:
                         try:
-                            is_batched_inner = len(jax_args[0].shape) == 3
                             myconv_grad = _create_keops_backend(
                                 grad_formula, list(grad_aliases), reduction_op, grad_axis, dtype_str,
-                                jax_args, use_ranges=is_batched_inner
+                                jax_args, use_ranges=is_batched
                             )
                             keops_jax_ext.register_keops_kernel(kernel_id, myconv_grad)
                         except Exception as e:
@@ -363,12 +443,10 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
 
             reordered_args = jax_args
             dimout = input_dim
-            var_names_grad, var_dims_grad, var_cats_grad = _parse_aliases(list(grad_aliases))
 
-            first_shape = jax_args[0].shape
-            batch_size = int(first_shape[0]) if len(first_shape) == 3 else 1
-
-            output_shape = _compute_output_shape(jax_args, var_cats_grad, grad_axis, dimout, target_cat=var_cat)
+            output_shape = _compute_output_shape(jax_args, var_cats_grad, grad_axis, dimout,
+                                                 target_cat=var_cat, is_batched=is_batched,
+                                                 batch_size=batch_size)
             result = jax.ShapeDtypeStruct(shape=output_shape, dtype=jax_args[0].dtype)
 
             output = jax.ffi.ffi_call(
@@ -383,7 +461,10 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
         return ffi_wrapper(*args)
 
     if not enable_vjp:
-        return grad_op_impl
+        def grad_op_broadcast(*args):
+            return grad_op_impl(*_broadcast_batch_dims(args, var_cats_grad))
+
+        return grad_op_broadcast
 
     @jax.custom_vjp
     def grad_op_with_vjp(*args):
@@ -400,7 +481,12 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
 
     grad_op_with_vjp.defvjp(grad_op_with_vjp_fwd, grad_op_with_vjp_bwd)
 
-    return grad_op_with_vjp
+    # Broadcast outside the custom_vjp, so JAX differentiates the expansion
+    # itself and sums each cotangent back to the caller's own shape.
+    def grad_op_broadcast(*args):
+        return grad_op_with_vjp(*_broadcast_batch_dims(args, var_cats_grad))
+
+    return grad_op_broadcast
 
 
 def _patch_nvcc_flags():
@@ -482,8 +568,7 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
             })
 
     def keops_jax_op_impl(*args):
-        first_shape = args[0].shape
-        is_batched = len(first_shape) == 3
+        is_batched, batch_size = _batch_info(args, var_cats)
         batch_key = "3d" if is_batched else "2d"
 
         if batch_key not in kernel_cache:
@@ -514,7 +599,6 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                 with _registration_lock:
                     if not ffi_state['registered']:
                         keops_jax_ext = _get_keops_ext()
-                        is_batched_inner = len(jax_args[0].shape) == 3
 
                         already_registered = (
                             hasattr(keops_jax_ext, 'is_kernel_registered') and
@@ -539,7 +623,7 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                             if dimout is None:
                                 myconv_orig = _create_keops_backend(
                                     formula, list(aliases), reduction_op, axis, dtype_str,
-                                    jax_args, use_ranges=is_batched_inner,
+                                    jax_args, use_ranges=is_batched,
                                     opt_arg=opt_arg, formula2=formula2
                                 )
                                 dimout = getattr(myconv_orig, 'dim', None)
@@ -560,7 +644,7 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                                 if myconv_orig is None:
                                     myconv_orig = _create_keops_backend(
                                         formula, list(aliases), reduction_op, axis, dtype_str,
-                                        jax_args, use_ranges=is_batched_inner,
+                                        jax_args, use_ranges=is_batched,
                                         opt_arg=opt_arg, formula2=formula2
                                     )
                                 try:
@@ -605,10 +689,8 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                         f"  This is an internal error - please report it."
                     )
 
-            first_shape = jax_args[0].shape
-            batch_size = int(first_shape[0]) if len(first_shape) == 3 else 1
-
-            output_shape = _compute_output_shape(jax_args, var_cats, axis, dimout)
+            output_shape = _compute_output_shape(jax_args, var_cats, axis, dimout,
+                                                 is_batched=is_batched, batch_size=batch_size)
             result = jax.ShapeDtypeStruct(shape=output_shape, dtype=jax_args[0].dtype)
 
             output = jax.ffi.ffi_call(
@@ -625,7 +707,10 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
         return ffi_wrapper(*args)
 
     if not enable_vjp:
-        return keops_jax_op_impl
+        def keops_op_broadcast(*args):
+            return keops_jax_op_impl(*_broadcast_batch_dims(args, var_cats))
+
+        return keops_op_broadcast
 
     @jax.custom_vjp
     def keops_jax_op(*args):
@@ -726,7 +811,15 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
         return tuple(results)
 
     keops_jax_op.defvjp(keops_jax_op_fwd, keops_jax_op_bwd)
-    return keops_jax_op
+
+    # Broadcast outside the custom_vjp: the residuals saved by the forward pass
+    # are then already expanded, so the gradient kernels see one batch size, and
+    # JAX differentiates the expansion itself to sum each cotangent back to the
+    # caller's own shape.
+    def keops_op_broadcast(*args):
+        return keops_jax_op(*_broadcast_batch_dims(args, var_cats))
+
+    return keops_op_broadcast
 
 
 def keops_reduction(formula, aliases, reduction_op='Sum', axis=0, dtype='float32', enable_vjp=True, opt_arg=None, formula2=None):
