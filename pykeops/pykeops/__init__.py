@@ -97,11 +97,21 @@ def get_build_folder():
     return keops_get_build_folder()
 
 
-if numpy_found:
-    from .numpy.test_install import test_numpy_bindings
+# Resolved on first attribute access, not at import (PEP 562). `from .torch.test_install import
+# test_torch_bindings` pulls pykeops.torch and therefore torch: measured 2026-09-03 at ~0.6 s and
+# ~450 MB of the 1.08 s and 660 MB that `import pykeops.jax` used to cost, for a diagnostic the
+# caller invokes by hand. Both `pykeops.test_torch_bindings()` and
+# `from pykeops import test_torch_bindings` still work; only the timing of the import moves.
+def __getattr__(name):
+    if name == "test_numpy_bindings" and numpy_found:
+        from .numpy.test_install import test_numpy_bindings
 
-if torch_found:
-    from .torch.test_install import test_torch_bindings
+        return test_numpy_bindings
+    if name == "test_torch_bindings" and torch_found:
+        from .torch.test_install import test_torch_bindings
+
+        return test_torch_bindings
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # next line is to ensure that cache file for formulas is loaded at import
 from .common import keops_io

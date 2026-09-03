@@ -365,22 +365,48 @@ allocation and OOMs on one card, so it ran at `groups: 2`, one card's share of t
 That biases the result in the safe direction: at the real per-card load the step is longer and the
 share smaller.
 
-### 4. Both frameworks get imported whenever KeOps is used
+### 4. Importing pykeops.jax no longer pulls in torch (fixed 2026-09-03)
 
-Measured in fresh processes on 2026-09-03: after `import pykeops.jax`, `torch` and `pykeops.torch`
-are in `sys.modules`; after `import pykeops.torch` alone `jax` is not, but the first torch
-reduction imports it through the guarded `from jax import Array` in
-`pykeops/pykeops/common/get_options.py::_find_mem` (line 98). The site of the torch import on the
-JAX side is not yet traced (`pykeops/config.py:10` only probes with `find_spec`, which does not
-import; a finder hook broke KeOps's own import, so use
-`python -X importtime -c "import pykeops.jax"` instead). The cost is import time and resident
-memory, not correctness. It may be unavoidable, since KeOps was built around torch and numpy and
-the JAX binder reuses that plumbing; the things to look at are whether the JAX side can avoid the
-torch import, and whether `_find_mem` can classify by `type(var).__module__` instead of importing
-both frameworks.
+`pykeops/__init__.py` used to run `from .torch.test_install import test_torch_bindings` at import,
+guarded only by a `find_spec` probe, so `import pykeops.jax` pulled `pykeops.torch` and therefore
+torch. Both backend diagnostics are now resolved on first attribute access (PEP 562 module
+`__getattr__`), so `pykeops.test_torch_bindings()` and `from pykeops import test_torch_bindings`
+still work and nothing else changes. Measured over three runs each:
 
-One caution before removing it: on this machine the torch import is what makes JAX GPU linear
-algebra correct in a JAX-only process, because torch loads its pip CUDA libraries by explicit path
-ahead of the system CUDA that `~/.bashrc` puts on `LD_LIBRARY_PATH`. See
-`geometric_measure_theory_functions/docs/precision.md`. Removing the import without fixing that
-machine's `.bashrc` re-exposes every JAX-only script there.
+| `import pykeops.jax` | before | after |
+|---|---|---|
+| time | 1.08-1.13 s | 0.48-0.49 s |
+| peak RSS | 658-660 MB | 212-214 MB |
+| modules | 1776 | 929 |
+
+That import site was the only one: with it removed, `torch` is absent from `sys.modules` after
+`import pykeops.jax`.
+
+**What the torch import was accidentally hiding, and why it is safe to drop now.** `~/.bashrc` put
+`/usr/local/cuda/lib64` on `LD_LIBRARY_PATH`, which the loader searches before a binary's
+`DT_RUNPATH`. The system CUDA is 13.0 (cuBLAS 13.0.0.19) and the pip wheels ship cuBLAS 13.1.0.3,
+so a JAX-only process ended up with the wheel's `libcublas.so.13` and `libcublasLt.so.13` *and* the
+system's `libcublasLt.so.13.0.0.19` mapped together, because the system cuBLAS needs its own
+fully-versioned cuBLASLt. `jnp.linalg.cho_solve` then failed to launch outright ("Unable to launch
+triangular solve"). Importing torch first hid it: `torch/__init__.py::_load_global_deps()` loads its
+CUDA libraries by absolute path with `RTLD_GLOBAL` before anything else asks. KeOps does the same
+via `CDLL(found_path, mode=RTLD_GLOBAL)` in `keopscore/config/cuda.py`, which is why importing
+pykeops hid it too. JAX has the same mechanism
+(`jax_plugins/xla_cuda13/__init__.py::_load_nvidia_libraries`) and it is not sufficient, because it
+cannot stop the system cuBLAS dragging in its own cuBLASLt.
+
+The line was removed from `~/.bashrc` on 2026-09-03 (backup at `~/.bashrc.bak-2026-09-03`); the
+`PATH` export above it stays, since that is how `nvcc` is found. It should never have been there:
+NVIDIA's installation guide scopes that step to the runfile installer ("when using the runfile
+installation method, the LD_LIBRARY_PATH variable needs to contain /usr/local/cuda-X.Y/lib64"),
+while the `PATH` export is unconditional. This box was installed from the deb local repo, and
+package installs register the directory with ldconfig instead. The line came from a third-party
+guide that carried the runfile instruction into a deb workflow. Nothing needed the library path:
+the system CUDA is still discoverable through 69 entries in the ldconfig cache, an `nvcc`-built
+CUDA program compiles and runs correctly without it, and both KeOps backends compile fresh kernels.
+A torch-free JAX process now reports `lu 1.26e-06, cholesky 1.02e-06`.
+
+On a machine whose environment you cannot edit, the same fault returns whenever a system CUDA lib
+directory precedes the wheels on `LD_LIBRARY_PATH`. Strip it for the process you launch rather than
+globally, and keep `gmtools.jax`'s `check_linear_algebra()` as the tripwire: it raises at import
+with the full diagnosis.
