@@ -339,14 +339,31 @@ project, and failing loudly there is the point of this change. Everything else (
 gmtools, flow_to_glow, pptf) already uses batch dimensions and carries its own notes saying
 so.
 
-### 3. Async dispatch (planned, not started)
+### 3. Async dispatch (measured 2026-09-03, shelved)
 
-`PLAN_JAX_ASYNC_DISPATCH.md` (2026-09-02) makes the binder's end-of-handler
-`cudaStreamSynchronize` optional behind `JAX_KEOPS_ASYNC=1`, replacing its one real job, fencing
-the ranges launcher's pinned staging buffer, with a per-thread, per-device CUDA event. Opt-in, the
-old path byte-identical, and a test ladder that starts by measuring gsed. Read it before touching
-`pykeops/pykeops/jax/binders/keops_jax.cpp` or the launcher template in
-`keopscore/keopscore/binders/cuda/Cuda_link_compile.py`.
+The idea was to make the handler's closing `cudaStreamSynchronize` optional behind
+`JAX_KEOPS_ASYNC=1`, replacing its one real job (fencing the ranges launcher's thread-local pinned
+staging buffer) with a per-device CUDA event. The gate on it was: measure how much host-side Python
+gsed could hide, and drop the idea if the answer is around 10%. That measurement has now been run
+and the answer is **0.95%**, so it is not being done.
+
+Over 197 steps of `stage1_varifold.yaml` at one card's share of its 4-GPU batch: blocking step call
+518.01 ms, hideable Python 4.99 ms median (p95 5.69). gsed's step is 518 ms where the pairwise
+template fit's is 62.5 ms, and the Python per step is roughly constant at 5-11 ms either way, so the
+17% measured there does not carry over.
+
+The split matters more than the number. gsed uses the ranges path, so the pinned staging buffer and
+its fence are live there, and it runs on 4 GPUs, which is the one rung that cannot be tested on this
+machine: that is where the risk of silently wrong numbers sits, and it buys 1%. The pairwise fit has
+the 17%, but every one of its KeOps calls has `batch_size = 1` and takes the plain launcher, which
+has no pinned buffer and needs no fence at all. If it is ever revisited for that consumer, the flag
+and the sync skip alone would do it, with no fence and no ranges path involved.
+
+The measurement was made by wrapping `eqx.filter_jit` so every jitted call is timed, changing
+nothing in gsed's source. `stage1_varifold.yaml`'s full 80-mesh batch wants a single 17.87 GiB
+allocation and OOMs on one card, so it ran at `groups: 2`, one card's share of the 4-GPU recipe.
+That biases the result in the safe direction: at the real per-card load the step is longer and the
+share smaller.
 
 ### 4. Both frameworks get imported whenever KeOps is used
 
