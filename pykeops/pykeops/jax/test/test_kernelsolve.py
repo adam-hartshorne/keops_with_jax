@@ -9,6 +9,13 @@ Tests:
 4. Gradient computation through the solve
 """
 
+import pytest
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
+
 import numpy as np
 import jax.numpy as jnp
 import jax

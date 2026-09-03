@@ -1,3 +1,10 @@
+import pytest
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -6,7 +13,7 @@ from pykeops.jax import LazyTensor as LazyTensor_jax
 from pykeops.torch import LazyTensor as LazyTensor_torch
 
 
-def test_at_scale(B, N, M, name=""):
+def check_at_scale(B, N, M, name=""):
     """Test JAX vs PyTorch KeOps at specific scale."""
     print(f"\n{'=' * 60}")
     print(f"Testing: {name} (B={B}, N={N}, M={M})")
@@ -137,25 +144,35 @@ def test_at_scale(B, N, M, name=""):
 
     # Compare
     loss_diff = abs(loss_torch - loss_jax)
+    # Relative, like grad_rel_diff below. The loss is a sum over N*M terms, so it grows with the
+    # problem: 0.10 at the smallest scale here and 1.0e7 at the largest. An absolute bound holds
+    # at one end and cannot be met at the other, since float32 carries ~1.2e-7 of relative error
+    # whatever the magnitude. Measured 2026-09-03 over five runs: usually exact at the three small
+    # scales and 1.1e-7 at the two large ones, but one run of the 191-magnitude case came back at
+    # 3.8e-6, because the XLA reduce after the kernel picks its algorithm per process. 1e-4 keeps
+    # 26x headroom over the worst seen, and the gradient check below at 1e-2 is the real
+    # correctness signal: it is exact in every run.
+    loss_rel_diff = loss_diff / (abs(loss_torch) + 1e-10)
     grad_diff = np.abs(grad_torch - grad_jax).max()
     grad_rel_diff = grad_diff / (np.abs(grad_torch).max() + 1e-10)
 
     print(f"\nComparison:")
     print(f"  Loss diff: {loss_diff:.2e}")
+    print(f"  Loss relative diff: {loss_rel_diff:.2e}")
     print(f"  Grad max diff: {grad_diff:.2e}")
     print(f"  Grad relative diff: {grad_rel_diff:.2e}")
     print(f"  Any NaN (torch): {np.any(np.isnan(grad_torch))}")
     print(f"  Any NaN (jax): {np.any(np.isnan(grad_jax))}")
 
-    if loss_diff < 1e-3 and grad_rel_diff < 1e-2:
+    if loss_rel_diff < 1e-4 and grad_rel_diff < 1e-2:
         print("  ✓ PASS")
     else:
         print("  ✗ FAIL")
 
 
 # Run at different scales
-test_at_scale(2, 50, 40, "Small")
-test_at_scale(2, 500, 400, "Medium")
-test_at_scale(2, 5000, 4000, "Large")
-test_at_scale(4, 10000, 5000, "Very Large")
-test_at_scale(21, 98776, 25000, "Your actual size")  # This might OOM or take long
+check_at_scale(2, 50, 40, "Small")
+check_at_scale(2, 500, 400, "Medium")
+check_at_scale(2, 5000, 4000, "Large")
+check_at_scale(4, 10000, 5000, "Very Large")
+check_at_scale(21, 98776, 25000, "Your actual size")  # This might OOM or take long

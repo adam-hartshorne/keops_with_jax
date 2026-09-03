@@ -88,17 +88,19 @@ Benchmarks are excluded from `all`.
 Every JAX test compares against `pykeops.torch` as ground truth and calls `sys.exit(1)` when
 PyTorch with CUDA is absent.
 
-pytest only half works on this suite, so prefer the runners above:
+pytest works from inside that directory too, and collects 67 tests:
 
-- Collection fails from the repo root for the shadowing reason above. It succeeds from inside the
-  test directory.
-- Many `test_*` functions take required positional arguments and are driven by each file's `main()`
-  rather than parametrized. pytest reports them as `fixture '<argname>' not found`. All seven
-  collectable functions in `test_correctness.py` are like this, so `pytest test_correctness.py`
-  runs nothing at all.
-- No `@pytest.mark` appears anywhere in the suite. `conftest.py` registers `slow`, `gpu`,
-  `multigpu` and `pytorch` and skips on missing hardware, but nothing is marked, so `-m pytorch`
-  and `-m "not slow"` select nothing.
+```bash
+pytest -q                          # the whole suite in one process
+pytest test_api.py -k gradient     # select by name
+pytest -m pytorch                  # every test here is marked gpu and pytorch
+```
+
+Two things to know. Helpers that take arguments and are driven by each file's `main()` are named
+`check_*`, not `test_*`, so pytest does not mistake them for tests with missing fixtures; if you
+add one, follow that. And pytest runs every file in one process where `run_tests.py` forks per
+file, so the memory-hungry `test_high_dim_gradient` can fail under pytest on a busy card while
+passing on its own. `run_tests.py` remains the runner the suites are written for.
 
 `./pytest.sh` is the upstream harness. It builds a throwaway venv, installs both packages, clears
 the cache, then runs `keopscore/keopscore/test/` and `pykeops/pykeops/test/`, which are the

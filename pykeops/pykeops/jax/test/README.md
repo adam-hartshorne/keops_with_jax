@@ -4,14 +4,20 @@ Comprehensive test suite for the JAX backend of KeOps.
 
 ## Overview
 
-| Test File | Description | PyTorch Required |
-|-----------|-------------|------------------|
-| `test_edge_cases.py` | Edge cases discovered during development | Optional |
-| `test_api.py` | Core API unit tests | Optional |
-| `test_correctness.py` | Cross-validation against PyTorch KeOps | **Yes** |
-| `test_advanced.py` | Advanced features (LogSumExp, KMin, Hessians) | Optional |
-| `test_benchmark_single_gpu.py` | Single GPU performance benchmarks | Optional |
-| `test_benchmark_multi_gpu.py` | Multi-GPU scaling benchmarks | No |
+| Test File | Suite name | Description |
+|-----------|-----------|-------------|
+| `test_edge_cases.py` | `edge` | Bugs found during development; also the `quick` suite |
+| `test_api.py` | `api` | Genred, LazyTensor, Vi/Vj/Pm, dtypes, JIT, gradients |
+| `test_correctness.py` | `correctness` | Cross-validation against PyTorch KeOps |
+| `test_advanced.py` | `advanced` | LogSumExp, KMin, exotic math, refused transformations |
+| `test_batched_gradients.py` | `batched` | 3D gradients, block-boundary cases |
+| `test_batch_broadcasting.py` | `broadcast` | Size-one batch axes against a batch |
+| `test_helpers.py` | `helpers` | generic_sum, generic_logsumexp and friends |
+| `test_benchmark_single_gpu.py` | `benchmark` | Single-GPU timings, not in `all` |
+| `test_benchmark_multi_gpu.py` | `benchmark-multi` | Multi-GPU scaling, not in `all` |
+
+Every one of these compares against PyTorch KeOps as ground truth and needs a GPU. Without
+PyTorch with CUDA they exit rather than run: the comparison is the test.
 
 ## Quick Start
 
@@ -35,27 +41,26 @@ python run_tests.py quick
 
 ## Using pytest
 
-The tests are also compatible with pytest:
+Run from inside this directory; it collects 67 tests.
 
 ```bash
-# Run all tests
-pytest
-
-# Run with verbose output
-pytest -v
-
-# Run specific test file
-pytest test_edge_cases.py
-
-# Run specific test class
-pytest test_api.py::TestGenredBasic
-
-# Skip slow tests
-pytest -m "not slow"
-
-# Only PyTorch comparison tests
-pytest -m pytorch
+pytest -q                          # everything, in one process
+pytest test_edge_cases.py          # one file
+pytest test_api.py -k gradient     # select by name
+pytest -m pytorch                  # every test here is marked gpu and pytorch
+pytest -m "not slow"               # nothing is marked slow yet, so this selects everything
 ```
+
+Two differences from `run_tests.py`:
+
+- Helpers that take arguments and are driven by a file's `main()` are named `check_*`, not
+  `test_*`, so pytest does not collect them as tests with missing fixtures. Follow that when
+  adding one.
+- pytest runs every file in a single process, where `run_tests.py` forks one per file. The
+  memory-hungry `test_high_dim_gradient` can therefore run out of GPU memory under pytest on a
+  busy card while passing on its own.
+
+`old/` is excluded from collection: it holds superseded tests that no longer import.
 
 ## Test Descriptions
 

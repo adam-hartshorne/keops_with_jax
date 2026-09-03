@@ -18,6 +18,7 @@ Tests cover:
 """
 
 import sys
+import pytest
 import numpy as np
 
 from test_utils import (
@@ -60,6 +61,11 @@ if not TORCH_AVAILABLE:
 # =============================================================================
 # Configuration
 # =============================================================================
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
 
 SEED = 42
 RTOL = 1e-5
@@ -141,7 +147,7 @@ def test_genred_gaussian():
     return compare_arrays(np.array(result_jax), result_torch, rtol=RTOL, atol=ATOL)
 
 
-def test_genred_reductions(reduction_op):
+def check_genred_reductions(reduction_op):
     data = get_test_data(100, 80, 3)
     formula = "SqDist(x, y)"
     aliases = ["x=Vi(3)", "y=Vj(3)"]
@@ -330,7 +336,7 @@ def test_lazytensor_batched():
 # 4. Gradients
 # =============================================================================
 
-def test_gradient_var(var_name):
+def check_gradient_var(var_name):
     data = get_test_data(50, 40, 3)
 
     if var_name == 'x':
@@ -493,7 +499,7 @@ def test_jit_gradient():
 # 6. Data Types
 # =============================================================================
 
-def test_dtype(dtype_str):
+def check_dtype(dtype_str):
     # Check for X64 support if needed
     if dtype_str == 'float64':
         from jax import config
@@ -540,8 +546,8 @@ def main():
     run_test("SqDist (Sum axis=1)", lambda: test_genred_sqdist_sum(axis=1), suite)
     run_test("SqDist (Sum axis=0)", lambda: test_genred_sqdist_sum(axis=0), suite)
     run_test("Gaussian Kernel", test_genred_gaussian, suite)
-    run_test("Reduction: Min", lambda: test_genred_reductions('Min'), suite)
-    run_test("Reduction: Max", lambda: test_genred_reductions('Max'), suite)
+    run_test("Reduction: Min", lambda: check_genred_reductions('Min'), suite)
+    run_test("Reduction: Max", lambda: check_genred_reductions('Max'), suite)
 
     # 2. Formulas
     print_subheader("2. Formula Types")
@@ -559,9 +565,9 @@ def main():
 
     # 4. Gradients
     print_subheader("4. Gradients")
-    run_test("Grad w.r.t Vi (x)", lambda: test_gradient_var('x'), suite)
-    run_test("Grad w.r.t Vj (y)", lambda: test_gradient_var('y'), suite)
-    run_test("Grad w.r.t Pm (s)", lambda: test_gradient_var('pm'), suite)
+    run_test("Grad w.r.t Vi (x)", lambda: check_gradient_var('x'), suite)
+    run_test("Grad w.r.t Vj (y)", lambda: check_gradient_var('y'), suite)
+    run_test("Grad w.r.t Pm (s)", lambda: check_gradient_var('pm'), suite)
     run_test("LazyTensor Grad", test_gradient_lazytensor, suite)
 
     # 5. JIT
@@ -572,8 +578,8 @@ def main():
 
     # 6. Dtypes
     print_subheader("6. Data Types")
-    run_test("float32", lambda: test_dtype('float32'), suite)
-    run_test("float64", lambda: test_dtype('float64'), suite)
+    run_test("float32", lambda: check_dtype('float32'), suite)
+    run_test("float64", lambda: check_dtype('float64'), suite)
 
     # Final Summary
     suite.print_summary()

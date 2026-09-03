@@ -19,6 +19,7 @@ the mature, well-tested reference implementation.
 """
 
 import sys
+import pytest
 import numpy as np
 
 from test_utils import (
@@ -67,6 +68,11 @@ except ImportError as e:
 # =============================================================================
 # Configuration
 # =============================================================================
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
 
 SEED = 42
 # Use tight tolerances since we expect near-exact matches
@@ -174,7 +180,7 @@ def jax_forward_and_grad(x_np, y_np, formula='sqdist'):
 # Comparison Tests
 # =============================================================================
 
-def test_forward_match(B, N, D, formula='sqdist'):
+def check_forward_match(B, N, D, formula='sqdist'):
     """Test that forward pass matches between JAX and PyTorch."""
     x_np, y_np = get_test_data(B, N, D)
 
@@ -184,7 +190,7 @@ def test_forward_match(B, N, D, formula='sqdist'):
     return compare_arrays(result_torch, result_jax, rtol=RTOL, atol=ATOL)
 
 
-def test_gradient_match(B, N, D, formula='sqdist'):
+def check_gradient_match(B, N, D, formula='sqdist'):
     """Test that gradients match between JAX and PyTorch."""
     x_np, y_np = get_test_data(B, N, D)
 
@@ -199,7 +205,7 @@ def test_gradient_match(B, N, D, formula='sqdist'):
     return match_x and match_y, max(diff_x, diff_y)
 
 
-def test_gradient_no_nan(B, N, D, formula='sqdist'):
+def check_gradient_no_nan(B, N, D, formula='sqdist'):
     """Test that gradients contain no NaN values."""
     x_np, y_np = get_test_data(B, N, D)
 
@@ -346,38 +352,38 @@ def main():
 
     # 1. Forward Pass Tests
     print_subheader("1. Forward Pass (Batched)")
-    run_test("B=1, N=100, D=3 (SqDist)", lambda: test_forward_match(1, 100, 3), suite)
-    run_test("B=1, N=193, D=3 (SqDist)", lambda: test_forward_match(1, 193, 3), suite)
-    run_test("B=4, N=100, D=3 (SqDist)", lambda: test_forward_match(4, 100, 3), suite)
-    run_test("B=1, N=100, D=3 (Gaussian)", lambda: test_forward_match(1, 100, 3, 'gaussian'), suite)
+    run_test("B=1, N=100, D=3 (SqDist)", lambda: check_forward_match(1, 100, 3), suite)
+    run_test("B=1, N=193, D=3 (SqDist)", lambda: check_forward_match(1, 193, 3), suite)
+    run_test("B=4, N=100, D=3 (SqDist)", lambda: check_forward_match(4, 100, 3), suite)
+    run_test("B=1, N=100, D=3 (Gaussian)", lambda: check_forward_match(1, 100, 3, 'gaussian'), suite)
 
     # 2. Gradient Tests - Basic
     print_subheader("2. Gradient Comparison - Basic Sizes")
-    run_test("B=1, N=50, D=3", lambda: test_gradient_match(1, 50, 3), suite)
-    run_test("B=1, N=100, D=3", lambda: test_gradient_match(1, 100, 3), suite)
-    run_test("B=1, N=200, D=3", lambda: test_gradient_match(1, 200, 3), suite)
+    run_test("B=1, N=50, D=3", lambda: check_gradient_match(1, 50, 3), suite)
+    run_test("B=1, N=100, D=3", lambda: check_gradient_match(1, 100, 3), suite)
+    run_test("B=1, N=200, D=3", lambda: check_gradient_match(1, 200, 3), suite)
 
     # 3. Block Boundary Tests (Critical for NaN bug)
     print_subheader("3. Block Boundary Edge Cases (N~192)")
-    run_test("B=1, N=192, D=3 (exact boundary)", lambda: test_gradient_match(1, 192, 3), suite)
-    run_test("B=1, N=193, D=3 (over boundary)", lambda: test_gradient_match(1, 193, 3), suite)
-    run_test("B=1, N=194, D=3", lambda: test_gradient_match(1, 194, 3), suite)
-    run_test("B=1, N=384, D=3 (two blocks)", lambda: test_gradient_match(1, 384, 3), suite)
+    run_test("B=1, N=192, D=3 (exact boundary)", lambda: check_gradient_match(1, 192, 3), suite)
+    run_test("B=1, N=193, D=3 (over boundary)", lambda: check_gradient_match(1, 193, 3), suite)
+    run_test("B=1, N=194, D=3", lambda: check_gradient_match(1, 194, 3), suite)
+    run_test("B=1, N=384, D=3 (two blocks)", lambda: check_gradient_match(1, 384, 3), suite)
     run_test("Index 192 Specific Test", test_specific_index_192, suite)
     run_test("Block Boundary Suite", test_block_boundary_gradients, suite)
 
     # 4. Multi-Batch Tests
     print_subheader("4. Multi-Batch Gradients")
-    run_test("B=2, N=100, D=3", lambda: test_gradient_match(2, 100, 3), suite)
-    run_test("B=4, N=193, D=3", lambda: test_gradient_match(4, 193, 3), suite)
-    run_test("B=8, N=50, D=3", lambda: test_gradient_match(8, 50, 3), suite)
+    run_test("B=2, N=100, D=3", lambda: check_gradient_match(2, 100, 3), suite)
+    run_test("B=4, N=193, D=3", lambda: check_gradient_match(4, 193, 3), suite)
+    run_test("B=8, N=50, D=3", lambda: check_gradient_match(8, 50, 3), suite)
     run_test("Multi-Batch Suite", test_multi_batch_gradients, suite)
 
     # 5. NaN Detection Tests
     print_subheader("5. NaN Detection")
-    run_test("No NaN: B=1, N=193, D=3", lambda: test_gradient_no_nan(1, 193, 3), suite)
-    run_test("No NaN: B=1, N=384, D=3", lambda: test_gradient_no_nan(1, 384, 3), suite)
-    run_test("No NaN: B=4, N=193, D=3", lambda: test_gradient_no_nan(4, 193, 3), suite)
+    run_test("No NaN: B=1, N=193, D=3", lambda: check_gradient_no_nan(1, 193, 3), suite)
+    run_test("No NaN: B=1, N=384, D=3", lambda: check_gradient_no_nan(1, 384, 3), suite)
+    run_test("No NaN: B=4, N=193, D=3", lambda: check_gradient_no_nan(4, 193, 3), suite)
 
     # 6. Different Kernels
     print_subheader("6. Different Kernel Types")

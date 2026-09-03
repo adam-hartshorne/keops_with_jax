@@ -15,6 +15,7 @@ PyTorch KeOps serves as the ground truth since it's the reference implementation
 """
 
 import sys
+import pytest
 import numpy as np
 
 # =============================================================================
@@ -69,6 +70,11 @@ if not TORCH_AVAILABLE:
 # =============================================================================
 # Configuration
 # =============================================================================
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
 
 SEED = 42
 RTOL = 1e-4  # Tight tolerance since both are KeOps
@@ -132,7 +138,7 @@ def make_aliases(alias_templates, d):
 # Forward Pass Tests
 # =============================================================================
 
-def test_forward_genred(formula_name, formula, alias_templates, has_param, has_b, 
+def check_forward_genred(formula_name, formula, alias_templates, has_param, has_b, 
                         n, m, d, reduction='Sum', axis=1):
     """Test Genred forward pass: JAX vs PyTorch."""
     aliases = make_aliases(alias_templates, d)
@@ -162,7 +168,7 @@ def test_forward_genred(formula_name, formula, alias_templates, has_param, has_b
     return compare_arrays(jax_np, torch_np, rtol=RTOL, atol=ATOL)
 
 
-def test_forward_lazytensor(n, m, d):
+def check_forward_lazytensor(n, m, d):
     """Test LazyTensor forward pass: JAX vs PyTorch."""
     data = generate_test_data(n, m, d)
     
@@ -185,7 +191,7 @@ def test_forward_lazytensor(n, m, d):
 # Gradient Tests
 # =============================================================================
 
-def test_gradient_vi(formula_name, formula, alias_templates, has_param, has_b, n, m, d):
+def check_gradient_vi(formula_name, formula, alias_templates, has_param, has_b, n, m, d):
     """Test gradient w.r.t. Vi variable (x)."""
     aliases = make_aliases(alias_templates, d)
     data = generate_test_data(n, m, d)
@@ -220,7 +226,7 @@ def test_gradient_vi(formula_name, formula, alias_templates, has_param, has_b, n
     return compare_arrays(grad_jax, grad_torch.cpu().numpy(), rtol=1e-3, atol=1e-4)
 
 
-def test_gradient_vj(formula_name, formula, alias_templates, has_param, has_b, n, m, d):
+def check_gradient_vj(formula_name, formula, alias_templates, has_param, has_b, n, m, d):
     """Test gradient w.r.t. Vj variable (y)."""
     aliases = make_aliases(alias_templates, d)
     data = generate_test_data(n, m, d)
@@ -255,7 +261,7 @@ def test_gradient_vj(formula_name, formula, alias_templates, has_param, has_b, n
     return compare_arrays(grad_jax, grad_torch.cpu().numpy(), rtol=1e-3, atol=1e-4)
 
 
-def test_gradient_pm(n, m, d):
+def check_gradient_pm(n, m, d):
     """Test gradient w.r.t. Pm parameter."""
     data = generate_test_data(n, m, d)
     
@@ -276,7 +282,7 @@ def test_gradient_pm(n, m, d):
     return compare_arrays(grad_jax, grad_torch.cpu().numpy(), rtol=1e-3, atol=1e-4)
 
 
-def test_gradient_lazytensor(n, m, d):
+def check_gradient_lazytensor(n, m, d):
     """Test LazyTensor gradient."""
     data = generate_test_data(n, m, d)
     
@@ -305,7 +311,7 @@ def test_gradient_lazytensor(n, m, d):
 # Reduction Operation Tests
 # =============================================================================
 
-def test_reduction(reduction, n, m, d, axis=1):
+def check_reduction(reduction, n, m, d, axis=1):
     """Test specific reduction operation."""
     data = generate_test_data(n, m, d)
     
@@ -346,7 +352,7 @@ def main():
             run_test(
                 test_name,
                 lambda fn=formula_name, f=formula, a=aliases, hp=has_param, hb=has_b, 
-                       nn=n, mm=m, dd=d: test_forward_genred(fn, f, a, hp, hb, nn, mm, dd),
+                       nn=n, mm=m, dd=d: check_forward_genred(fn, f, a, hp, hb, nn, mm, dd),
                 suite
             )
     
@@ -356,7 +362,7 @@ def main():
         test_name = f"LazyTensor SqDist [{size_name}: {n}x{m}x{d}]"
         run_test(
             test_name,
-            lambda nn=n, mm=m, dd=d: test_forward_lazytensor(nn, mm, dd),
+            lambda nn=n, mm=m, dd=d: check_forward_lazytensor(nn, mm, dd),
             suite
         )
     
@@ -371,7 +377,7 @@ def main():
         run_test(
             test_name,
             lambda fn=formula_name, f=formula, a=aliases, hp=has_param, hb=has_b: 
-                test_gradient_vi(fn, f, a, hp, hb, n, m, d),
+                check_gradient_vi(fn, f, a, hp, hb, n, m, d),
             suite
         )
     
@@ -382,7 +388,7 @@ def main():
         run_test(
             test_name,
             lambda fn=formula_name, f=formula, a=aliases, hp=has_param, hb=has_b: 
-                test_gradient_vj(fn, f, a, hp, hb, n, m, d),
+                check_gradient_vj(fn, f, a, hp, hb, n, m, d),
             suite
         )
     
@@ -392,7 +398,7 @@ def main():
         test_name = f"∂/∂σ Gaussian [{size_name}]"
         run_test(
             test_name,
-            lambda nn=n, mm=m, dd=d: test_gradient_pm(nn, mm, dd),
+            lambda nn=n, mm=m, dd=d: check_gradient_pm(nn, mm, dd),
             suite
         )
     
@@ -402,7 +408,7 @@ def main():
         test_name = f"LazyTensor ∂/∂x [{size_name}]"
         run_test(
             test_name,
-            lambda nn=n, mm=m, dd=d: test_gradient_lazytensor(nn, mm, dd),
+            lambda nn=n, mm=m, dd=d: check_gradient_lazytensor(nn, mm, dd),
             suite
         )
     
@@ -417,7 +423,7 @@ def main():
             test_name = f"{reduction} reduction (axis={axis})"
             run_test(
                 test_name,
-                lambda r=reduction, a=axis: test_reduction(r, n, m, d, a),
+                lambda r=reduction, a=axis: check_reduction(r, n, m, d, a),
                 suite
             )
     
@@ -430,7 +436,7 @@ def main():
         test_name = f"Large SqDist [{size_name}: {n}x{m}x{d}]"
         run_test(
             test_name,
-            lambda nn=n, mm=m, dd=d: test_forward_genred(
+            lambda nn=n, mm=m, dd=d: check_forward_genred(
                 "SqDist", "SqDist(x,y)", ["x=Vi(D)", "y=Vj(D)"], False, False, nn, mm, dd),
             suite
         )
@@ -438,7 +444,7 @@ def main():
         test_name = f"Large Gaussian [{size_name}: {n}x{m}x{d}]"
         run_test(
             test_name,
-            lambda nn=n, mm=m, dd=d: test_forward_genred(
+            lambda nn=n, mm=m, dd=d: check_forward_genred(
                 "Gaussian", "Exp(-SqNorm2(x-y)*s)", ["x=Vi(D)", "y=Vj(D)", "s=Pm(1)"], 
                 True, False, nn, mm, dd),
             suite

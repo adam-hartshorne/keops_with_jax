@@ -492,7 +492,7 @@ def print_benchmark_table(title: str, rows: List[Dict[str, Any]],
 # =============================================================================
 
 @contextmanager
-def test_context(name: str, suite: TestSuite):
+def check_context(name: str, suite: TestSuite):
     """Context manager for running a test with timing and error handling."""
     start_time = time.time()
     result = TestResult(name=name, status=Status.PASS)

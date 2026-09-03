@@ -7,6 +7,10 @@ import pytest
 import sys
 
 
+# `old/` holds superseded tests that run_tests.py never touches and that no longer import cleanly.
+# Without this, plain `pytest` in this directory stops on four collection errors from dead files.
+collect_ignore_glob = ["old/*"]
+
 def pytest_configure(config):
     """Configure pytest with custom markers."""
     config.addinivalue_line(

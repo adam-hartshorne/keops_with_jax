@@ -18,6 +18,7 @@ These tests specifically target bugs that were found and fixed:
 """
 
 import sys
+import pytest
 import numpy as np
 
 # =============================================================================
@@ -63,6 +64,11 @@ if not TORCH_AVAILABLE:
 # =============================================================================
 # Configuration
 # =============================================================================
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
 
 SEED = 42
 RTOL = 1e-4

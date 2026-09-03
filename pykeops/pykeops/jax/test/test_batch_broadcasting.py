@@ -21,6 +21,7 @@ PyTorch KeOps is the ground truth throughout.
 """
 
 import sys
+import pytest
 import numpy as np
 
 from test_utils import (
@@ -55,6 +56,11 @@ except ImportError as e:
     print(f"Error: KeOps not found: {e}")
     KEOPS_AVAILABLE = False
 
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
 
 SEED = 42
 RTOL = 1e-4

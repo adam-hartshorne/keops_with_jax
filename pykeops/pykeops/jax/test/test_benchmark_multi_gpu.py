@@ -15,6 +15,13 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 os.environ['JAX_KEOPS_DEBUG'] = '0'
 
 import sys
+import pytest
+
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
+
 import time
 import json
 import numpy as np

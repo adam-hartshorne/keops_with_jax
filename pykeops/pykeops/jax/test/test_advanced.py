@@ -16,6 +16,7 @@ Tests cover:
 """
 
 import sys
+import pytest
 import math
 import numpy as np
 
@@ -57,6 +58,11 @@ except ImportError:
 # Configuration
 # =============================================================================
 
+# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
+# markers and skips on missing hardware, so declaring them at module level is what makes
+# `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
+
 SEED = 42
 RTOL = 1e-5
 ATOL = 1e-5
@@ -88,7 +94,7 @@ def generate_data_np(n, m, d, batch=None, seed=SEED):
 # 1. Advanced Reductions
 # =============================================================================
 
-def test_reduction(reduction_op, n, m, d, opt_arg=None, extra_args=False):
+def check_reduction(reduction_op, n, m, d, opt_arg=None, extra_args=False):
     """Generic test for reductions."""
     data = generate_data_np(n, m, d)
 
@@ -170,7 +176,7 @@ def test_reduction(reduction_op, n, m, d, opt_arg=None, extra_args=False):
 # 2. Exotic Math
 # =============================================================================
 
-def test_lazy_math(op_name, n=50, m=40, d=3):
+def check_lazy_math(op_name, n=50, m=40, d=3):
     """Test LazyTensor math operations."""
     np.random.seed(SEED)
 
@@ -240,7 +246,7 @@ def test_lazy_math(op_name, n=50, m=40, d=3):
 # 3. Batched Ops
 # =============================================================================
 
-def test_batched(mode, n=50, m=40, d=3, batch=3):
+def check_batched(mode, n=50, m=40, d=3, batch=3):
     data = generate_data_np(n, m, d, batch=batch)
 
     # JAX
@@ -383,7 +389,7 @@ def test_hessian():
 # 5. Formulas
 # =============================================================================
 
-def test_formula(name, n=100, m=80, d=3):
+def check_formula(name, n=100, m=80, d=3):
     data = generate_data_np(n, m, d)
 
     if name == "Laplacian":
@@ -651,7 +657,7 @@ def main():
         name = f"{op}" + (f"(K={arg})" if arg else "")
         run_test(
             name,
-            lambda o=op, k=arg, e=extra: test_reduction(o, N, M, D, k, e),
+            lambda o=op, k=arg, e=extra: check_reduction(o, N, M, D, k, e),
             suite
         )
 
@@ -659,12 +665,12 @@ def main():
     print_subheader("2. Exotic Math Operations")
     math_ops = ["Sin", "Cos", "SinCos", "AbsSign", "Step", "Clamp", "Sqrt", "Square", "Log"]
     for op in math_ops:
-        run_test(f"Math: {op}", lambda o=op: test_lazy_math(o), suite)
+        run_test(f"Math: {op}", lambda o=op: check_lazy_math(o), suite)
 
     # 3. Batched
     print_subheader("3. Batched Operations")
-    run_test("Batched SqDist", lambda: test_batched("SqDist"), suite)
-    run_test("Batched Gaussian", lambda: test_batched("Gaussian"), suite)
+    run_test("Batched SqDist", lambda: check_batched("SqDist"), suite)
+    run_test("Batched Gaussian", lambda: check_batched("Gaussian"), suite)
 
     print_subheader("4. Unsupported Transformations")
     run_test("jax.vmap raises", test_vmap_raises, suite)
@@ -678,9 +684,9 @@ def main():
 
     # 5. Formulas
     print_subheader("5. Complex Formulas")
-    run_test("Kernel: Laplacian", lambda: test_formula("Laplacian"), suite)
-    run_test("Kernel: Cauchy", lambda: test_formula("Cauchy"), suite)
-    run_test("Kernel: WeightedSum", lambda: test_formula("WeightedSum"), suite)
+    run_test("Kernel: Laplacian", lambda: check_formula("Laplacian"), suite)
+    run_test("Kernel: Cauchy", lambda: check_formula("Cauchy"), suite)
+    run_test("Kernel: WeightedSum", lambda: check_formula("WeightedSum"), suite)
 
     # 6. Complex Numbers
     print_subheader("6. Complex Number Support")
