@@ -59,46 +59,83 @@ This checkout had arrived with all ten flattened into regular files holding the 
 content, so `git status` showed ten permanent `T` (typechange) entries. That is a trap rather than
 cosmetic: `git add -A` or `git commit -a` would have committed *symlinks converted to regular
 files* into KeOps history, an upstream-breaking change that looks like background noise in the
-status output. The filesystem is ext4 and handles symlinks fine, so the cause was the copy that
-created the tree, not the disk.
+status output. The filesystem is not the cause on either box: `dior` is ext4, the 5090 box is NTFS
+through ntfs-3g, and both create symlinks fine (`ln -s` in the work tree succeeds on both, and
+`core.symlinks` is at its default). It is the copy that created the tree that flattened them, so it
+can happen again on any machine if that copy is repeated.
 
 They were restored on 2026-09-06 with `git checkout --` on the ten paths, after confirming each
 flattened file was byte-identical to its target, and `keopscore.__version__` still reads `2.3`
 through the links. If those ten `T` entries ever reappear, the tree was copied again without `-a`;
 verify equality and restore the same way rather than committing them.
 
-## Environment
+## Environment: several machines, one CUDA major version
 
-This box is `dior`: **ten** RTX A5000, compute capability 8.6 (`sm_86`), 24 GB each. Conda is
-**miniconda**, and the env is `jax_torch_latest`: Python 3.12.13, jax 0.11.1 on the cuda13 plugin,
-torch 2.12.1+cu130, numpy 2.5.
+This checkout is worked on from more than one box, and they differ in almost everything that a
+setup instruction would normally hard-code: card model, card count, compute capability, conda
+distribution, environment name, even the filesystem. **Do not assume which one you are on. Ask.**
 
 ```bash
-source /home/adam/miniconda3/etc/profile.d/conda.sh && conda activate jax_torch_latest
+nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version --format=csv,noheader
+ls -d ~/anaconda3 ~/miniconda3 2>/dev/null      # which conda
+conda env list                                   # which env has KeOps
+python -c "import jax, torch; print(jax.__version__, jax.devices(), torch.__version__)"
 ```
 
-Always run that line; do not trust the ambient `python`. `~/.bashrc` has a `conda init` block but no
-`conda activate`, so a fresh interactive terminal lands in **`base`**, whose python has no JAX at
-all (`ModuleNotFoundError: No module named 'jax'`). A Claude Code session may nevertheless *look*
-correct, because it inherits whatever env its launching process had -- this session inherited
-`jax_torch_latest`, so `python` happened to be right without activating. That is a property of the
-session, not of the machine, and a clean login shell (`env -i bash -lc`) has no python on `PATH`
-whatsoever, since the `conda init` block only runs for interactive shells.
+The ones seen so far:
 
-`keopscore` and `pykeops` are installed editable in `jax_torch_latest` and already point
-at this checkout. The JAX backend is CUDA only, with no CPU fallback, so it needs a GPU and a CUDA
-toolkit with `nvcc`. The other conda envs (`jax_torch_3_12`, `kernel_compiler`) carry older JAX
-(0.9.1, 0.5.3) on cuda12 and have no KeOps installed; they are not this project's.
+| | `dior` | the 5090 box |
+|---|---|---|
+| GPUs | **ten** RTX A5000, `sm_86`, 24 GB | **one** RTX 5090, `sm_120`, 32 GB |
+| driver | 580.167.08 | 610.43.02 |
+| conda | miniconda, env `jax_torch_latest` | anaconda3, env `jax_latest` |
+| python / jax / torch | 3.12.13 / 0.11.1 / 2.12.1+cu130 | 3.12.12 / 0.11.1 / 2.12.0+cu130 |
+| filesystem | ext4 | NTFS through ntfs-3g (`fuseblk`) |
+| `/usr/local/cuda` | -> 13.3 (12.5.1 and 12.6.3 also installed) | -> 13.0, the only toolkit |
+| `nvcc` on PATH | 12.6.85 (`/etc/profile` puts 12.6 first) | 13.0.48 |
+| multi-GPU tests | run, with the cap below | skip: `test_sharding.py` needs two devices |
 
-Earlier revisions of this file described a different machine (anaconda, env `jax_latest`, five RTX
-PRO 6000 Blackwell cards at `sm_120`). Measurements taken there are still labelled as such below,
-because the numbers do not transfer; instructions describe this box.
+A third configuration, five RTX PRO 6000 Blackwell cards at `sm_120` on anaconda / `jax_latest`,
+appears in older revisions of this file and in measurements below. Treat every measured number as
+belonging to the box named beside it; none of them transfer.
 
-### There is no single CUDA version here
+**What is the same everywhere, and what the fork targets: CUDA 13.** Every box runs a driver that
+advertises 13.x, JAX on the `jax_cuda13_plugin` with the `nvidia/cu13` wheels, and torch built for
+`cu130`. So the JAX backend is a CUDA 13 target: the `.so` KeOps builds is `dlopen`ed into the JAX
+process and shares its context, and both ends are 13. An environment carrying CUDA 12 JAX is not
+this project's, whatever else is installed on the machine (`dior` has `jax_torch_3_12` and
+`kernel_compiler` on cuda12, with no KeOps in them).
 
-Three toolkits are installed and different layers pick different ones. Nothing is broken -- the
-whole JAX suite and the upstream NumPy suite pass -- but do not answer "what CUDA is this" from one
-command:
+That invariant is what makes the toolkit resolution below safe: picking the environment's own
+`nvcc` rather than the machine's is only sensible because the environment is always 13, even where
+`/usr/local/cuda` is 13.0 on one box and 13.3 on another, and where `PATH` offers 12.6.
+
+Activate deliberately on every box; do not trust the ambient `python`:
+
+```bash
+# dior
+source /home/adam/miniconda3/etc/profile.d/conda.sh && conda activate jax_torch_latest
+# the 5090 box
+source /home/adam/anaconda3/etc/profile.d/conda.sh && conda activate jax_latest
+```
+
+`~/.bashrc` runs `conda init` but never `conda activate`, so a fresh interactive terminal lands in
+`base`, whose python has no JAX (`ModuleNotFoundError: No module named 'jax'`). A Claude Code
+session may nevertheless *look* correct, because it inherits whatever environment its launcher had.
+That is a property of the session, not the machine: a clean login shell (`env -i bash -lc`) has no
+python on `PATH` at all, since the `conda init` block only runs for interactive shells.
+
+`keopscore` and `pykeops` are installed editable in the project's env on each box and already point
+at that box's checkout. The JAX backend is CUDA only, with no CPU fallback, so it needs a GPU and a
+CUDA toolkit with `nvcc`.
+
+### One box, several CUDA versions: check the layer, not the machine (`dior`)
+
+The major version is 13 everywhere (see above), but the *minor* version differs by layer, and on
+`dior` three toolkits are installed at once. Nothing is broken -- the whole JAX suite and the
+upstream NumPy suite pass -- but do not answer "what CUDA is this" from one command. This table is
+`dior`'s; on the 5090 box there is a single toolkit, 13.0, and `nvcc` on `PATH` is 13.0.48 while
+the environment's wheel is 13.2.78, so the same split exists in a milder form:
 
 | layer | version | how it is chosen |
 |---|---|---|
@@ -132,7 +169,7 @@ priority first:
 Whatever wins, the headers are taken from that same root when it ships them, so compiler and
 headers can no longer disagree. `JAX_KEOPS_DEBUG=1` prints the pair it chose.
 
-Until 2026-09-06 step 3 was the only rule, so on this box kernels were built by **nvcc 12.6**
+Until 2026-09-06 step 3 was the only rule, so on `dior` kernels were built by **nvcc 12.6**
 against **CUDA 13.3 headers** -- `shutil.which` found `/etc/profile`'s 12.6 while the include path
 came from the `/usr/local/cuda` alternatives link. It worked, but nothing made those two agree.
 Two wheel layouts are handled: CUDA 13 consolidates into `nvidia/cu13/{bin,include}`, CUDA 12
@@ -146,9 +183,10 @@ built a kernel: `strings <cached>.so | grep -oE 'V1[23]\.[0-9.]+'`.
 The NVRTC backend behind `pykeops.torch` and `pykeops.numpy` is untouched by this and still loads
 NVRTC 13.3 from `/usr/local/cuda`; `keopscore/binders/cuda/` is fork-only and not on `main`.
 
-### Never let JAX see more than eight GPUs
+### Never let JAX see more than eight GPUs (`dior` only)
 
-CUDA allows at most eight peers per device and this box has ten cards, so **cap the device list**:
+CUDA allows at most eight peers per device and `dior` has ten cards, so **cap the device list**
+there. It is unnecessary and harmless on any box with eight or fewer:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -159,7 +197,8 @@ between every pair, GPU 9 fails against all nine others with `CUDA_ERROR_TOO_MAN
 mapping resources exhausted`, and the allocator then fails every allocation on device 0 in turn,
 walking 17.66 GiB down to 297 MiB without recovering. It is loud rather than silent, but it buries
 the test output under thousands of lines. With the cap, `jax.devices()` returns 8 and the log is
-clean. `test_sharding.py` needs at least two devices, so it runs here either way.
+clean. `test_sharding.py` needs at least two devices: it runs on `dior` either way, and skips its
+per-device tests entirely on a single-card box.
 
 ## Build
 
@@ -176,11 +215,12 @@ Installing pykeops also builds the JAX C++ extension. `pykeops/setup.py` runs CM
 `pykeops/pykeops/jax/binders/` from both its `build` and `egg_info` commands and writes
 `keops_jax_ext.cpython-*.so` into `pykeops/pykeops/jax/`. `*.so` is gitignored, so a fresh clone has
 no extension until you install. `CMAKE_CUDA_ARCHITECTURES` comes from
-`nvidia-smi --query-gpu=compute_cap` (here `86`), falling back to `70;75;80;86;89;90`. Should that
+`nvidia-smi --query-gpu=compute_cap` (`86` on `dior`, `120` on the 5090 box), falling back to
+`70;75;80;86;89;90`. Should that
 list ever not cover the card, it is harmless, and worth knowing so nobody chases it:
 `keops_jax.cpp` is a dlopen shim and an FFI handler with no device code (no `__global__`, no
 `<<<`), and the kernels that do run get their `-arch` from keopscore's own detection at runtime
-(`[KeOps] Detected GPU 0: compute capability 8.6 (arch=sm_86)` on this box).
+(`compute capability 8.6 (arch=sm_86)` on `dior`, `12.0 (arch=sm_120)` on the 5090 box).
 If JAX, nanobind, nvcc or cmake is missing, setup.py prints why, skips the extension and installs
 only the Python side, so watch the install log rather than the exit code.
 
@@ -208,7 +248,7 @@ test files import `test_utils` as a top-level module.
 
 ```bash
 cd pykeops/pykeops/jax/test
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   # required on this box; see Environment
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7   # `dior` only, it has ten cards; see Environment
 python run_tests.py              # all but the benchmarks; see the suite list below
 python run_tests.py quick        # edge only
 python run_tests.py api          # one suite
