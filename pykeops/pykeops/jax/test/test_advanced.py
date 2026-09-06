@@ -429,6 +429,12 @@ def check_formula(name, n=100, m=80, d=3):
 # =============================================================================
 # 6. Complex Number Support
 # =============================================================================
+#
+# TO DO: complex kernels do not work in float64. Under `run_tests.py --float64`,
+# test_complex_nudft and test_complex_mixed_real raise ValueError: Incompatible, while the other
+# three complex tests here pass. This is the gap 3906bf1e (2026-01-27) left open when it added
+# 64-bit mode: "Doesn't support 64-bit complex kernels yet". It is not a regression, and it is the
+# only reason `--float64` exits non-zero. See CLAUDE.md known bug 6.
 
 def test_complex_creation():
     """Test basic complex LazyTensor creation."""

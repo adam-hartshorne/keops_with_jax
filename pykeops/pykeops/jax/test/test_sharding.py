@@ -10,6 +10,8 @@ the caller-side `shard_map` gsed used before this rule still works with it.
 
 Run from this directory:  python -m pytest test_sharding.py -q
 The per-device checks need two or more GPUs and skip otherwise; the rule-string test runs anywhere.
+Precision follows KEOPS_TEST_FLOAT64 like the other suites, so `run_tests.py --float64` exercises
+this file too.
 """
 import re
 import sys
@@ -19,6 +21,8 @@ import pytest
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from test_utils import get_dtype_str, get_np_dtype
 
 
 def _gpus():
@@ -37,15 +41,16 @@ ALIASES = ["x = Vi(3)", "y = Vj(3)", "b = Vj(2)", "g = Pm(1)"]
 
 def _op(axis=1):
     from pykeops.jax import Genred
-    return Genred(FORMULA, ALIASES, reduction_op="Sum", axis=axis, dtype="float32")
+    return Genred(FORMULA, ALIASES, reduction_op="Sum", axis=axis, dtype=get_dtype_str())
 
 
 def _data(B, N, M, seed=0):
     r = np.random.default_rng(seed)
-    x = r.normal(size=(B, N, 3)).astype(np.float32)
-    y = r.normal(size=(B, M, 3)).astype(np.float32)
-    b = r.normal(size=(B, M, 2)).astype(np.float32)
-    g = np.array([0.5], np.float32)
+    dt = get_np_dtype()
+    x = r.normal(size=(B, N, 3)).astype(dt)
+    y = r.normal(size=(B, M, 3)).astype(dt)
+    b = r.normal(size=(B, M, 2)).astype(dt)
+    g = np.array([0.5], dt)
     # JAX arrays, not numpy: the first (registering) call of the JAX backend reads the device off its
     # arguments and accepts only JAX arrays or tracers (`pykeops/common/get_options.py::_find_mem`).
     return tuple(jnp.asarray(a) for a in (x, y, b, g))
@@ -68,9 +73,13 @@ def _mesh():
 
 def _launches(hlo):
     """Every KeOps launch in a compiled program as (result shape, launch text); the compiled text does
-    not print operand shapes, so the result shape is what a check reads."""
+    not print operand shapes, so the result shape is what a check reads. The element type follows the
+    test precision now that the data does, so the pattern has to as well; every caller asserts the
+    match is non-empty, so a stale pattern fails loudly rather than skipping the checks."""
+    et = "f64" if get_dtype_str() == "float64" else "f32"
     return [(tuple(int(v) for v in res.split(",")), line)
-            for res, line in re.findall(r'= f32\[([\d,]+)\]([^\n]*custom_call_target="keops[^\n]*)', hlo)]
+            for res, line in re.findall(
+                r'= ' + et + r'\[([\d,]+)\]([^\n]*custom_call_target="keops[^\n]*)', hlo)]
 
 
 def _rel(a, b):
