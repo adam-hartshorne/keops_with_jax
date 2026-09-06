@@ -11,6 +11,8 @@ import os
 import sys
 import jax
 import jax.numpy as jnp
+from jax.experimental.custom_partitioning import custom_partitioning
+from jax.sharding import NamedSharding, PartitionSpec as _PSpec
 import hashlib
 import re
 import threading
@@ -408,6 +410,181 @@ def _compute_output_shape(args, var_cats, axis, dimout, target_cat=None,
                                         target_cat, is_batched, batch_size)
 
 
+# ---------------------------------------------------------------------------------------------------
+# SPMD partitioning of the FFI call (CLAUDE.md known bug 5).
+#
+# XLA has no partitioning rule for a custom call it cannot see into. Under a multi-device `jit` with
+# sharded inputs it therefore REPLICATES the call: all-gathers every operand onto every device, runs
+# the whole reduction everywhere and slices each device's own rows back out. The answer is right and
+# each device does the work of all of them. `custom_partitioning` is JAX's way for a primitive to say
+# how it splits, and a KeOps reduction splits the same way whatever the formula: every output row is a
+# complete reduction over the other index, so the batch axis and the surviving row axis are
+# independent across devices, while the reduced row axis, every feature axis and every parameter must
+# be whole on each device. The rule below states exactly that; the per-device computation is the same
+# FFI call on the local shapes, which the binding already derives at trace time.
+#
+# Inside a `shard_map` body the call is already per device (the axes in context are manual), so it is
+# made as is: a caller that split the batch itself keeps working, bit for bit.
+# ---------------------------------------------------------------------------------------------------
+_partitioned_calls = BoundedLRUCache(maxsize=256)
+_partitioned_lock = threading.Lock()
+
+
+def _sharding_rule(var_cats, ranks, axis, out_rank):
+    """The Shardy sharding rule of one KeOps launch: the einsum-like string `custom_partitioning`
+    takes, and the factors that must stay replicated.
+
+    `axis=1` reduces over j and keeps the Vi rows, `axis=0` the reverse; a gradient launch follows the
+    same convention through its own axis. Factor names: `b` the batch, `i` the surviving rows, `j` the
+    reduced rows, `f<k>` operand k's feature axis, `p<k>_<d>` a parameter's axes, `o` the output's.
+    Only `b` and `i` are free to shard. Raises ValueError for an operand pattern it does not describe,
+    which the caller turns into the plain (replicated) call rather than a wrong rule."""
+    row_cat = 0 if axis == 1 else 1
+    ops, rep, has_rows = [], {"j", "o"}, False
+    for k, (cat, r) in enumerate(zip(var_cats, ranks)):
+        if cat != 2 and r in (2, 3):
+            if (r == 3) != (out_rank == 3):
+                raise ValueError("batched and unbatched variables in one launch")
+            row = "i" if cat == row_cat else "j"
+            has_rows = has_rows or row == "i"
+            names = (["b"] if r == 3 else []) + [row, f"f{k}"]
+            rep.add(f"f{k}")
+        else:                                       # a parameter, or a variable of an unexpected rank
+            names = [f"p{k}_{d}" for d in range(r)]
+            rep.update(names)
+        ops.append(" ".join(names))
+    if not has_rows:
+        raise ValueError("no variable carries the surviving rows")
+    result = "b i o" if out_rank == 3 else "i o"
+    # Shardy numbers the factors by first appearance and requires the special ones listed in that
+    # order ("indices of special factors must be sorted" at lowering otherwise), so list them so.
+    order = []
+    for names in ops + [result]:
+        for nm in names.split():
+            if nm not in order:
+                order.append(nm)
+    return ", ".join(ops) + " -> " + result, tuple(nm for nm in order if nm in rep)
+
+
+def _row_sharding_of(mesh, arg_shapes, result_shape, var_cats, ranks, axis, out_rank):
+    """What the rule allows, applied to the shardings the partitioner proposes: the mesh axes on the
+    batch and on the surviving rows, read off the result first and then off the operands, and the
+    per-operand and result shardings that carry only those. Everything else is replicated, which the
+    partitioner enforces with collectives on the way in."""
+    row_cat = 0 if axis == 1 else 1
+
+    def spec_of(s):
+        sh = getattr(s, "sharding", None)
+        spec = tuple(getattr(sh, "spec", None) or ()) if sh is not None else ()
+        return spec + (None,) * (len(s.shape) - len(spec))
+
+    def pick(*cands):
+        for c in cands:
+            if c is not None:
+                return c
+        return None
+
+    rs = spec_of(result_shape)
+    b_ax = rs[0] if out_rank == 3 else None
+    i_ax = rs[1] if out_rank == 3 else rs[0]
+    for s, cat, r in zip(arg_shapes, var_cats, ranks):
+        if cat == 2 or r not in (2, 3):
+            continue
+        sp = spec_of(s)
+        if r == 3:
+            b_ax = pick(b_ax, sp[0])
+        if cat == row_cat:
+            i_ax = pick(i_ax, sp[1] if r == 3 else sp[0])
+    if mesh is None:
+        for s in list(arg_shapes) + [result_shape]:
+            sh = getattr(s, "sharding", None)
+            if getattr(sh, "mesh", None) is not None:
+                mesh = sh.mesh
+                break
+
+    def ns(spec):
+        return NamedSharding(mesh, _PSpec(*spec))
+
+    args = []
+    for s, cat, r in zip(arg_shapes, var_cats, ranks):
+        if cat == 2 or r not in (2, 3):
+            args.append(ns((None,) * len(s.shape)))
+        elif r == 3:
+            args.append(ns((b_ax, i_ax if cat == row_cat else None, None)))
+        else:
+            args.append(ns((i_ax if cat == row_cat else None, None)))
+    result = ns((b_ax, i_ax, None) if out_rank == 3 else (i_ax, None))
+    return mesh, tuple(args), result
+
+
+def _partitioned_ffi_call(target_name, kernel_id, var_cats, axis, dimout, target_cat, jax_args):
+    """The FFI launch, partitioned over the batch and the surviving rows when the enclosing `jit` runs
+    on several devices. `dimout` and `target_cat` fix the output shape as `_compute_output_shape`
+    does; `kernel_id` must already be registered. `jax_args` are the launch's operands, batch axes
+    already broadcast."""
+    var_cats = tuple(int(c) for c in var_cats)
+
+    def launch(*a):
+        is_batched, batch_size = _batch_info(a, var_cats)
+        out_shape = _compute_output_shape(a, var_cats, axis, dimout, target_cat=target_cat,
+                                          is_batched=is_batched, batch_size=batch_size)
+        return jax.ffi.ffi_call(
+            target_name,
+            jax.ShapeDtypeStruct(shape=out_shape, dtype=a[0].dtype),
+            # None, so JAX refuses to batch this call. "broadcast_all" returned the right
+            # shape holding the wrong numbers (max error 5.05) whenever a jit sat between
+            # vmap and the reduction, where _reject_vmap cannot see the batch tracer.
+            vmap_method=None,
+            has_side_effect=False,
+        )(*a, kernel_id=int(kernel_id), batch_size=int(batch_size))
+
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh is not None and not getattr(mesh, "empty", True) and getattr(mesh, "manual_axes", ()):
+        return launch(*jax_args)                    # a shard_map body: already one device's slice
+
+    ranks = tuple(len(getattr(a, "shape", ())) for a in jax_args)
+    out_rank = 3 if _batch_info(jax_args, var_cats)[0] else 2
+    key = (target_name, int(kernel_id), var_cats, int(axis), int(dimout), target_cat, ranks)
+    f = _partitioned_calls.get(key)
+    if f is None:
+        try:
+            rule, replicated = _sharding_rule(var_cats, ranks, axis, out_rank)
+        except ValueError:
+            f = launch                              # not described by the rule: the plain call
+        else:
+            def partition(mesh, arg_shapes, result_shape):
+                mesh, arg_sh, res_sh = _row_sharding_of(mesh, arg_shapes, result_shape, var_cats, ranks, axis, out_rank)
+                return mesh, launch, res_sh, arg_sh
+
+            def infer_sharding_from_operands(mesh, arg_shapes, result_shape):
+                return _row_sharding_of(mesh, arg_shapes, result_shape, var_cats, ranks, axis, out_rank)[2]
+
+            def propagate_user_sharding(mesh, user_shape):
+                return getattr(user_shape, "sharding", None)
+
+            f = custom_partitioning(launch)
+            f.def_partition(partition,
+                            propagate_user_sharding=propagate_user_sharding,
+                            infer_sharding_from_operands=infer_sharding_from_operands,
+                            sharding_rule=rule, need_replication_factors=replicated)
+        with _partitioned_lock:
+            _partitioned_calls.set(key, f)
+    try:
+        return f(*jax_args)
+    except NotImplementedError as e:
+        # The partitioning primitive has no differentiation rule, and neither has the launch inside it:
+        # a second-order derivative (a jvp of a grad) reached the plain launch before this and got JAX's
+        # own ValueError, which callers and test_advanced.py::test_hessian match on. Same limitation,
+        # same error.
+        if "custom_partitioning" in str(e):
+            raise ValueError(
+                f"The FFI call to `{target_name}` cannot be differentiated. You can use `jax.custom_jvp` "
+                f"or `jax.custom_vjp` to add support. (KeOps: a second-order derivative reached the launch.)"
+            ) from e
+        raise
+
+
+
 def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dtype_str, input_dim, var_cat, enable_vjp=True):
     """Create gradient operator."""
 
@@ -466,25 +643,10 @@ def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dty
                                     f"  Original error: {e}"
                                 ) from e
 
-            reordered_args = jax_args
-            dimout = input_dim
-
-            output_shape = _compute_output_shape(jax_args, var_cats_grad, grad_axis, dimout,
-                                                 target_cat=var_cat, is_batched=is_batched,
-                                                 batch_size=batch_size)
-            result = jax.ShapeDtypeStruct(shape=output_shape, dtype=jax_args[0].dtype)
-
-            output = jax.ffi.ffi_call(
-                target_name,
-                result,
-                # None, so JAX refuses to batch this call. "broadcast_all" returned the right
-                # shape holding the wrong numbers (max error 5.05) whenever a jit sat between
-                # vmap and the reduction, where _reject_vmap cannot see the batch tracer.
-                vmap_method=None,
-                has_side_effect=False
-            )(*reordered_args, kernel_id=int(kernel_id), batch_size=int(batch_size))
-
-            return output
+            # Partitioned under a multi-device jit (known bug 5): the batch and the surviving rows run
+            # per device, everything else stays whole. The vmap refusal lives inside it.
+            return _partitioned_ffi_call(target_name, kernel_id, var_cats_grad, grad_axis, input_dim,
+                                         var_cat, jax_args)
 
         return ffi_wrapper(*args)
 
@@ -717,23 +879,9 @@ def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str,
                         f"  This is an internal error - please report it."
                     )
 
-            output_shape = _compute_output_shape(jax_args, var_cats, axis, dimout,
-                                                 is_batched=is_batched, batch_size=batch_size)
-            result = jax.ShapeDtypeStruct(shape=output_shape, dtype=jax_args[0].dtype)
-
-            output = jax.ffi.ffi_call(
-                target_name,
-                result,
-                # None, so JAX refuses to batch this call. "broadcast_all" returned the right
-                # shape holding the wrong numbers (max error 5.05) whenever a jit sat between
-                # vmap and the reduction, where _reject_vmap cannot see the batch tracer.
-                vmap_method=None,
-                has_side_effect=False
-            )(*jax_args,
-              kernel_id=int(kernel_id),
-              batch_size=int(batch_size))
-
-            return output
+            # Partitioned under a multi-device jit (known bug 5): the batch and the surviving rows run
+            # per device, everything else stays whole. The vmap refusal lives inside it.
+            return _partitioned_ffi_call(target_name, kernel_id, var_cats, axis, dimout, None, jax_args)
 
         return ffi_wrapper(*args)
 

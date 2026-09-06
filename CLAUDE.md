@@ -365,30 +365,55 @@ allocation and OOMs on one card, so it ran at `groups: 2`, one card's share of t
 That biases the result in the safe direction: at the real per-card load the step is longer and the
 share smaller.
 
-### 5. Under XLA's SPMD partitioner the FFI call is REPLICATED (found 2026-09-06 in gsed; open here)
+### 5. Under XLA's SPMD partitioner the FFI call was REPLICATED (found 2026-09-06 in gsed, fixed the same day)
 
-A JAX program `jit`ted over a multi-device mesh with batch-sharded inputs runs every KeOps
-reduction on the WHOLE global batch on EVERY device. XLA has no partitioning rule for the
-FFI custom call, so it does the one safe thing: all-gathers the inputs onto every card,
-runs the call on all of them, and dynamic-slices each card's own rows back out. Measured
-in gsed's compiled training step on five RTX PRO 6000s: the varifold's `keops_*` and
+A JAX program `jit`ted over a multi-device mesh with batch-sharded inputs ran every KeOps
+reduction on the WHOLE global batch on EVERY device. XLA has no partitioning rule for a custom
+call it cannot see into, so it did the one safe thing: all-gathered the operands onto every
+card, ran the reduction on all of them, and dynamic-sliced each card's own rows back out.
+Measured in gsed's compiled training step on five RTX PRO 6000s: the varifold's `keops_*` and
 `keops_jax_grad_*` calls took `f32[25,24778,3]` operands assembled by all-gather from the
 cards' `[5,24778,3]` slices, with 16 partition-id slices after them -- each card doing the
 work of all five, the largest term in the step at 5x its needed cost, the collectives
-another 8% of GPU time. Nothing raises: the answer is right, five times over.
+another 8% of GPU time. Nothing raised: the answer was right, five times over.
 
-The caller's fix, for now: `jax.shard_map` over the batch axis around the reduction
-(per-sample arrays sharded, formula parameters replicated, `check_vma=False` because
-`ffi_call` drops the varying-axes type on its outputs, jax 0.11.1 `ffi.py:638`), which is
-what gsed does in `gsed/losses.py::per_device_over_batch` and `gsed/fused_ode.py::sharded_call`.
-On one device that is the plain call. Measured there: the training step 0.22 -> 0.145 s.
+**The fix is `generic_ops._partitioned_ffi_call`**, which both launch sites (forward and
+gradient) now go through. It wraps the FFI launch in `jax.experimental.custom_partitioning`
+with a Shardy sharding rule built from what the binding already knows: the alias categories
+(Vi / Vj / Pm) and whether a batch axis is present. Every output row of a KeOps reduction is a
+complete reduction over the other index, so the rule frees exactly two factors, the batch
+axis and the surviving row axis (`Vi`'s for `axis=1`, `Vj`'s for `axis=0`; a gradient launch
+follows the same convention through its own axis), and marks the reduced row axis, every
+feature axis and every parameter `need_replication`. The per-device computation is the same
+`ffi_call` on the local shapes, whose batch size and output shape the binding derives at
+trace time as before; `kernel_id` and the C++/FFI registration are untouched. Three details
+that cost a round each: Shardy numbers factors by first appearance and requires the special
+factors listed in that order (the verifier says "indices of special factors must be sorted"
+otherwise); the JAX backend's first, registering call accepts JAX arrays or tracers only,
+never numpy (`common/get_options.py::_find_mem`, pre-existing); and the partitioning
+primitive has no differentiation rule, so a second-order derivative now raised a
+NotImplementedError where the bare launch raised JAX's ValueError "cannot be differentiated"
+-- the same limitation, which `test_advanced.py::test_hessian` matches on, so the launch
+re-raises it in the original form.
 
-The proper fix is here: a `jax.experimental.custom_partitioning` rule on the primitive
-declaring the batch axis independent, so every caller is safe by default. It touches the
-FFI registration (`generic_ops.py:456`, `:691`), needs the batch/ranges machinery to see
-the per-shard shapes (it does today, they are ordinary trace-time shapes), and must keep
-the vmap refusal (#2) intact -- shard_map produces no BatchTracer, custom_partitioning's
-inner call must not either. A caller-side shard_map stays correct if this lands.
+What it does and does not do, pinned by `jax/test/test_sharding.py` on five GPUs
+(7 tests; the per-device ones skip below two GPUs, the rule-string one runs anywhere):
+
+* batch-sharded operands: each device launches on its own samples, value and gradients
+  bitwise the single-device call's, no all-gather in the compiled program;
+* a row shard of an unbatched call: each device reduces its own rows over all of j;
+* a shard over the REDUCED axis is gathered before the launch and the numbers are right,
+  never a partial sum -- the rule refuses to split j rather than combine it (a `psum` per
+  reduction type would be the extension, not needed by any caller yet);
+* a caller-side `shard_map` (gsed's fix before this rule, `check_vma=False`) still works:
+  inside a shard_map body the mesh axes in context are manual and the launch is made as is;
+* the LazyTensor path goes through the same launch and is covered.
+
+The vmap refusal (#2) is intact: custom_partitioning's per-shard tracing produces no
+BatchTracer. Ragged batches are a separate matter -- the binding batches by block-diagonal
+ranges over a flattened axis, which is also KeOps' native way to hold meshes of different
+sizes; a rule cutting on block boundaries would cover both, and exposing ragged ranges through
+the JAX binding is the work that would come first.
 
 ### 4. Importing pykeops.jax no longer pulls in torch (fixed 2026-09-03)
 
