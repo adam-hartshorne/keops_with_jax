@@ -365,6 +365,31 @@ allocation and OOMs on one card, so it ran at `groups: 2`, one card's share of t
 That biases the result in the safe direction: at the real per-card load the step is longer and the
 share smaller.
 
+### 5. Under XLA's SPMD partitioner the FFI call is REPLICATED (found 2026-09-06 in gsed; open here)
+
+A JAX program `jit`ted over a multi-device mesh with batch-sharded inputs runs every KeOps
+reduction on the WHOLE global batch on EVERY device. XLA has no partitioning rule for the
+FFI custom call, so it does the one safe thing: all-gathers the inputs onto every card,
+runs the call on all of them, and dynamic-slices each card's own rows back out. Measured
+in gsed's compiled training step on five RTX PRO 6000s: the varifold's `keops_*` and
+`keops_jax_grad_*` calls took `f32[25,24778,3]` operands assembled by all-gather from the
+cards' `[5,24778,3]` slices, with 16 partition-id slices after them -- each card doing the
+work of all five, the largest term in the step at 5x its needed cost, the collectives
+another 8% of GPU time. Nothing raises: the answer is right, five times over.
+
+The caller's fix, for now: `jax.shard_map` over the batch axis around the reduction
+(per-sample arrays sharded, formula parameters replicated, `check_vma=False` because
+`ffi_call` drops the varying-axes type on its outputs, jax 0.11.1 `ffi.py:638`), which is
+what gsed does in `gsed/losses.py::per_device_over_batch` and `gsed/fused_ode.py::sharded_call`.
+On one device that is the plain call. Measured there: the training step 0.22 -> 0.145 s.
+
+The proper fix is here: a `jax.experimental.custom_partitioning` rule on the primitive
+declaring the batch axis independent, so every caller is safe by default. It touches the
+FFI registration (`generic_ops.py:456`, `:691`), needs the batch/ranges machinery to see
+the per-shard shapes (it does today, they are ordinary trace-time shapes), and must keep
+the vmap refusal (#2) intact -- shard_map produces no BatchTracer, custom_partitioning's
+inner call must not either. A caller-side shard_map stays correct if this lands.
+
 ### 4. Importing pykeops.jax no longer pulls in torch (fixed 2026-09-03)
 
 `pykeops/__init__.py` used to run `from .torch.test_install import test_torch_bindings` at import,
