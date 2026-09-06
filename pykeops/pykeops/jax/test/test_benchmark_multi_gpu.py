@@ -86,6 +86,7 @@ class ScalingConfig:
 class ScalingResult:
     config_name: str
     size_str: str
+    launch: str          # "jit" or "shard_map"; see LAUNCH_MODES
     total_batch_size: int
     bg: int
     n_gpus: int
@@ -111,6 +112,18 @@ SCALING_CONFIGS = [
     ScalingConfig("XLarge (Varifold)", 100_000, 100_000, 3,
                   "Exp(-SqNorm2(x-y)*s) * Square((u|v))", mode="varifold"),
 ]
+
+# The two ways a caller reaches several GPUs, and they are not equivalent.
+#
+#   jit        plain `jax.jit` over operands that carry a NamedSharding. This is what most
+#              callers write, and it is the path known bug 5 was about: XLA has no partitioning
+#              rule for a custom call, so before d579e35d it all-gathered the operands and ran
+#              the whole global batch on every device. `_partitioned_ffi_call` now supplies the
+#              rule. Measuring only shard_map hid that entirely.
+#   shard_map  the caller cuts the batch by hand. Inside a shard_map body the mesh axes are
+#              manual and the launch is made as is, so this path never regressed and never
+#              improved. It is the control.
+LAUNCH_MODES = ["jit", "shard_map"]
 
 N_WARMUP = 5
 N_ITERS = 20
@@ -175,8 +188,22 @@ def create_sharded_data(config: ScalingConfig, n_gpus, total_batch_size, seed=42
 # Benchmarking Core
 # =============================================================================
 
-def benchmark_op(op, args, mesh, mode="forward"):
-    """Run benchmark with visual progress bar. Mode can be 'forward' or 'backward'."""
+def benchmark_op(op, args, mesh, mode="forward", launch="shard_map"):
+    """Time one launch. `mode` is 'forward' or 'backward', `launch` is one of LAUNCH_MODES.
+
+    The operands are already globally sharded by create_sharded_data, so the jit path just jits
+    the op over them and lets the partitioner place the work."""
+
+    if launch == "jit":
+        if mode == "forward":
+            @jax.jit
+            def compute(*a):
+                return op(*a)
+        else:
+            @jax.jit
+            def compute(x, *others):
+                return jax.grad(lambda xx: op(xx, *others).sum())(x)
+        return _time(compute, args, mode)
 
     in_specs = []
     for i in range(len(args) - 1):
@@ -201,7 +228,11 @@ def benchmark_op(op, args, mesh, mode="forward"):
 
             return jax.grad(loss_fn)(x_loc)
 
-    # Execution
+    return _time(compute, args, mode)
+
+
+def _time(compute, args, mode):
+    """Warmup, then N_ITERS timed calls in batches of TIMING_BATCH; returns the median ms."""
     times = []
     mode_str = "Forward" if mode == "forward" else "Backward"
 
@@ -275,8 +306,9 @@ def format_efficiency(eff_pct):
         return f"[bold red]{eff_pct:.0f}%[/bold red]"
 
 
-def run_scaling_test(config: ScalingConfig, gpu_counts: List[int], bg: int):
+def run_scaling_test(config: ScalingConfig, bg: int, launch: str):
     results = []
+    failures = 0
     baseline_forward = None
     baseline_backward = None
     size_str = f"N={config.nx:,}"
@@ -293,8 +325,15 @@ def run_scaling_test(config: ScalingConfig, gpu_counts: List[int], bg: int):
 
     op = Genred(config.formula, aliases, reduction_op='Sum', axis=1)
 
+    # Only device counts that divide the batch: B is bg * N_GPUS, so this always ends at
+    # N_GPUS and never asks for a split that cannot be made. The old fixed [1, 2, 4, 8] raised
+    # on every count that did not divide B, which on a 5-GPU box was every 4-GPU run and half
+    # the 2-GPU ones, and left the summary tables empty.
+    gpu_counts = [g for g in range(1, N_GPUS + 1) if total_batch_size % g == 0]
+
     if RICH_AVAILABLE:
-        console.print(f"[bold]  Batch Size B={total_batch_size} (bg={bg})[/bold]")
+        console.print(f"[bold]  Batch Size B={total_batch_size} (bg={bg}), launch={launch}, "
+                      f"GPU counts {gpu_counts}[/bold]")
 
     for n_gpus in gpu_counts:
         try:
@@ -305,10 +344,10 @@ def run_scaling_test(config: ScalingConfig, gpu_counts: List[int], bg: int):
             if RICH_AVAILABLE:
                 console.print(f"    Running on [bold magenta]{n_gpus} GPUs[/bold magenta]...", end="\r")
 
-            forward_ms = benchmark_op(op, args, mesh, mode="forward")
+            forward_ms = benchmark_op(op, args, mesh, mode="forward", launch=launch)
 
             # 3. Benchmark Backward
-            backward_ms = benchmark_op(op, args, mesh, mode="backward")
+            backward_ms = benchmark_op(op, args, mesh, mode="backward", launch=launch)
 
             # Format arrows for inline display (with colors)
             def inline_speedup(speedup):
@@ -349,6 +388,7 @@ def run_scaling_test(config: ScalingConfig, gpu_counts: List[int], bg: int):
                 ScalingResult(
                     config_name=config.name,
                     size_str=size_str,
+                    launch=launch,
                     total_batch_size=total_batch_size,
                     bg=bg,
                     n_gpus=n_gpus,
@@ -364,8 +404,9 @@ def run_scaling_test(config: ScalingConfig, gpu_counts: List[int], bg: int):
             console.print(f"[red]Error on {n_gpus} GPUs: {e}[/red]")
             import traceback
             traceback.print_exc()
+            failures += 1
 
-    return results
+    return results, failures
 
 
 def print_summary_table(all_results: Dict[str, List[ScalingResult]], max_gpus):
@@ -375,6 +416,7 @@ def print_summary_table(all_results: Dict[str, List[ScalingResult]], max_gpus):
     # Forward Pass Table
     table_fwd = Table(title="[bold cyan]Forward Pass - Multi-GPU Performance[/bold cyan]", box=box.ROUNDED)
     table_fwd.add_column("Problem", style="cyan", justify="left")
+    table_fwd.add_column("Launch", style="magenta", justify="left")
     table_fwd.add_column("Size", style="dim", justify="right")
     table_fwd.add_column("Batch (B)", justify="right")
     table_fwd.add_column("1 GPU (ms)", style="yellow", justify="right")
@@ -389,6 +431,7 @@ def print_summary_table(all_results: Dict[str, List[ScalingResult]], max_gpus):
         if r1 and r_max:
             table_fwd.add_row(
                 r1.config_name,
+                r1.launch,
                 r1.size_str,
                 str(r1.total_batch_size),
                 f"{r1.forward_ms:.2f}",
@@ -403,6 +446,7 @@ def print_summary_table(all_results: Dict[str, List[ScalingResult]], max_gpus):
     # Backward Pass Table
     table_bwd = Table(title="[bold cyan]Backward Pass - Multi-GPU Performance[/bold cyan]", box=box.ROUNDED)
     table_bwd.add_column("Problem", style="cyan", justify="left")
+    table_bwd.add_column("Launch", style="magenta", justify="left")
     table_bwd.add_column("Size", style="dim", justify="right")
     table_bwd.add_column("Batch (B)", justify="right")
     table_bwd.add_column("1 GPU (ms)", style="yellow", justify="right")
@@ -417,6 +461,7 @@ def print_summary_table(all_results: Dict[str, List[ScalingResult]], max_gpus):
         if r1 and r_max:
             table_bwd.add_row(
                 r1.config_name,
+                r1.launch,
                 r1.size_str,
                 str(r1.total_batch_size),
                 f"{r1.backward_ms:.2f}",
@@ -457,28 +502,27 @@ def main():
 
     if N_GPUS < 1:
         console.print("[bold red]No GPUs found![/bold red]")
-        return
-
-    # We test 1 GPU (Baseline) and then powers of 2 up to Max
-    gpu_counts = [1, 2, 4, 8]
-    gpu_counts = [g for g in gpu_counts if g <= N_GPUS]
+        return 1
 
     all_results = {}
+    total_failures = 0
 
     for config in SCALING_CONFIGS:
         console.rule(f"[bold blue]{config.name} (N={config.nx:,})[/bold blue]")
 
-        # Iterate over different Batch-per-GPU settings
-        for bg in BATCHES_PER_GPU_LIST:
-            results = run_scaling_test(config, gpu_counts, bg)
-            # Store with unique key to separate bg in dictionary
-            key = f"{config.name}_bg{bg}"
-            all_results[key] = results
+        # Both launch paths, so the plain-jit numbers the partitioning rule governs are visible
+        # next to the shard_map control.
+        for launch in LAUNCH_MODES:
+            for bg in BATCHES_PER_GPU_LIST:
+                results, failures = run_scaling_test(config, bg, launch)
+                total_failures += failures
+                key = f"{config.name}_bg{bg}_{launch}"
+                all_results[key] = results
 
         console.print()
 
-    # Final Summary Table
-    print_summary_table(all_results, max(gpu_counts))
+    # Final Summary Table. Keyed on every card, which is always in gpu_counts now.
+    print_summary_table(all_results, N_GPUS)
 
     # Save Results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -489,6 +533,12 @@ def main():
         json.dump(data, f, indent=2)
     console.print(f"[dim]Results saved to {output_file}[/dim]")
 
+    # A benchmark that swallowed every failure and still exited 0 is how the broken GPU counts
+    # went unnoticed: run_tests.py reported PASSED beside two empty tables.
+    if total_failures:
+        console.print(f"[bold red]{total_failures} benchmark configuration(s) failed.[/bold red]")
+    return 1 if total_failures else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
