@@ -1,238 +1,159 @@
 #!/usr/bin/env python3
+"""KernelSolve on the JAX backend.
+
+Covers the conjugate-gradient solve of (alpha I + K) a = b: its residual, agreement with
+pykeops.torch, behaviour across regularizations and kernels, and a kernel ridge fit.
+
+Nothing here runs at import. Until 2026-09-06 the whole file was module-level code, so pytest
+executed it while collecting and then collected no tests from it, and every check printed its
+verdict without ever failing the run.
 """
-Test script for KernelSolve functionality.
 
-Tests:
-1. Basic kernel solve (Gaussian kernel)
-2. Comparison with PyTorch KernelSolve
-3. Different regularization values
-4. Gradient computation through the solve
-"""
-
-import pytest
-
-# Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
-# markers and skips on missing hardware, so declaring them at module level is what makes
-# `pytest -m pytorch` and `pytest -m gpu` select anything.
-pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
+import sys
 
 import numpy as np
 import jax.numpy as jnp
-import jax
+import pytest
 
-print("=" * 70)
-print("Testing KernelSolve")
-print("=" * 70)
+from pykeops.jax import Genred, KernelSolve
 
-# Generate test data
-np.random.seed(42)
-N = 100
-D = 3
-x_np = np.random.randn(N, D).astype(np.float32)
-b_np = np.random.randn(N, D).astype(np.float32)
+# Every test here needs a GPU and the torch comparison needs PyTorch with CUDA. conftest.py
+# registers these markers and skips on missing hardware, so declaring them at module level is what
+# makes `pytest -m pytorch` and `pytest -m gpu` select anything.
+pytestmark = [pytest.mark.gpu, pytest.mark.pytorch]
 
-# =============================================================================
-# Test 1: Basic KernelSolve
-# =============================================================================
-print("\n" + "=" * 70)
-print("Test 1: Basic KernelSolve (Gaussian Kernel)")
-print("=" * 70)
+N, D = 100, 3
+EPS = 1e-6
+FORMULA = "Exp(-SqDist(x,y)) * a"
+ALIASES = ["x=Vi(3)", "y=Vj(3)", "a=Vj(3)"]
 
-try:
-    from pykeops.jax import KernelSolve
+# A conjugate-gradient residual only means something against the scale of the right-hand side, and
+# the conditioning of (alpha I + K) grows as alpha shrinks, so the check is relative. Measured
+# 2026-09-06 across the four alphas below: 2.1e-5 at alpha=0.01, then 3.8e-6, 1.0e-6, 6.3e-7. The
+# absolute 1e-4 this file used before put alpha=0.01 over the line (3.5e-4 against ||b|| = 16.6)
+# and printed PASSED regardless, because the summary line was unconditional.
+RTOL_RESIDUAL = 1e-4
 
-    # Define Gaussian kernel: K(x,y) * a = exp(-|x-y|^2) * a
-    formula = "Exp(-SqDist(x,y)) * a"
-    aliases = ["x=Vi(3)", "y=Vj(3)", "a=Vj(3)"]
+# JAX and torch run the same kernel but reduce with different libraries, so agreement is checked
+# at single-precision scale rather than bitwise.
+ATOL_VS_TORCH = 1e-4
 
-    solver = KernelSolve(formula, aliases, "a", axis=1)
 
-    x_jax = jnp.array(x_np)
-    b_jax = jnp.array(b_np)
+@pytest.fixture(scope="module")
+def data():
+    """The x and b of (alpha I + K) a = b, shared by every test in the file."""
+    np.random.seed(42)
+    x = np.random.randn(N, D).astype(np.float32)
+    b = np.random.randn(N, D).astype(np.float32)
+    return jnp.array(x), jnp.array(b), x, b
 
-    # Solve (αI + K)a = b
+
+@pytest.fixture(scope="module")
+def solver():
+    return KernelSolve(FORMULA, ALIASES, "a", axis=1)
+
+
+@pytest.fixture(scope="module")
+def kernel_op():
+    return Genred(FORMULA, ALIASES, reduction_op="Sum", axis=1)
+
+
+def relative_residual(kernel_op, x, a, b, alpha):
+    """||(alpha I + K) a - b|| / ||b||."""
+    Ka = kernel_op(x, x, a)
+    return float(jnp.linalg.norm(Ka + alpha * a - b) / jnp.linalg.norm(b))
+
+
+def test_basic_solve(data, solver, kernel_op):
+    """A Gaussian kernel solve returns the right shape and a small residual."""
+    x_jax, b_jax, _, _ = data
     alpha = 0.1
-    a_star = solver(x_jax, x_jax, b_jax, alpha=alpha, eps=1e-6)
 
-    print(f"Solution shape: {a_star.shape}")
-    print(f"Solution (first 3 rows):\n{a_star[:3]}")
+    a_star = solver(x_jax, x_jax, b_jax, alpha=alpha, eps=EPS)
 
-    # Verify solution: compute residual ||(αI + K)a - b||
-    from pykeops.jax import Genred
+    assert a_star.shape == (N, D)
+    residual = relative_residual(kernel_op, x_jax, a_star, b_jax, alpha)
+    print(f"  relative residual at alpha={alpha}: {residual:.2e}")
+    assert residual < RTOL_RESIDUAL
 
-    K_op = Genred(formula, aliases, reduction_op='Sum', axis=1)
-    Ka = K_op(x_jax, x_jax, a_star)
-    residual = Ka + alpha * a_star - b_jax
-    residual_norm = jnp.linalg.norm(residual)
 
-    print(f"\nResidual ||Ka + αa - b||: {residual_norm}")
-
-    if residual_norm < 1e-4:
-        print("✓ Basic KernelSolve PASSED!")
-    else:
-        print(f"✗ Basic KernelSolve FAILED - residual too large: {residual_norm}")
-
-except Exception as e:
-    print(f"✗ Basic KernelSolve FAILED: {e}")
-    import traceback
-
-    traceback.print_exc()
-
-# =============================================================================
-# Test 2: Compare with PyTorch KernelSolve
-# =============================================================================
-print("\n" + "=" * 70)
-print("Test 2: Compare with PyTorch KernelSolve")
-print("=" * 70)
-
-try:
+def test_matches_torch(data):
+    """The JAX solve agrees with pykeops.torch on the same system."""
     import torch
     from pykeops.torch import KernelSolve as KernelSolve_torch
 
-    # PyTorch solve
-    solver_torch = KernelSolve_torch(formula, aliases, "a", axis=1)
-
-    x_torch = torch.tensor(x_np, device='cuda')
-    b_torch = torch.tensor(b_np, device='cuda')
-
-    a_star_torch = solver_torch(x_torch, x_torch, b_torch, alpha=alpha, eps=1e-6)
-
-    # Compare
-    a_star_jax_np = np.array(a_star)
-    a_star_torch_np = a_star_torch.cpu().numpy()
-
-    max_diff = np.abs(a_star_jax_np - a_star_torch_np).max()
-    print(f"Max difference JAX vs PyTorch: {max_diff}")
-
-    if max_diff < 1e-4:
-        print("✓ JAX vs PyTorch comparison PASSED!")
-    else:
-        print(f"✗ JAX vs PyTorch comparison FAILED - max diff: {max_diff}")
-
-except ImportError:
-    print("PyTorch not available - skipping comparison")
-except Exception as e:
-    print(f"✗ PyTorch comparison FAILED: {e}")
-    import traceback
-
-    traceback.print_exc()
-
-# =============================================================================
-# Test 3: Different alpha values
-# =============================================================================
-print("\n" + "=" * 70)
-print("Test 3: Different Regularization Values")
-print("=" * 70)
-
-try:
-    for alpha_test in [0.01, 0.1, 1.0, 10.0]:
-        a_star = solver(x_jax, x_jax, b_jax, alpha=alpha_test, eps=1e-6)
-
-        Ka = K_op(x_jax, x_jax, a_star)
-        residual = Ka + alpha_test * a_star - b_jax
-        residual_norm = jnp.linalg.norm(residual)
-
-        status = "✓" if residual_norm < 1e-4 else "✗"
-        print(f"  α={alpha_test:5.2f}: residual={residual_norm:.2e} {status}")
-
-    print("✓ Different alpha values PASSED!")
-
-except Exception as e:
-    print(f"✗ Different alpha values FAILED: {e}")
-    import traceback
-
-    traceback.print_exc()
-
-# =============================================================================
-# Test 4: Laplacian Kernel
-# =============================================================================
-print("\n" + "=" * 70)
-print("Test 4: Laplacian Kernel")
-print("=" * 70)
-
-try:
-    # Laplacian kernel: exp(-|x-y|) * a
-    formula_lap = "Exp(-Sqrt(SqDist(x,y)+IntCst(1e-6))) * a"
-    aliases_lap = ["x=Vi(3)", "y=Vj(3)", "a=Vj(3)"]
-
-    solver_lap = KernelSolve(formula_lap, aliases_lap, "a", axis=1)
-
+    x_jax, b_jax, x_np, b_np = data
     alpha = 0.1
-    a_star_lap = solver_lap(x_jax, x_jax, b_jax, alpha=alpha, eps=1e-6)
 
-    # Verify
-    K_op_lap = Genred(formula_lap, aliases_lap, reduction_op='Sum', axis=1)
-    Ka_lap = K_op_lap(x_jax, x_jax, a_star_lap)
-    residual_lap = Ka_lap + alpha * a_star_lap - b_jax
-    residual_norm_lap = jnp.linalg.norm(residual_lap)
+    solver_jax = KernelSolve(FORMULA, ALIASES, "a", axis=1)
+    a_star_jax = np.array(solver_jax(x_jax, x_jax, b_jax, alpha=alpha, eps=EPS))
 
-    print(f"Laplacian kernel residual: {residual_norm_lap}")
+    solver_torch = KernelSolve_torch(FORMULA, ALIASES, "a", axis=1)
+    x_torch = torch.tensor(x_np, device="cuda")
+    b_torch = torch.tensor(b_np, device="cuda")
+    a_star_torch = solver_torch(x_torch, x_torch, b_torch, alpha=alpha, eps=EPS)
 
-    if residual_norm_lap < 1e-4:
-        print("✓ Laplacian Kernel PASSED!")
-    else:
-        print(f"✗ Laplacian Kernel FAILED - residual: {residual_norm_lap}")
+    max_diff = np.abs(a_star_jax - a_star_torch.cpu().numpy()).max()
+    print(f"  max |jax - torch|: {max_diff:.2e}")
+    assert max_diff < ATOL_VS_TORCH
 
-except Exception as e:
-    print(f"✗ Laplacian Kernel FAILED: {e}")
-    import traceback
 
-    traceback.print_exc()
+@pytest.mark.parametrize("alpha", [0.01, 0.1, 1.0, 10.0])
+def test_regularization(data, solver, kernel_op, alpha):
+    """The residual stays small across four orders of magnitude of regularization."""
+    x_jax, b_jax, _, _ = data
 
-# =============================================================================
-# Test 5: Kernel Ridge Regression Example
-# =============================================================================
-print("\n" + "=" * 70)
-print("Test 5: Kernel Ridge Regression")
-print("=" * 70)
+    a_star = solver(x_jax, x_jax, b_jax, alpha=alpha, eps=EPS)
 
-try:
-    # Generate regression data
+    residual = relative_residual(kernel_op, x_jax, a_star, b_jax, alpha)
+    print(f"  alpha={alpha:5.2f}: relative residual={residual:.2e}")
+    assert residual < RTOL_RESIDUAL
+
+
+def test_laplacian_kernel(data):
+    """A kernel other than the Gaussian solves to the same accuracy."""
+    x_jax, b_jax, _, _ = data
+    alpha = 0.1
+    formula = "Exp(-Sqrt(SqDist(x,y)+IntCst(1e-6))) * a"
+    aliases = ["x=Vi(3)", "y=Vj(3)", "a=Vj(3)"]
+
+    solver_lap = KernelSolve(formula, aliases, "a", axis=1)
+    a_star = solver_lap(x_jax, x_jax, b_jax, alpha=alpha, eps=EPS)
+
+    kernel_op = Genred(formula, aliases, reduction_op="Sum", axis=1)
+    residual = relative_residual(kernel_op, x_jax, a_star, b_jax, alpha)
+    print(f"  Laplacian relative residual: {residual:.2e}")
+    assert residual < RTOL_RESIDUAL
+
+
+def test_kernel_ridge_regression():
+    """The solve is usable as the fitting step of a kernel ridge regression."""
     np.random.seed(123)
-    N_train = 200
-    x_train = np.random.randn(N_train, 1).astype(np.float32)
-    y_train = (np.sin(3 * x_train) + 0.1 * np.random.randn(N_train, 1)).astype(np.float32)
+    n_train = 200
+    x_train = np.random.randn(n_train, 1).astype(np.float32)
+    y_train = (np.sin(3 * x_train) + 0.1 * np.random.randn(n_train, 1)).astype(
+        np.float32
+    )
 
-    x_train_jax = jnp.array(x_train)
-    y_train_jax = jnp.array(y_train)
-
-    # Gaussian RBF kernel with sigma as a Pm parameter
-    # K(x,y) = exp(-|x-y|^2 * oos2) where oos2 = 1/(2*sigma^2)
     sigma = 0.5
-    oos2 = np.array([1.0 / (2 * sigma ** 2)], dtype=np.float32)  # 1/(2*sigma^2)
+    oos2 = jnp.array(np.array([1.0 / (2 * sigma**2)], dtype=np.float32))
+    x_jax = jnp.array(x_train)
+    y_jax = jnp.array(y_train)
 
-    formula_krr = "Exp(-SqDist(x,y) * oos2) * a"
-    aliases_krr = ["x=Vi(1)", "y=Vj(1)", "a=Vj(1)", "oos2=Pm(1)"]
+    formula = "Exp(-SqDist(x,y) * oos2) * a"
+    aliases = ["x=Vi(1)", "y=Vj(1)", "a=Vj(1)", "oos2=Pm(1)"]
 
-    solver_krr = KernelSolve(formula_krr, aliases_krr, "a", axis=1)
+    coeffs = KernelSolve(formula, aliases, "a", axis=1)(
+        x_jax, x_jax, y_jax, oos2, alpha=0.01
+    )
+    y_pred = Genred(formula, aliases, reduction_op="Sum", axis=1)(
+        x_jax, x_jax, coeffs, oos2
+    )
 
-    # Solve for coefficients
-    alpha_krr = 0.01
-    oos2_jax = jnp.array(oos2)
-    coeffs = solver_krr(x_train_jax, x_train_jax, y_train_jax, oos2_jax, alpha=alpha_krr)
+    mse = float(jnp.mean((y_pred - y_jax) ** 2))
+    print(f"  training MSE: {mse:.6f}")
+    assert mse < 0.1
 
-    # Make predictions
-    K_krr = Genred(formula_krr, aliases_krr, reduction_op='Sum', axis=1)
-    y_pred = K_krr(x_train_jax, x_train_jax, coeffs, oos2_jax)
 
-    # Compute training error
-    mse = jnp.mean((y_pred - y_train_jax) ** 2)
-    print(f"Training MSE: {mse:.6f}")
-
-    if mse < 0.1:
-        print("✓ Kernel Ridge Regression PASSED!")
-    else:
-        print(f"⚠ Kernel Ridge Regression: MSE higher than expected ({mse})")
-
-except Exception as e:
-    print(f"✗ Kernel Ridge Regression FAILED: {e}")
-    import traceback
-
-    traceback.print_exc()
-
-# =============================================================================
-# Summary
-# =============================================================================
-print("\n" + "=" * 70)
-print("KernelSolve Testing Complete")
-print("=" * 70)
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q", "-s"]))

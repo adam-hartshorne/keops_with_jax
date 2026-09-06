@@ -13,13 +13,17 @@ Comprehensive test suite for the JAX backend of KeOps.
 | `test_batched_gradients.py` | `batched` | 3D gradients, block-boundary cases |
 | `test_batch_broadcasting.py` | `broadcast` | Size-one batch axes against a batch |
 | `test_helpers.py` | `helpers` | generic_sum, generic_logsumexp and friends |
+| `test_kernelsolve.py` | `kernelsolve` | Conjugate-gradient solve: residual, agreement with torch, ridge regression |
+| `test_varifold_batched_grad.py` | `varifold` | Batched varifold loss and gradient at five scales; the slowest suite, and the largest scale is the one most likely to OOM |
 | `test_sharding.py` | `sharding` | The launch under a multi-device jit: per-device launches, no all-gather, the shard_map path (needs no PyTorch; per-device tests skip below two GPUs) |
 | `test_benchmark_single_gpu.py` | `benchmark` | Single-GPU timings, not in `all` |
 | `test_benchmark_multi_gpu.py` | `benchmark-multi` | Multi-GPU scaling, not in `all` |
 
 Every one of these needs a GPU, and all but `sharding` compare against PyTorch KeOps as ground
-truth: without PyTorch with CUDA they exit rather than run, because the comparison is the test.
-`sharding` compares the multi-device call against the single-device call instead.
+truth, because the comparison is the test. `sharding` compares the multi-device call against the
+single-device call instead. Without PyTorch with CUDA the `main()`-driven suites exit rather than
+run, while the three pytest files (`sharding`, `kernelsolve`, `varifold`) skip through the markers
+conftest.py applies.
 
 ## Quick Start
 
@@ -33,6 +37,8 @@ python run_tests.py api           # API tests only
 python run_tests.py correctness   # Cross-validation (needs PyTorch)
 python run_tests.py advanced      # Advanced features
 python run_tests.py sharding      # Multi-device partitioning of the launch (two or more GPUs)
+python run_tests.py kernelsolve   # KernelSolve
+python run_tests.py varifold      # Batched varifold at five scales (slow)
 
 # Run benchmarks
 python run_tests.py benchmark       # Single GPU
@@ -44,7 +50,7 @@ python run_tests.py quick
 
 ## Using pytest
 
-Run from inside this directory; it collects 74 tests.
+Run from inside this directory; it collects 87 tests in about 4 s.
 
 ```bash
 pytest -q                          # everything, in one process
@@ -58,10 +64,17 @@ Two differences from `run_tests.py`:
 
 - Helpers that take arguments and are driven by a file's `main()` are named `check_*`, not
   `test_*`, so pytest does not collect them as tests with missing fixtures. Follow that when
-  adding one.
+  adding one. `test_correctness.py` is written entirely that way, so pytest collects nothing from
+  it: a green `pytest -q` has not cross-checked anything against `pykeops.torch`. Use
+  `python run_tests.py correctness` for that.
 - pytest runs every file in a single process, where `run_tests.py` forks one per file. The
   memory-hungry `test_high_dim_gradient` can therefore run out of GPU memory under pytest on a
   busy card while passing on its own.
+
+Keep test bodies inside functions. `test_kernelsolve.py` and `test_varifold_batched_grad.py` used
+to do their work at module level, which meant pytest ran them while importing them and collected
+no tests from either: collection alone took 12 s and executed a 21 x 98776 x 25000 varifold, and
+an OOM there killed the run before any test started. Both are ordinary test functions now.
 
 `old/` is excluded from collection: it holds superseded tests that no longer import.
 

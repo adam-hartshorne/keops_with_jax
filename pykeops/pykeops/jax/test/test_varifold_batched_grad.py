@@ -1,3 +1,13 @@
+"""The batched varifold loss and its gradient, JAX against PyTorch, at five scales.
+
+Nothing here runs at import. Until 2026-09-06 the five scales were module-level calls, so pytest
+ran them all while collecting and then collected no tests from the file. The largest of them
+allocates a 21 x 98776 x 25000 reduction, and an OOM there took the whole collection down before
+any other test in the directory could run.
+"""
+
+import sys
+
 import pytest
 
 # Every test here needs a GPU and compares against PyTorch KeOps. conftest.py registers these
@@ -169,10 +179,32 @@ def check_at_scale(B, N, M, name=""):
     else:
         print("  ✗ FAIL")
 
+    return loss_rel_diff, grad_rel_diff
 
-# Run at different scales
-check_at_scale(2, 50, 40, "Small")
-check_at_scale(2, 500, 400, "Medium")
-check_at_scale(2, 5000, 4000, "Large")
-check_at_scale(4, 10000, 5000, "Very Large")
-check_at_scale(21, 98776, 25000, "Your actual size")  # This might OOM or take long
+
+# The last one is the size that motivated this file. It is the slowest test in the directory and
+# the one most likely to OOM on a card someone else is using.
+SCALES = [
+    (2, 50, 40, "Small"),
+    (2, 500, 400, "Medium"),
+    (2, 5000, 4000, "Large"),
+    (4, 10000, 5000, "Very Large"),
+    (21, 98776, 25000, "Your actual size"),
+]
+
+
+@pytest.mark.parametrize("B,N,M,name", SCALES, ids=[s[3] for s in SCALES])
+def test_scale(B, N, M, name):
+    """JAX matches PyTorch on the loss and on the gradient at this scale.
+
+    Tolerances as in check_at_scale: the loss is compared at 1e-4 relative because the XLA reduce
+    after the kernel picks its algorithm per process, and the gradient at 1e-2 relative is the
+    real correctness signal.
+    """
+    loss_rel_diff, grad_rel_diff = check_at_scale(B, N, M, name)
+    assert loss_rel_diff < 1e-4, f"{name}: loss relative diff {loss_rel_diff:.2e}"
+    assert grad_rel_diff < 1e-2, f"{name}: gradient relative diff {grad_rel_diff:.2e}"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q", "-s"]))

@@ -117,6 +117,9 @@ Test Suites:
   batched         Batched (3D tensor) gradient tests vs PyTorch
   broadcast       Size-one batch axes broadcast like NumPy and PyTorch
   helpers         Helper functions (generic_sum, generic_logsumexp, etc.)
+  kernelsolve     KernelSolve: residual, agreement with torch, ridge regression
+  sharding        The launch under a multi-device jit (needs no PyTorch)
+  varifold        Batched varifold loss and gradient vs PyTorch, five scales (slowest)
   benchmark       Single-GPU performance benchmarks
   benchmark-multi Multi-GPU scaling benchmarks
   quick           Quick sanity check (subset of api tests)
@@ -142,14 +145,18 @@ Test Suites:
         'batched': 'test_batched_gradients.py',
         'broadcast': 'test_batch_broadcasting.py',
         'helpers': 'test_helpers.py',
+        'kernelsolve': 'test_kernelsolve.py',
         'sharding': 'test_sharding.py',
+        'varifold': 'test_varifold_batched_grad.py',
         'benchmark': 'test_benchmark_single_gpu.py',
         'benchmark-multi': 'test_benchmark_multi_gpu.py',
     }
 
     # Handle 'all' and 'quick'
     if 'all' in args.suites:
-        suites = ['edge', 'api', 'correctness', 'advanced', 'batched', 'broadcast', 'helpers', 'sharding']
+        # varifold last: it is the slowest and the one most likely to OOM on a shared card.
+        suites = ['edge', 'api', 'correctness', 'advanced', 'batched', 'broadcast', 'helpers',
+                  'kernelsolve', 'sharding', 'varifold']
     elif 'quick' in args.suites:
         suites = ['edge']
     else:
