@@ -15,27 +15,45 @@ Two packages:
 
 This checkout is a fork. The work is the JAX backend on the `jax_api` branch, about 50 commits
 ahead of `main`. The NumPy and PyTorch paths are upstream code and must keep working unchanged;
-`pykeops.torch` is also the correctness reference the JAX tests compare against.
+`pykeops.torch` is also the correctness reference the JAX tests compare against. `rkeops/` (the R
+binder), `doc/` (Sphinx) and `benchmarks/` are upstream too and nothing here touches them.
 
 ## Do not run Python with the repo root as the working directory
 
-`keops/keopscore/__init__.py` is a 0-byte file sitting next to `keopscore/setup.py`. Whenever the
-repo root is on `sys.path`, which is any `python` invocation started from there, it shadows the
-installed `keopscore` package and every pykeops import dies at
-`keopscore/keopscore/config/base_config.py:82` with:
-
-```
-AttributeError: module 'keopscore' has no attribute '__version__'
-```
+The repo root holds a directory called `keopscore/` and one called `pykeops/`, and both shadow the
+installed packages whenever the root is on `sys.path`, which is any `python` started from there.
+Neither has an `__init__.py`, so each resolves to an empty namespace package: `pykeops.__file__` is
+None and `__path__` is `['<root>/pykeops']`. That makes the failure quiet. `import pykeops` at the
+root succeeds, and nothing raises until something asks for an attribute, a long way from the cause.
 
 Run from somewhere else. `cd pykeops/pykeops/jax/test` for the test suite, or a scratch directory
-for one-off scripts. This also breaks `pytest` and `python -c` launched at the root.
+for one-off scripts. `python -c` and `python -m pytest` fail the same way at the root, because `-m`
+puts the working directory on `sys.path`. The bare `pytest` console script does not, so since the
+shim below was deleted it collects fine from the root; `python -m pytest` still does not.
+
+There used to be a second, worse version of this. A tracked 0-byte `keopscore/__init__.py` sat next
+to `keopscore/setup.py`, added on this branch by `9f596f38` and never present on `main`. Because
+pytest walks up from a test file through every directory holding an `__init__.py`, it walked
+through that one and put the repo root on `sys.path`, so `pytest keopscore/keopscore/test/` errored
+during collection from *any* working directory, `--import-mode=importlib` included. That is the
+keopscore half of `./pytest.sh`, which runs under `set +e` and exits with the status of the pykeops
+run, so `cuda_test.yml` reported green with 67 tests never running, from 2026-01-23 until the file
+was deleted on 2026-09-06. Do not reintroduce it; nothing imports it and `keopscore/setup.py` reads
+its data by path.
 
 ## Environment
 
-Conda env `jax_latest` (Python 3.12). `keopscore` and `pykeops` are installed editable and already
-point at this checkout. The JAX backend is CUDA only, with no CPU fallback, so it needs a GPU and a
-CUDA toolkit with `nvcc`.
+Conda env `jax_latest` (Python 3.12), and it is not what a fresh shell gives you:
+
+```bash
+source /home/adam/anaconda3/etc/profile.d/conda.sh && conda activate jax_latest
+```
+
+The default `python` is anaconda `base` (3.13) and has no JAX in it, so every command below needs
+that line first. `keopscore` and `pykeops` are installed editable in `jax_latest` and already point
+at this checkout. The JAX backend is CUDA only, with no CPU fallback, so it needs a GPU and a CUDA
+toolkit with `nvcc`. This box has five RTX PRO 6000 Blackwell cards at compute capability 12.0
+(`sm_120`), so the multi-GPU tests in `test_sharding.py` do run here.
 
 ## Build
 
@@ -52,9 +70,12 @@ Installing pykeops also builds the JAX C++ extension. `pykeops/setup.py` runs CM
 `pykeops/pykeops/jax/binders/` from both its `build` and `egg_info` commands and writes
 `keops_jax_ext.cpython-*.so` into `pykeops/pykeops/jax/`. `*.so` is gitignored, so a fresh clone has
 no extension until you install. `CMAKE_CUDA_ARCHITECTURES` comes from
-`nvidia-smi --query-gpu=compute_cap`, falling back to `70;75;80;86;89;90`. If JAX, nanobind, nvcc or
-cmake is missing, setup.py prints why, skips the extension and installs only the Python side, so
-watch the install log rather than the exit code.
+`nvidia-smi --query-gpu=compute_cap`, falling back to `70;75;80;86;89;90`, which stops short of the
+`sm_120` these cards report. That is harmless, and worth knowing so nobody chases it:
+`keops_jax.cpp` is a dlopen shim and an FFI handler with no device code (no `__global__`, no
+`<<<`), and the kernels that do run get their `-arch` from keopscore's own detection at runtime.
+If JAX, nanobind, nvcc or cmake is missing, setup.py prints why, skips the extension and installs
+only the Python side, so watch the install log rather than the exit code.
 
 After editing `keops_jax.cpp` or its `CMakeLists.txt`, rebuild. The configured tree persists, so
 
@@ -80,39 +101,68 @@ test files import `test_utils` as a top-level module.
 
 ```bash
 cd pykeops/pykeops/jax/test
-python run_tests.py              # edge, api, correctness, advanced, batched, broadcast, helpers, sharding
+python run_tests.py              # all but the benchmarks; see the suite list below
 python run_tests.py quick        # edge only
 python run_tests.py api          # one suite
 python run_tests.py correctness  # cross-check against pykeops.torch
-python run_tests.py --float64    # sets KEOPS_TEST_FLOAT64=1 and JAX_ENABLE_X64=1
+python run_tests.py --float64    # sets KEOPS_TEST_FLOAT64=1 and JAX_ENABLE_X64=1; exits 1 on
+                                 # the two complex tests of known bug 6, everything else passes
 python test_api.py               # one file directly; run_tests.py just shells out to this
 ```
 
-Suite names are api, correctness, edge, advanced, batched, broadcast, helpers, sharding, benchmark,
-benchmark-multi. Benchmarks are excluded from `all`.
+Suite names are api, correctness, edge, advanced, batched, broadcast, helpers, kernelsolve,
+sharding, varifold, benchmark, benchmark-multi. Benchmarks are excluded from `all`; varifold runs
+last in `all` because it is the slowest and the likeliest to OOM on a shared card.
 
 Every JAX test compares against `pykeops.torch` as ground truth and calls `sys.exit(1)` when
 PyTorch with CUDA is absent, except `test_sharding.py` (known bug 5): it compares the multi-device
 call against the single-device one, needs no torch, and skips its per-device tests below two GPUs.
 
-pytest works from inside that directory too, and collects 74 tests:
+pytest works from inside that directory too, and collects 87 tests in about 4 s:
 
 ```bash
-pytest -q                          # the whole suite in one process
+pytest -q                          # the whole collection in one process
 pytest test_api.py -k gradient     # select by name
 pytest -m pytorch                  # every test here is marked gpu and pytorch
 ```
 
-Two things to know. Helpers that take arguments and are driven by each file's `main()` are named
-`check_*`, not `test_*`, so pytest does not mistake them for tests with missing fixtures; if you
-add one, follow that. And pytest runs every file in one process where `run_tests.py` forks per
-file, so the memory-hungry `test_high_dim_gradient` can fail under pytest on a busy card while
-passing on its own. `run_tests.py` remains the runner the suites are written for.
+Know what that 74 covers before you trust a green run.
+
+The tests come from nine files: `test_edge_cases` 18, `test_api` 13, `test_helpers` 11,
+`test_batch_broadcasting` 11, `test_advanced` 10, `test_kernelsolve` 8, `test_sharding` 7,
+`test_varifold_batched_grad` 5, `test_batched_gradients` 4.
+`test_correctness.py` contributes none of them, because every function in it is a `check_*` driven
+by `main()`. A passing `pytest` run has therefore cross-checked nothing against `pykeops.torch`;
+`python run_tests.py correctness`, or `python test_correctness.py`, is what runs that. Helpers that
+take arguments are named `check_*` rather than `test_*` on purpose, so pytest does not
+mistake them for tests with missing fixtures, and you should follow that when adding one.
+
+Keep test bodies inside functions. Until 2026-09-06 `test_kernelsolve.py` and
+`test_varifold_batched_grad.py` did their work at module level, which meant pytest ran both while
+importing them and collected no tests from either. Collection alone took 12 s and executed
+`check_at_scale(21, 98776, 25000)`, whose own comment says it might OOM; had it, collection would
+have errored and killed the run before a single test started. Both are ordinary test functions now,
+wired into `run_tests.py` as the `kernelsolve` and `varifold` suites, and collection is down to
+4.3 s with nothing executing.
+
+pytest still runs every file in one process where `run_tests.py` forks per file, so
+`test_high_dim_gradient` can fail under pytest on a busy card while passing on its own.
+`run_tests.py` remains the runner the suites are written for.
 
 `./pytest.sh` is the upstream harness. It builds a throwaway venv, installs both packages, clears
 the cache, then runs `keopscore/keopscore/test/` and `pykeops/pykeops/test/`, which are the
 PyTorch and NumPy suites. It never touches the JAX backend.
 `.github/workflows/cuda_test.yml` runs it on a self-hosted GPU runner.
+
+You do not need that venv to run one upstream test. From any directory except the repo root:
+
+```bash
+python -m pytest ~/keops/pykeops/pykeops/test/test_numpy.py           # 8 tests, ~2 s
+python -m pytest ~/keops/pykeops/pykeops/test/test_lazytensor_grad.py
+```
+
+The keopscore half is the exception: `keopscore/keopscore/test/test_op.py` cannot be collected at
+all while the 0-byte `keopscore/__init__.py` is in place. See the working-directory section.
 
 ## Lint
 
@@ -323,11 +373,13 @@ rule, so JAX mapped over a handler that knows nothing about the extra axis.
 
 It is refused in two places, and it needs both:
 
-- `_reject_vmap` (`generic_ops.py:259`) raises `NotImplementedError` naming KeOps batch dimensions
+- `_reject_vmap` (`generic_ops.py:264`) raises `NotImplementedError` naming KeOps batch dimensions
   as the route. It spots the vmap tracer by class name, since `BatchTracer` moved to `jax._src` in
   JAX 0.11 and is no longer re-exported from `jax.interpreters.batching`.
-- Both `ffi_call` sites pass `vmap_method=None` (`generic_ops.py:483` and `:730`), which makes JAX
-  itself refuse to batch the primitive.
+- The `ffi_call` passes `vmap_method=None` (`generic_ops.py:540`), which makes JAX itself refuse to
+  batch the primitive. This used to be two call sites; the custom_partitioning work of known bug 5
+  routed the forward and gradient launches through the one `_partitioned_ffi_call`, so there is a
+  single place to keep it.
 
 The guard alone is not enough. It only sees the arguments handed to the Python wrapper, so under
 `vmap(jit(op))` those are jit tracers, the batching happens outside on the compiled jaxpr, and with
@@ -424,6 +476,22 @@ BatchTracer. Ragged batches are a separate matter -- the binding batches by bloc
 ranges over a flattened axis, which is also KeOps' native way to hold meshes of different
 sizes; a rule cutting on block boundaries would cover both, and exposing ragged ranges through
 the JAX binding is the work that would come first.
+
+### 6. Complex kernels do not work in float64 (open, and the only red in `--float64`)
+
+`run_tests.py --float64` passes 185 checks across 8 of the 10 suites and fails exactly two, both
+in `test_advanced.py` section 6: `Complex: NUDFT (exp)` and `Complex: Real*Complex Mixed`, each a
+`ValueError: Incompatible`. The other three complex tests in that section pass, as does every
+non-complex suite.
+
+This is not a regression. `3906bf1e` (2026-01-27) says so in its own subject line when it added
+64-bit mode: "Doesn't support 64-bit complex kernels yet". It is a to-do, and until it is done
+`--float64` exits 1 with those two errors and nothing else. Anyone reading a red float64 run should
+check the count before assuming something broke; three failures, not two, means something new.
+
+Deliberately left failing rather than skipped, so the gap stays visible. A `skipif` on
+`is_float64_mode()` in `test_advanced.py` would make the suite green in one line if that is ever
+preferred.
 
 ### 4. Importing pykeops.jax no longer pulls in torch (fixed 2026-09-03)
 
