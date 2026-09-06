@@ -24,6 +24,61 @@ build_folder = config.get_build_folder()
 get_gpu_props = cuda_config.get_gpu_props()
 
 
+def _find_env_cuda_toolkit():
+    """Locate the CUDA toolkit that pip installed into this Python environment.
+
+    Returns ``(nvcc_path, include_dir)``; either element may be None.
+
+    The kernels compiled here are dlopen'd into the host process, so the CUDA
+    they must agree with is the one that process has already loaded -- not
+    whatever the machine happens to have under /usr/local. When JAX (or torch)
+    comes from pip wheels, that CUDA lives in site-packages/nvidia and its
+    version tracks the environment rather than the box, which is exactly the
+    property we want. Two wheel layouts exist:
+
+        CUDA 13:  nvidia/cu13/bin/nvcc,       nvidia/cu13/include/cuda.h
+        CUDA 12:  nvidia/cuda_nvcc/bin/nvcc,  nvidia/cuda_runtime/include/cuda.h
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("nvidia")
+    except (ImportError, ValueError):
+        return None, None
+    if spec is None:
+        return None, None
+
+    def _usable(path):
+        return os.path.isfile(path) and os.access(path, os.X_OK)
+
+    def _headers(include_dir):
+        return (
+            include_dir if os.path.isfile(os.path.join(include_dir, "cuda.h")) else None
+        )
+
+    for base in list(getattr(spec, "submodule_search_locations", None) or []):
+        # Consolidated layout (CUDA 13+): one root holds both bin/ and include/.
+        try:
+            majors = sorted(
+                (d for d in os.listdir(base) if d.startswith("cu") and d[2:].isdigit()),
+                key=lambda d: int(d[2:]),
+            )
+        except OSError:
+            majors = []
+        for name in reversed(majors):  # newest major first
+            root = os.path.join(base, name)
+            nvcc = os.path.join(root, "bin", "nvcc")
+            if _usable(nvcc):
+                return nvcc, _headers(os.path.join(root, "include"))
+
+        # Split layout (CUDA 12): one directory per component.
+        nvcc = os.path.join(base, "cuda_nvcc", "bin", "nvcc")
+        if _usable(nvcc):
+            return nvcc, _headers(os.path.join(base, "cuda_runtime", "include"))
+
+    return None, None
+
+
 class Cuda_link_compile(LinkCompile):
     """
     CMake-based GPU compilation (alternative to NVRTC)
@@ -124,12 +179,45 @@ class Cuda_link_compile(LinkCompile):
         # 3. As a final fallback, scan a hardcoded list of common
         #    install locations for an `nvcc` binary that exists +
         #    is executable.
+        # Resolve nvcc and the CUDA headers from ONE toolkit root, so that the
+        # compiler and the headers can never disagree. Priority, highest first:
+        #
+        #   1. CUDA_PATH / CUDA_HOME  -- an explicit, deliberate override
+        #   2. the nvidia/* wheels in THIS Python environment
+        #   3. nvcc on PATH           -- the historical behaviour
+        #   4. common install dirs    -- for launchers that start with no CUDA
+        #                                on PATH (IDE run-configs, restricted
+        #                                login shells), where the failure would
+        #                                otherwise surface as the misleading
+        #                                "compilation succeeded but .so not found"
+        #
+        # (2) is what keeps this backend aligned with JAX; see
+        # _find_env_cuda_toolkit(). Steps 3 and 4 preserve the previous
+        # behaviour for machines with no CUDA wheels installed.
         import shutil as _shutil
         import os as _os
-        _nvcc_path = _shutil.which("nvcc")
+
+        _nvcc_path = None
+        _nvcc_include = None
+
+        for _env_var in ("CUDA_PATH", "CUDA_HOME"):
+            _root = _os.environ.get(_env_var)
+            if _root:
+                _candidate = _os.path.join(_root, "bin", "nvcc")
+                if _os.path.isfile(_candidate) and _os.access(_candidate, _os.X_OK):
+                    _nvcc_path = _candidate
+                    break
+
+        if _nvcc_path is None:
+            _nvcc_path, _nvcc_include = _find_env_cuda_toolkit()
+
+        if _nvcc_path is None:
+            _nvcc_path = _shutil.which("nvcc")
+
         if _nvcc_path is None:
             _candidate_bins = [
                 "/usr/local/cuda/bin",
+                "/usr/local/cuda-13.3/bin",
                 "/usr/local/cuda-13.0/bin",
                 "/usr/local/cuda-12.8/bin",
                 "/usr/local/cuda-12.6/bin",
@@ -162,6 +250,23 @@ class Cuda_link_compile(LinkCompile):
                 else:
                     _nvcc_path = "nvcc"  # final fallback — will fail
                                           # the same way as before
+
+        # Take the headers from the compiler's own root whenever that root
+        # ships them. This is the half that closes the mismatch: without it a
+        # 12.6 nvcc can be handed 13.3 headers (or the reverse) purely because
+        # PATH and /usr/local/cuda point at different toolkits.
+        if _nvcc_include is None and _os.path.sep in _nvcc_path:
+            _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(_nvcc_path)))
+            _candidate_inc = _os.path.join(_root, "include")
+            if _os.path.isfile(_os.path.join(_candidate_inc, "cuda.h")):
+                _nvcc_include = _candidate_inc
+        if _nvcc_include:
+            cuda_include = _nvcc_include
+
+        if _os.environ.get("JAX_KEOPS_DEBUG") == "1":
+            KeOps_Message(
+                f"nvcc={_nvcc_path} includes={cuda_include}", use_tag=False, flush=True
+            )
 
         compile_flags = [
             _nvcc_path,

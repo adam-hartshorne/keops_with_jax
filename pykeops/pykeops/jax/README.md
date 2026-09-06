@@ -12,10 +12,17 @@ that means anything.
 
 ## Requirements
 
-- A CUDA GPU, and a CUDA toolkit with `nvcc` on `PATH`.
+- A CUDA GPU, and an `nvcc` to build the kernels with. You do not have to provide one yourself:
+  the backend prefers the CUDA toolkit pip installed into the same environment as JAX (the
+  `nvidia-cuda-nvcc` wheel, under `site-packages/nvidia/`), taking nvcc *and* the headers from that
+  one root so the two always match the CUDA JAX itself is using. It falls back to `CUDA_PATH` /
+  `CUDA_HOME`, then to `nvcc` on `PATH`, then to the usual install directories. Set `CUDA_PATH` to
+  override; `JAX_KEOPS_DEBUG=1` prints what it picked. Note the kernel cache does not hash the
+  compiler, so run `rm -rf ~/.cache/keops2.3` after changing toolkits.
 - `cmake` and `nanobind`, for the C++ FFI extension.
 - JAX with CUDA support. This branch tracks jax 0.11.1.
-- Python 3.12. On Adam's machines that is the conda env `jax_latest`.
+- Python 3.12. On `dior` that is the miniconda env `jax_torch_latest`; on the older box it was
+  anaconda's `jax_latest`.
 - PyTorch with CUDA only for the tests that cross-check against `pykeops.torch`. `pykeops.jax`
   itself does not import torch.
 
