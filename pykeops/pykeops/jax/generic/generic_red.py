@@ -19,6 +19,11 @@ class Genred:
         x = jnp.array(...)  # shape (N, 3)
         y = jnp.array(...)  # shape (M, 3)
         result = op(x, y)   # shape (N, 1)
+
+    Batching: pass (B, N, 3) and (B, M, 3) for B independent reductions (one batch dimension, size 1
+    broadcasts); jax.vmap over the op is refused. Under a jit over several devices the launch runs on
+    each device's own samples or rows by itself (see generic_ops._partitioned_ffi_call). The first
+    call registers and compiles the kernel and takes JAX arrays, not numpy.
     """
 
     def __init__(

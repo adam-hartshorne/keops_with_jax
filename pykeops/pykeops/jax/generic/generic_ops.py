@@ -5,6 +5,9 @@ FIXES APPLIED:
 1. Use C++ get_kernel_dimout to avoid redundant Python backend creation
 2. Bounded gradient cache with LRU eviction
 3. Thread-safe registration with proper error handling
+4. The FFI launch partitions itself under a multi-device jit (`_partitioned_ffi_call`, a
+   custom_partitioning around the ffi_call; CLAUDE.md known bug 5). Batch-sharded operands run per
+   device; a shard over the reduced axis is gathered, never combined wrongly.
 """
 
 import os
@@ -586,7 +589,8 @@ def _partitioned_ffi_call(target_name, kernel_id, var_cats, axis, dimout, target
 
 
 def _make_keops_grad_op(grad_formula, grad_aliases, reduction_op, grad_axis, dtype_str, input_dim, var_cat, enable_vjp=True):
-    """Create gradient operator."""
+    """Create gradient operator: the KeOps launch of Grad(formula, var, eta), same batching and the same
+    multi-device partitioning as the forward launch (`_partitioned_ffi_call`)."""
 
     _, _, var_cats_grad = _parse_aliases(list(grad_aliases))
 
@@ -723,7 +727,11 @@ def _create_keops_backend(formula, aliases, reduction_op, axis, dtype_str, jax_a
 
 
 def make_keops_jax_op(formula: str, aliases: Tuple[str, ...], reduction_op: str, axis: int, dtype_str: str, enable_vjp: bool = True, max_order: int = 2, opt_arg: int = None, formula2: str = None):
-    """Creates a JAX op for KeOps kernel with FULLY OPTIMIZED gradient computation."""
+    """Creates a JAX op for KeOps kernel with FULLY OPTIMIZED gradient computation.
+
+    The returned op takes (N, D) arrays, or (B, N, D) with one batch dimension shared by every i/j
+    variable (size 1 broadcasts); jax.vmap over it is refused (`_reject_vmap`). Under a multi-device
+    jit the launch partitions itself over the batch and the surviving rows (`_partitioned_ffi_call`)."""
     _patch_nvcc_flags()
     var_names, var_dims, var_cats = _parse_aliases(list(aliases))
 

@@ -142,13 +142,14 @@ Test Suites:
         'batched': 'test_batched_gradients.py',
         'broadcast': 'test_batch_broadcasting.py',
         'helpers': 'test_helpers.py',
+        'sharding': 'test_sharding.py',
         'benchmark': 'test_benchmark_single_gpu.py',
         'benchmark-multi': 'test_benchmark_multi_gpu.py',
     }
 
     # Handle 'all' and 'quick'
     if 'all' in args.suites:
-        suites = ['edge', 'api', 'correctness', 'advanced', 'batched', 'broadcast', 'helpers']
+        suites = ['edge', 'api', 'correctness', 'advanced', 'batched', 'broadcast', 'helpers', 'sharding']
     elif 'quick' in args.suites:
         suites = ['edge']
     else:

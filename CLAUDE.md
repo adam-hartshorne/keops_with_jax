@@ -64,6 +64,12 @@ cmake --build pykeops/build/jax_ext_build -j
 
 is enough. Reinstalling also works but reconfigures from scratch.
 
+Three layers, and what refreshes each: the Python binding is the editable checkout, so a pull is
+its update; the C++ extension is rebuilt as above, or by reinstalling; the JIT-compiled kernels in
+`~/.cache/keops2.3` (`KEOPS_CACHE_FOLDER`) are stale only after a launcher-template change that
+leaves the kernel hash alone, and then `rm -rf` the folder. `pykeops/pykeops/jax/README.md` is the
+install and update guide written for another machine, with the flags explained; keep it current.
+
 Release packaging is `./pybuild.sh`, or `./pybuild.sh -l` for a local build with no hard-coded
 versions.
 
@@ -74,7 +80,7 @@ test files import `test_utils` as a top-level module.
 
 ```bash
 cd pykeops/pykeops/jax/test
-python run_tests.py              # edge, api, correctness, advanced, batched, helpers
+python run_tests.py              # edge, api, correctness, advanced, batched, broadcast, helpers, sharding
 python run_tests.py quick        # edge only
 python run_tests.py api          # one suite
 python run_tests.py correctness  # cross-check against pykeops.torch
@@ -82,13 +88,14 @@ python run_tests.py --float64    # sets KEOPS_TEST_FLOAT64=1 and JAX_ENABLE_X64=
 python test_api.py               # one file directly; run_tests.py just shells out to this
 ```
 
-Suite names are api, correctness, edge, advanced, batched, helpers, benchmark, benchmark-multi.
-Benchmarks are excluded from `all`.
+Suite names are api, correctness, edge, advanced, batched, broadcast, helpers, sharding, benchmark,
+benchmark-multi. Benchmarks are excluded from `all`.
 
 Every JAX test compares against `pykeops.torch` as ground truth and calls `sys.exit(1)` when
-PyTorch with CUDA is absent.
+PyTorch with CUDA is absent, except `test_sharding.py` (known bug 5): it compares the multi-device
+call against the single-device one, needs no torch, and skips its per-device tests below two GPUs.
 
-pytest works from inside that directory too, and collects 67 tests:
+pytest works from inside that directory too, and collects 74 tests:
 
 ```bash
 pytest -q                          # the whole suite in one process
@@ -168,7 +175,10 @@ PATH; the failure otherwise surfaces as "CMake compilation succeeded but .so fil
   device
 - calls `jax.ffi.register_ffi_target(name, get_ffi_handler(), platform="CUDA")` under
   `_registration_lock`, treating "already registered" as success
-- calls `jax.ffi.ffi_call(...)` with `kernel_id` and `batch_size` passed as FFI attributes
+- calls `_partitioned_ffi_call`, which wraps `jax.ffi.ffi_call(...)` (`kernel_id` and
+  `batch_size` passed as FFI attributes) in a `custom_partitioning`, so a multi-device jit launches
+  on each device's own samples or rows instead of replicating the call (known bug 5); inside a
+  shard_map body, or for an operand pattern the rule does not describe, it is the bare `ffi_call`
 
 Registration is deferred to the first call on purpose. Doing it at construction time makes JAX's
 trace-time validation calls fire the kernel.

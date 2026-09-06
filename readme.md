@@ -12,6 +12,15 @@
 Please visit our [website](https://www.kernel-operations.io/) for 
 documentation, contribution guidelines and tutorials.
 
+## JAX backend (this fork, branch `jax_api`)
+
+This fork adds `pykeops.jax`: `Genred`, `LazyTensor`, `KernelSolve` and the generic helpers on JAX,
+CUDA only, through XLA's FFI. The PyPI wheel does not contain it, so it is installed editable from
+this checkout, `keopscore` first and with `--no-deps`; the install builds a C++ extension and the
+JIT-compiled kernels live in `~/.cache/keops2.3`. Install, update and test instructions, what has to
+be rebuilt when, and the backend's limits: [`pykeops/pykeops/jax/README.md`](pykeops/pykeops/jax/README.md).
+Design notes and the known-bug record: `CLAUDE.md`.
+
 # Kernel Operations on the GPU, with autodiff, without memory overflows
 
 The KeOps library lets you compute reductions of **large arrays** 
