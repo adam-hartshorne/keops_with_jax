@@ -44,7 +44,11 @@ Each part of that matters:
 - Installing `pykeops` also builds the C++ FFI extension: CMake runs over
   `pykeops/pykeops/jax/binders/` and writes `keops_jax_ext.cpython-*.so` into `pykeops/pykeops/jax/`.
   The `.so` is gitignored, so a fresh clone has none until you install. `CMAKE_CUDA_ARCHITECTURES`
-  is read from `nvidia-smi --query-gpu=compute_cap`, falling back to `70;75;80;86;89;90`.
+  is read from `nvidia-smi --query-gpu=compute_cap`, falling back to `70;75;80;86;89;90`. The
+  `nvcc` CMake uses is the first one whose major version matches the installed
+  `jax-cuda<N>-plugin` (searched in `CUDA_PATH`/`CUDA_HOME`, `PATH`, `/usr/local/cuda`,
+  `/usr/local/cuda-<N>*`), so the extension links the same CUDA major as JAX even when `PATH`
+  offers an older toolkit; `pip install -v` shows the choice, and a set `CUDACXX` overrides it.
 - Read the install log, not the exit code. If JAX, nanobind, `nvcc` or `cmake` is missing,
   `setup.py` says why, skips the extension and installs only the Python side, and exits 0.
 - Never run Python at the fork root. The source directories there shadow the installed packages,

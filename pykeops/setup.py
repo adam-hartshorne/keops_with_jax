@@ -120,11 +120,21 @@ def build_jax_extension(install_dir=None):
         print("[KeOps] nanobind not found - skipping JAX extension build")
         return False
 
-    nvcc_path = shutil.which("nvcc")
+    # The extension is dlopen'ed into the JAX process, so its CUDA runtime must match the
+    # major version JAX itself uses. CMake would otherwise take whatever `nvcc` is first on
+    # PATH, which on a box with several toolkits installed can be a different major.
+    jax_cuda_major = detect_jax_cuda_major()
+    nvcc_path = find_nvcc(jax_cuda_major)
     if not nvcc_path:
         print("[KeOps] CUDA nvcc not found - skipping JAX extension build")
         return False
-    print(f"[KeOps] Found nvcc: {nvcc_path}")
+    if jax_cuda_major is None:
+        print(f"[KeOps] Found nvcc: {nvcc_path} (could not tell JAX's CUDA major; using it as is)")
+    elif nvcc_major(nvcc_path) == jax_cuda_major:
+        print(f"[KeOps] Found nvcc: {nvcc_path} (CUDA {jax_cuda_major}, matching JAX)")
+    else:
+        print(f"[KeOps] WARNING: no CUDA {jax_cuda_major} nvcc found to match JAX; building the "
+              f"extension with {nvcc_path} (CUDA {nvcc_major(nvcc_path)}) instead")
 
     cmake_path = shutil.which("cmake")
     if not cmake_path:
@@ -153,6 +163,9 @@ def build_jax_extension(install_dir=None):
         f"-Dnanobind_DIR={nanobind_cmake_dir}",
         "-DCMAKE_BUILD_TYPE=Release",
     ]
+    if not os.environ.get("CUDACXX"):
+        # An explicit CUDACXX from the caller wins; otherwise pin CMake to the nvcc chosen above.
+        cmake_args.append(f"-DCMAKE_CUDA_COMPILER={nvcc_path}")
     if cuda_arch:
         cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}")
 
@@ -179,6 +192,51 @@ def build_jax_extension(install_dir=None):
     except subprocess.CalledProcessError as e:
         print(f"\n[KeOps] BUILD FAILED: {e}\n")
         return False
+
+
+def nvcc_major(nvcc_path):
+    """Major CUDA version an nvcc binary reports, or None."""
+    import re
+    try:
+        out = subprocess.run([nvcc_path, "--version"], capture_output=True, text=True, timeout=10).stdout
+        m = re.search(r"release (\d+)\.", out)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def detect_jax_cuda_major():
+    """CUDA major version of the installed JAX GPU plugin (jax-cuda13-plugin -> 13), or None."""
+    import importlib.metadata as md
+    for dist in md.distributions():
+        name = (dist.metadata["Name"] or "").lower()
+        if name.startswith("jax-cuda") and name.endswith("-plugin"):
+            digits = name[len("jax-cuda"):-len("-plugin")]
+            if digits.isdigit():
+                return int(digits)
+    return None
+
+
+def find_nvcc(cuda_major):
+    """First nvcc whose major version matches `cuda_major`, searching CUDA_PATH / CUDA_HOME,
+    PATH, /usr/local/cuda and the versioned /usr/local/cuda-* toolkits. Falls back to the PATH
+    nvcc (or None) when nothing matches or the major is unknown."""
+    candidates = []
+    for var in ("CUDA_PATH", "CUDA_HOME"):
+        if os.environ.get(var):
+            candidates.append(os.path.join(os.environ[var], "bin", "nvcc"))
+    on_path = shutil.which("nvcc")
+    if on_path:
+        candidates.append(on_path)
+    candidates.append("/usr/local/cuda/bin/nvcc")
+    if cuda_major is not None:
+        candidates += sorted(glob.glob(f"/usr/local/cuda-{cuda_major}*/bin/nvcc"), reverse=True)
+    candidates = [c for c in candidates if os.path.isfile(c) and os.access(c, os.X_OK)]
+    if cuda_major is not None:
+        for c in candidates:
+            if nvcc_major(c) == cuda_major:
+                return c
+    return on_path
 
 
 def detect_cuda_arch():
