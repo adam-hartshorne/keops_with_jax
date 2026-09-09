@@ -13,69 +13,37 @@ Two packages:
 - `keopscore` turns a formula string into C++/CUDA source and compiles it.
 - `pykeops` binds that to NumPy, PyTorch and JAX.
 
-This checkout is a fork. The work is the JAX backend on the `jax_api` branch, about 50 commits
-ahead of `main`. The NumPy and PyTorch paths are upstream code and must keep working unchanged;
-`pykeops.torch` is also the correctness reference the JAX tests compare against. `rkeops/` (the R
-binder), `doc/` (Sphinx) and `benchmarks/` are upstream too and nothing here touches them.
+This checkout is a fork (`origin` is `github.com/adam-hartshorne/keops_with_jax`). The work is the
+JAX backend on the `jax_api` branch, 68 commits ahead of `main` on 2026-09-09. The NumPy and PyTorch
+paths are upstream code and must keep working unchanged; `pykeops.torch` is also the correctness
+reference the JAX tests compare against. `rkeops/` (the R binder), `doc/` (Sphinx) and
+`benchmarks/` are upstream too and nothing here touches them.
 
-## Do not run Python with the repo root as the working directory
+The fork's footprint against `main` is 70 added files and 26 modified upstream ones
+(`git diff --name-status main..HEAD`). The additions are `pykeops/pykeops/jax/`,
+`keopscore/keopscore/binders/cuda/`, `keopscore/keopscore/mapreduce/gpu/gpu_utils.py`, this file
+and the READMEs. Of the modified upstream files, most carry the `lang` plumbing described under
+Architecture; `keopscore/keopscore/config/cuda.py` gained per-GPU `-arch` detection (the
+`[KeOps] Detected GPU` lines printed at import); `keopscore/keopscore/utils/Cache.py` folds keyword
+arguments into its in-memory key so `lang="jax"` separates the binder-level cache too; and four
+(`keops_nvrtc.cpp`, `pykeops_nvrtc.cpp`, `LoadKeOps_nvrtc.py`, `keops_io/__init__.py`) differ only
+in whitespace or a lost final newline. Two stray files are tracked on the branch and are not the
+place to edit anything: `pykeops/pykeops/common/get_options_bak.py` is the pre-fork copy of
+`get_options.py`, and `pykeops/readne.md` (sic) is four pip lines. `pykeops/pykeops/jax/test/old/`
+holds superseded tests that no longer import; `conftest.py` excludes it from collection.
 
-The repo root holds a directory called `keopscore/` and one called `pykeops/`, and both shadow the
-installed packages whenever the root is on `sys.path`, which is any `python` started from there.
-Neither has an `__init__.py`, so each resolves to an empty namespace package: `pykeops.__file__` is
-None and `__path__` is `['<root>/pykeops']`. That makes the failure quiet. `import pykeops` at the
-root succeeds, and nothing raises until something asks for an attribute, a long way from the cause.
-
-Run from somewhere else. `cd pykeops/pykeops/jax/test` for the test suite, or a scratch directory
-for one-off scripts. `python -c` and `python -m pytest` fail the same way at the root, because `-m`
-puts the working directory on `sys.path`. The bare `pytest` console script does not, so since the
-shim below was deleted it collects fine from the root; `python -m pytest` still does not.
-
-There used to be a second, worse version of this. A tracked 0-byte `keopscore/__init__.py` sat next
-to `keopscore/setup.py`, added on this branch by `9f596f38` and never present on `main`. Because
-pytest walks up from a test file through every directory holding an `__init__.py`, it walked
-through that one and put the repo root on `sys.path`, so `pytest keopscore/keopscore/test/` errored
-during collection from *any* working directory, `--import-mode=importlib` included. That is the
-keopscore half of `./pytest.sh`, which runs under `set +e` and exits with the status of the pykeops
-run, so `cuda_test.yml` reported green with 67 tests never running, from 2026-01-23 until the file
-was deleted on 2026-09-06. Do not reintroduce it; nothing imports it and `keopscore/setup.py` reads
-its data by path.
-
-## Ten tracked paths are symlinks; keep them that way
-
-Upstream keeps one copy of the version string, the licence and the readme at the repo root and
-symlinks them into each package, so git tracks ten paths at mode `120000` whose content is just a
-relative target:
-
-```
-keopscore/keopscore/keops_version -> ../../keops_version    pykeops/pykeops/keops_version -> ../../keops_version
-keopscore/keopscore/licence.txt   -> ../../licence.txt      pykeops/pykeops/licence.txt   -> ../../licence.txt
-keopscore/keopscore/readme.md     -> ../readme.md           pykeops/pykeops/readme.md     -> ../readme.md
-keopscore/licence.txt             -> ../licence.txt         pykeops/licence.txt           -> ../licence.txt
-rkeops/LICENSE.md                 -> ../licence.txt         rkeops/version                -> ../keops_version
-```
-
-This checkout had arrived with all ten flattened into regular files holding the dereferenced
-content, so `git status` showed ten permanent `T` (typechange) entries. That is a trap rather than
-cosmetic: `git add -A` or `git commit -a` would have committed *symlinks converted to regular
-files* into KeOps history, an upstream-breaking change that looks like background noise in the
-status output. The filesystem is not the cause on either box: `dior` is ext4, the 5090 box is NTFS
-through ntfs-3g, and both create symlinks fine (`ln -s` in the work tree succeeds on both, and
-`core.symlinks` is at its default). It is the copy that created the tree that flattened them, so it
-can happen again on any machine if that copy is repeated.
-
-They were restored on 2026-09-06 with `git checkout --` on the ten paths, after confirming each
-flattened file was byte-identical to its target, and `keopscore.__version__` still reads `2.3`
-through the links. If those ten `T` entries ever reappear, the tree was copied again without `-a`;
-verify equality and restore the same way rather than committing them.
+`PLAN_JAX_ASYNC_DISPATCH.md` at the root is untracked. It is the long form of known bug 3 below,
+and its status line says it was measured and shelved.
 
 ## Environment: several machines, one CUDA major version
 
 This checkout is worked on from more than one box, and they differ in almost everything that a
 setup instruction would normally hard-code: card model, card count, compute capability, conda
-distribution, environment name, even the filesystem. **Do not assume which one you are on. Ask.**
+distribution, environment name, checkout path, even the filesystem. **Do not assume which one you
+are on. Run these first.**
 
 ```bash
+hostname
 nvidia-smi --query-gpu=index,name,compute_cap,memory.total,driver_version --format=csv,noheader
 ls -d ~/anaconda3 ~/miniconda3 2>/dev/null      # which conda
 conda env list                                   # which env has KeOps
@@ -90,9 +58,11 @@ The ones seen so far:
 | driver | 580.167.08 | 610.43.02 |
 | conda | miniconda, env `jax_torch_latest` | anaconda3, env `jax_latest` |
 | python / jax / torch | 3.12.13 / 0.11.1 / 2.12.1+cu130 | 3.12.12 / 0.11.1 / 2.12.0+cu130 |
+| checkout | `~/keops` | `/media/adam/shared_folder/PycharmProjects/keops` |
 | filesystem | ext4 | NTFS through ntfs-3g (`fuseblk`) |
 | `/usr/local/cuda` | -> 13.3 (12.5.1 and 12.6.3 also installed) | -> 13.0, the only toolkit |
 | `nvcc` on PATH | 12.6.85 (`/etc/profile` puts 12.6 first) | 13.0.48 |
+| `cmake` | `/usr/bin/cmake` 3.28.3, the system's | not recorded |
 | multi-GPU tests | run, with the cap below | skip: `test_sharding.py` needs two devices |
 
 A third configuration, five RTX PRO 6000 Blackwell cards at `sm_120` on anaconda / `jax_latest`,
@@ -121,13 +91,15 @@ source /home/adam/anaconda3/etc/profile.d/conda.sh && conda activate jax_latest
 
 `~/.bashrc` runs `conda init` but never `conda activate`, so a fresh interactive terminal lands in
 `base`, whose python has no JAX (`ModuleNotFoundError: No module named 'jax'`). A Claude Code
-session may nevertheless *look* correct, because it inherits whatever environment its launcher had.
-That is a property of the session, not the machine: a clean login shell (`env -i bash -lc`) has no
-python on `PATH` at all, since the `conda init` block only runs for interactive shells.
+session may nevertheless *look* correct, because it inherits whatever environment its launcher had
+(on 2026-09-09 the session on `dior` started with `jax_torch_latest` already active and
+`CUDA_VISIBLE_DEVICES` unset). That is a property of the session, not the machine: a clean login
+shell (`env -i bash -lc`) has no python on `PATH` at all, since the `conda init` block only runs
+for interactive shells.
 
 `keopscore` and `pykeops` are installed editable in the project's env on each box and already point
-at that box's checkout. The JAX backend is CUDA only, with no CPU fallback, so it needs a GPU and a
-CUDA toolkit with `nvcc`.
+at that box's checkout (`pip show pykeops | grep Editable`). The JAX backend is CUDA only, with no
+CPU fallback, so it needs a GPU and a CUDA toolkit with `nvcc`.
 
 ### One box, several CUDA versions: check the layer, not the machine (`dior`)
 
@@ -142,9 +114,11 @@ the environment's wheel is 13.2.78, so the same split exists in a milder form:
 | driver | 580.167.08, advertises CUDA 13.0 | -- |
 | toolkits under `/usr/local` | 12.5.1, 12.6.3, 13.3.0 | deb installs |
 | `/usr/local/cuda` | -> `/usr/local/cuda-13.3` | `/etc/alternatives` |
-| `nvcc` on `PATH` | 12.6.85 | `/etc/profile` puts `cuda-12.6/bin` first |
+| `nvcc` on `PATH` | 12.6.85 | `/etc/profile:31` puts `cuda-12.6/bin` first |
 | `LD_LIBRARY_PATH` | `/usr/local/cuda-12.6/lib64` | `/etc/profile:32` |
 | **the JAX backend's `nvcc`** | **13.3.73** | **the env's `nvidia-cuda-nvcc` wheel; see below** |
+| the FFI extension's `nvcc` | 13.3.33 | `pykeops/setup.py` picks an nvcc whose major matches the `jax-cuda*-plugin`; here `/usr/local/cuda`; see Build |
+| the env's other CUDA wheels | cuda-runtime 13.0.96, cublas 13.1.1.3 | pip, next to `jax-cuda13-plugin` 0.11.1 |
 | keopscore's NVRTC | 13.3.33 | `/usr/local/cuda/targets/x86_64-linux/lib`, so the alternatives link |
 | JAX | cuda13 wheels | `jax_cuda13_plugin`, `nvidia/cu13/lib` |
 | PyTorch | built for CUDA 13.0 | `2.12.1+cu130` |
@@ -178,7 +152,8 @@ CUDA wheels falls through to the old behaviour unchanged.
 
 The kernel cache hashes the formula, **not the compiler**, so switching toolkits leaves stale
 `.so`s that are silently reused. `rm -rf ~/.cache/keops2.3` after any such change. To confirm what
-built a kernel: `strings <cached>.so | grep -oE 'V1[23]\.[0-9.]+'`.
+built a kernel: `strings <cached>.so | grep -oE 'V1[23]\.[0-9.]+'`. On 2026-09-09 `dior`'s cache
+held 254 `*_jax.so`, every one built by 13.3.73.
 
 The NVRTC backend behind `pykeops.torch` and `pykeops.numpy` is untouched by this and still loads
 NVRTC 13.3 from `/usr/local/cuda`; `keopscore/binders/cuda/` is fork-only and not on `main`.
@@ -200,6 +175,85 @@ the test output under thousands of lines. With the cap, `jax.devices()` returns 
 clean. `test_sharding.py` needs at least two devices: it runs on `dior` either way, and skips its
 per-device tests entirely on a single-card box.
 
+## The tree is moved between boxes by copying, and the copy is lossy
+
+The checkout is not cloned on each box. It is copied, `.git/` included, from the 5090 box's
+`/media/adam/shared_folder/PycharmProjects/keops` onto `dior`'s `~/keops` (that source path is
+recorded in the copied `pykeops/build/jax_ext_build/CMakeCache.txt` and in
+`.claude/settings.local.json`). On 2026-09-09 every path in the tree carried the copy's own
+timestamp (13:19 that day, `.git/config` and `.git/HEAD` included) and mode 755, and the five
+things below came with it. Check for them at the start of a session on a box the tree has just
+landed on; `git status --short` showing ten `T` lines is the tell.
+
+**1. The ten symlinks arrive as regular files.** Upstream keeps one copy of the version string,
+the licence and the readme at the repo root and symlinks them into each package, so git tracks
+ten paths at mode `120000` whose content is just a relative target:
+
+```
+keopscore/keopscore/keops_version -> ../../keops_version    pykeops/pykeops/keops_version -> ../../keops_version
+keopscore/keopscore/licence.txt   -> ../../licence.txt      pykeops/pykeops/licence.txt   -> ../../licence.txt
+keopscore/keopscore/readme.md     -> ../readme.md           pykeops/pykeops/readme.md     -> ../readme.md
+keopscore/licence.txt             -> ../licence.txt         pykeops/licence.txt           -> ../licence.txt
+rkeops/LICENSE.md                 -> ../licence.txt         rkeops/version                -> ../keops_version
+```
+
+The copy dereferences them into regular files holding the target's content, so `git status`
+shows ten permanent `T` (typechange) entries. That is a trap rather than cosmetic: `git add -A` or
+`git commit -a` would commit *symlinks converted to regular files* into KeOps history, an
+upstream-breaking change that looks like background noise in the status output. The filesystem is
+not the cause: `dior` is ext4, the 5090 box is NTFS through ntfs-3g, `ln -s` works in the work
+tree on both, and `core.symlinks` is at its default. Confirm each file is byte-identical to its
+target, then restore with `git checkout --` on the ten paths. Done on 2026-09-06 and again on
+2026-09-09; `keopscore.__version__` reads `2.3` through the links either way.
+
+**2. The C++ extension and its CMake tree are the other box's.** The copied
+`pykeops/pykeops/jax/keops_jax_ext.cpython-312-x86_64-linux-gnu.so` was built by conda-forge
+gcc 15.2 with an anaconda `jax_latest` RUNPATH and `CMAKE_CUDA_ARCHITECTURES=120`. It works on
+`dior` regardless: it contains no device code (`cuobjdump` says so) and links only
+`libcudart.so.13`, which ldconfig resolves to `/usr/local/cuda` 13.3, and the `edge` suite passed
+18/18 on it on 2026-09-09. But `cmake --build pykeops/build/jax_ext_build -j` fails with "The
+source directory /media/adam/shared_folder/... does not exist" until
+`pip install -e ./pykeops --no-build-isolation --no-deps` reconfigures the tree here; setup.py
+deletes the build directory before configuring, so the foreign cache never gets in the way
+(done on 2026-09-09: the new cache names `/home/adam/keops`, the miniconda python and `86`). After
+a copy, an edit to `keops_jax.cpp` means a reinstall, not a `cmake --build`.
+
+**3. `.git/config` carries `core.filemode=false`**, which git writes only on a filesystem without
+an executable bit, i.e. the NTFS box. On ext4 it is what keeps the copy's 755 modes out of
+`git status`. Leave it; setting it to `true` here would mark every file modified.
+
+**4. Untracked files travel too.** `PLAN_JAX_ASYNC_DISPATCH.md` at the root, and
+`.claude/settings.local.json`, which is ignored through `~/.config/git/ignore` and whose allow list
+names the other box's `anaconda3` and `/media/adam` paths.
+
+**5. The kernel cache does not travel, and does not need to.** `~/.cache/keops2.3/` holds one build
+folder per `<OS>_<hostname>_<kernel release>_p<python version>`, so it is per box and starts cold
+after a Python upgrade (`dior` has a dead `p3.12.9` folder next to the live `p3.12.13` one).
+
+## Do not run Python with the repo root as the working directory
+
+The repo root holds a directory called `keopscore/` and one called `pykeops/`, and both shadow the
+installed packages whenever the root is on `sys.path`, which is any `python` started from there.
+Neither has an `__init__.py`, so each resolves to an empty namespace package: `pykeops.__file__` is
+None and `__path__` is `['<root>/pykeops']`. That makes the failure quiet. `import pykeops` at the
+root succeeds, and nothing raises until something asks for an attribute, a long way from the cause.
+
+Run from somewhere else. `cd pykeops/pykeops/jax/test` for the test suite, or a scratch directory
+for one-off scripts. `python -c` and `python -m pytest` fail the same way at the root, because `-m`
+puts the working directory on `sys.path`. The bare `pytest` console script does not, so since the
+shim below was deleted it collects fine from the root; `python -m pytest` still does not.
+
+There used to be a second, worse version of this. A tracked 0-byte `keopscore/__init__.py` sat next
+to `keopscore/setup.py`, added on this branch by `9f596f38` and never present on `main`. Because
+pytest walks up from a test file through every directory holding an `__init__.py`, it walked
+through that one and put the repo root on `sys.path`, so `pytest keopscore/keopscore/test/` errored
+during collection from *any* working directory, `--import-mode=importlib` included, from 2026-01-23
+until the file was deleted on 2026-09-06. That is the keopscore half of `./pytest.sh`. The script
+runs under `set -e`, so on a runner that collection error would have stopped the harness before
+the pykeops half; whether the fork's `cuda_test.yml` job (`on: push`, `runs-on: self-hosted`) has
+ever run is not knowable from this box, so do not cite it as evidence of anything. Do not
+reintroduce the file; nothing imports it and `keopscore/setup.py` reads its data by path.
+
 ## Build
 
 ```bash
@@ -209,34 +263,56 @@ pip install -e ./pykeops   --no-build-isolation --no-deps
 
 Install keopscore first, and keep `--no-deps`: `pykeops/setup.py` imports keopscore, and without
 the flag pip replaces the editable checkout with a release wheel. setup.py prints a warning when it
-detects this.
+detects this. `pykeops/setup.py` declares a `jax` extra (`jax`, `jaxlib`, `nanobind`, `cmake`), but
+on the boxes above those already come from the conda env: nanobind 2.13.0 in `jax_torch_latest`,
+cmake from the system.
 
 Installing pykeops also builds the JAX C++ extension. `pykeops/setup.py` runs CMake over
 `pykeops/pykeops/jax/binders/` from both its `build` and `egg_info` commands and writes
 `keops_jax_ext.cpython-*.so` into `pykeops/pykeops/jax/`. `*.so` is gitignored, so a fresh clone has
 no extension until you install. `CMAKE_CUDA_ARCHITECTURES` comes from
-`nvidia-smi --query-gpu=compute_cap` (`86` on `dior`, `120` on the 5090 box), falling back to
-`70;75;80;86;89;90`. Should that
-list ever not cover the card, it is harmless, and worth knowing so nobody chases it:
-`keops_jax.cpp` is a dlopen shim and an FFI handler with no device code (no `__global__`, no
-`<<<`), and the kernels that do run get their `-arch` from keopscore's own detection at runtime
-(`compute capability 8.6 (arch=sm_86)` on `dior`, `12.0 (arch=sm_120)` on the 5090 box).
-If JAX, nanobind, nvcc or cmake is missing, setup.py prints why, skips the extension and installs
-only the Python side, so watch the install log rather than the exit code.
+`nvidia-smi --query-gpu=compute_cap`, one entry per distinct capability (`86` on `dior`, `120` on
+the 5090 box), falling back to `70;75;80;86;89;90`. Should that list ever not cover the card, it is
+harmless, and worth knowing so nobody chases it: `keops_jax.cpp` is a dlopen shim and an FFI
+handler with no device code (no `__global__`, no `<<<`), and the kernels that do run get their
+`-arch` from keopscore's own detection at runtime (`compute capability 8.6 (arch=sm_86)` on
+`dior`, `12.0 (arch=sm_120)` on the 5090 box). If JAX, nanobind, nvcc or cmake is missing, setup.py
+prints why, skips the extension and installs only the Python side, and the exit code is still 0.
+pip's default verbosity hides everything setup.py prints (the log shows only "Building editable
+for pykeops ... done"), so either install with `pip install -v` or check the `.so` mtime and
+`readelf -d` afterwards, as was done on 2026-09-09.
 
-After editing `keops_jax.cpp` or its `CMakeLists.txt`, rebuild. The configured tree persists, so
+The extension's compiler is chosen separately from the kernels'. `CMakeLists.txt` declares
+`LANGUAGES CXX CUDA` and `find_package(CUDAToolkit)`, and left alone CMake takes `nvcc` from
+`PATH`: on `dior` that is 12.6, and on 2026-09-09 a reinstall produced a shim linking
+`libcudart.so.12` next to 13.3 kernels. It ran (no device code, two runtimes in one process is
+allowed, quick suite green) but it is not the CUDA 13 build the project is. Since that day
+`setup.py` reads the installed `jax-cuda<N>-plugin` for JAX's CUDA major, takes the first `nvcc`
+of that major from `CUDA_PATH`/`CUDA_HOME`, `PATH`, `/usr/local/cuda` and
+`/usr/local/cuda-<N>*`, passes it as `-DCMAKE_CUDA_COMPILER`, and prints the choice as
+`[KeOps] Found nvcc: ... (CUDA 13, matching JAX)`; a set `CUDACXX` is left to CMake instead. On
+`dior` that resolves to `/usr/local/cuda/bin/nvcc` 13.3.33 and the shim links `libcudart.so.13`.
+The env's wheel `nvcc` 13.3.73 is deliberately not a candidate: the wheel ships only the
+versioned `libcudart.so.13`, so CMake's `FindCUDAToolkit` fails on it with
+"missing: CUDA_CUDART" (tried 2026-09-09).
+
+After editing `keops_jax.cpp` or its `CMakeLists.txt`, rebuild. If the configured tree was made on
+this box,
 
 ```bash
 cmake --build pykeops/build/jax_ext_build -j
 ```
 
-is enough. Reinstalling also works but reconfigures from scratch.
+is enough. After a copy from the other box it is not (see the copy section above); reinstalling
+pykeops reconfigures from scratch and always works.
 
 Three layers, and what refreshes each: the Python binding is the editable checkout, so a pull is
 its update; the C++ extension is rebuilt as above, or by reinstalling; the JIT-compiled kernels in
 `~/.cache/keops2.3` (`KEOPS_CACHE_FOLDER`) are stale only after a launcher-template change that
 leaves the kernel hash alone, and then `rm -rf` the folder. `pykeops/pykeops/jax/README.md` is the
 install and update guide written for another machine, with the flags explained; keep it current.
+Its Tests paragraph lags this file (it names eight suites and 74 pytest tests); `run_tests.py` and
+the counts below are the source of truth when they disagree.
 
 Release packaging is `./pybuild.sh`, or `./pybuild.sh -l` for a local build with no hard-coded
 versions.
@@ -260,23 +336,32 @@ python test_api.py               # one file directly; run_tests.py just shells o
 
 Suite names are api, correctness, edge, advanced, batched, broadcast, helpers, kernelsolve,
 sharding, varifold, benchmark, benchmark-multi. Benchmarks are excluded from `all`; varifold runs
-last in `all` because it is the slowest and the likeliest to OOM on a shared card.
+last in `all` because it is the slowest and the likeliest to OOM on a shared card. `PYKEOPS_VERBOSE=0`
+silences the per-kernel compile chatter; the runner prints Rich tables when `rich` is installed.
 
 Last full run on `dior`, 2026-09-06: all ten suites PASSED, exit 0 -- edge 18, api 22, correctness
 49, advanced 36, batched 21, broadcast 11, helpers 11, kernelsolve 8, sharding 7, varifold 5. Re-run
-green from a cold cache after the switch to the environment's nvcc 13.3.73, with all 174 cached
-`*_jax.so` confirmed built by it (`strings ... | grep -oE 'V1[23]\.[0-9.]+'`) and none by 12.6. Note
-these are check counts, not the pytest test counts below; the two runners count differently. The
-first run of the day is slow because every kernel is compiled by nvcc from cold; a warm
-`~/.cache/keops2.3` makes it minutes rather than tens of minutes. The A5000s have 24 GB against the
-other box's 96, so varifold and the larger `check_at_scale` cases have far less headroom here --
-run the suite on an idle card.
+green from a cold cache after the switch to the environment's nvcc 13.3.73, with every cached
+`*_jax.so` confirmed built by it (`strings ... | grep -oE 'V1[23]\.[0-9.]+'`) and none by 12.6. On
+2026-09-09, after the tree had been copied over again, `quick` passed 18/18 in 15 s on the
+5090-built extension, and again after a reinstall and `rm -rf ~/.cache/keops2.3`: 128 s wall from
+cold, 69 kernels compiled, all by 13.3.73. The full suite was then re-run the same day on the
+CUDA 13 extension: all ten suites PASSED, exit 0, 261 s wall with a mostly cold cache, the same
+check counts as 2026-09-06, and 174 cached kernels afterwards, all built by 13.3.73. Note these are
+check counts, not the pytest test counts below; the two runners count differently. The first run of the day is slow because
+every kernel is compiled by nvcc from cold; a warm `~/.cache/keops2.3` makes it minutes rather than
+tens of minutes. The A5000s have 24 GB against the other box's 96, so varifold and the larger
+`check_at_scale` cases have far less headroom here -- run the suite on an idle card
+(`nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv`).
 
-Every JAX test compares against `pykeops.torch` as ground truth and calls `sys.exit(1)` when
-PyTorch with CUDA is absent, except `test_sharding.py` (known bug 5): it compares the multi-device
-call against the single-device one, needs no torch, and skips its per-device tests below two GPUs.
+Every suite except `sharding` compares against `pykeops.torch` as ground truth. Without PyTorch
+with CUDA, the `main()`-driven files (edge, api, correctness, advanced, batched, broadcast,
+helpers, both benchmarks) exit rather than run; the three pytest-style files (kernelsolve,
+sharding, varifold) skip through the `gpu` / `pytorch` markers `conftest.py` applies.
+`test_sharding.py` needs no torch (known bug 5): it compares the multi-device call against the
+single-device one, and skips its per-device tests below two GPUs.
 
-pytest works from inside that directory too, and collects 87 tests in about 4 s:
+pytest works from inside that directory too, and collects 87 tests in about 5 s:
 
 ```bash
 pytest -q                          # the whole collection in one process
@@ -288,12 +373,14 @@ Know what those 87 cover before you trust a green run.
 
 The tests come from nine files: `test_edge_cases` 18, `test_api` 13, `test_helpers` 11,
 `test_batch_broadcasting` 11, `test_advanced` 10, `test_kernelsolve` 8, `test_sharding` 7,
-`test_varifold_batched_grad` 5, `test_batched_gradients` 4.
+`test_varifold_batched_grad` 5, `test_batched_gradients` 4 (re-counted 2026-09-09).
 `test_correctness.py` contributes none of them, because every function in it is a `check_*` driven
 by `main()`. A passing `pytest` run has therefore cross-checked nothing against `pykeops.torch`;
 `python run_tests.py correctness`, or `python test_correctness.py`, is what runs that. Helpers that
 take arguments are named `check_*` rather than `test_*` on purpose, so pytest does not
-mistake them for tests with missing fixtures, and you should follow that when adding one.
+mistake them for tests with missing fixtures, and you should follow that when adding one. The
+`PytestCollectionWarning` lines about `TestSuite` and `TestResult` in `test_utils.py` are the same
+name clash and are harmless.
 
 Keep test bodies inside functions. Until 2026-09-06 `test_kernelsolve.py` and
 `test_varifold_batched_grad.py` did their work at module level, which meant pytest ran both while
@@ -301,7 +388,7 @@ importing them and collected no tests from either. Collection alone took 12 s an
 `check_at_scale(21, 98776, 25000)`, whose own comment says it might OOM; had it, collection would
 have errored and killed the run before a single test started. Both are ordinary test functions now,
 wired into `run_tests.py` as the `kernelsolve` and `varifold` suites, and collection is down to
-4.3 s with nothing executing.
+about 5 s with nothing executing.
 
 pytest still runs every file in one process where `run_tests.py` forks per file, so
 `test_high_dim_gradient` can fail under pytest on a busy card while passing on its own.
@@ -327,9 +414,23 @@ reason and not that file -- `ImportError: cannot import name 'default_device_id'
 
 ## Lint
 
-`.github/workflows/black.yml` runs psf/black on every push and pull request. The JAX backend files
-predate that job and are not black-formatted (single quotes, `if cond: stmt` on one line), so a
-repo-wide `black .` would produce an enormous diff. Format what you touch, not the tree.
+`.github/workflows/black.yml` runs `psf/black@stable` over the whole tree on every push and pull
+request, with no configuration file, so it is `black --check .` from the root. Measured on
+2026-09-09 with black 26.5.1 (installed in `jax_torch_latest`): 110 files would be reformatted on
+this branch against 36 on `main`, so upstream itself is behind black's current stable style and
+that job has never been a clean signal here. The 74-file difference is the fork's: 55 fork-added
+files, 31 of them under `test/old/`, and 19 upstream files that were clean on `main` and are not
+now, through the fork's edits, an IDE's continuation-indent style (`config/cuda.py`) or a dropped
+final newline (`keops_io/__init__.py`, `LoadKeOps_nvrtc.py`). The JAX backend files predate that
+job and are not black-formatted (single quotes, `if cond: stmt` on one line), so a repo-wide
+`black .` would produce an enormous diff. Format what you touch, not the tree.
+
+The 19 are the ones to reformat before anything goes upstream: `keopscore/keopscore/`
+`binders/LinkCompile.py`, `config/cuda.py`, `get_keops_dll.py`, `utils/Cache.py`, the eight
+`mapreduce/gpu/GpuReduc*.py` and `GpuAssignZero.py`; `pykeops/pykeops/` `__init__.py`,
+`common/get_options.py`, `common/keops_io/{__init__,LoadKeOps,LoadKeOps_cpp,LoadKeOps_nvrtc}.py`;
+and `pykeops/setup.py`. Regenerate the list with `black --check .` on the branch and on a `main`
+worktree and diff the two.
 
 ## Architecture
 
@@ -354,25 +455,37 @@ single `lang` string threads that choice through:
 
 1. `pykeops/pykeops/jax/generic/generic_ops.py::_create_keops_backend` calls
    `keops_binder["cpp"](..., "jax", ...)`. Note that the JAX path goes through the `cpp` binder,
-   not the `nvrtc` one.
+   not the `nvrtc` one. `pykeops/common/utils.py::get_tools("jax")` returns
+   `pykeops/jax/utils.py::jaxtools`, and `common/get_options.py::_find_mem` recognises JAX arrays
+   and tracers (tracers are assumed to be on the GPU).
 2. `LoadKeOps_cpp` sees `params.lang == "jax"` and skips both phases of the pybind11 wrapper,
-   recording `kernel_so_path` instead.
+   recording `kernel_so_path` instead. `keopscore/utils/Cache.py` includes keyword arguments in
+   its key, which is how `lang` reaches that cache at all.
 3. `keopscore/get_keops_dll.py` forwards `lang` to the map-reduce class.
 4. Every `GpuReduc*` class in `keopscore/mapreduce/gpu/` is a factory. Its `__new__` asks
    `gpu_utils.use_cuda_backend(lang)` and returns either the `*_Cuda` variant, which mixes in
    `binders/cuda/Cuda_link_compile.py` and shells out to nvcc, or the `*_Nvrtc` variant, which
    mixes in `binders/nvrtc/Gpu_link_compile.py`.
-5. `LinkCompile.__init__` folds `lang` into the cache hash and appends a suffix in JAX mode, so the
-   two backends never load each other's cached artifacts.
+5. `LinkCompile.__init__` folds `lang` into the cache hash and appends a `_jax` suffix in JAX mode,
+   so the two backends never load each other's cached artifacts.
 
 The nvcc-built `.so` exports `extern "C" int launch_keops_kernel(...)`, emitted by the launcher
-template in `Cuda_link_compile.py`. `keops_jax.cpp` `dlopen`s it with
+template in `Cuda_link_compile.py` (two launchers: plain, and ranges for batched calls, the latter
+staging its tables through a thread-local pinned buffer). `keops_jax.cpp` `dlopen`s it with
 `RTLD_LAZY|RTLD_LOCAL|RTLD_DEEPBIND|RTLD_NODELETE`, falling back without the last two, and `dlsym`s
 that symbol.
 
-`Cuda_link_compile.py` resolves nvcc to an absolute path, trying `shutil.which` and then a list of
-common CUDA bin directories, because IDE run configurations often start Python without CUDA on
-PATH; the failure otherwise surfaces as "CMake compilation succeeded but .so file not found".
+`Cuda_link_compile.py` resolves nvcc to an absolute path (the four-step order under Environment),
+because IDE run configurations often start Python without CUDA on PATH; the failure otherwise
+surfaces as "CMake compilation succeeded but .so file not found".
+
+### The JAX front end (pykeops/pykeops/jax/)
+
+`generic/generic_red.py` holds `Genred`; `generic/generic_helpers.py` the `generic_*` shorthands;
+`operations.py` holds `KernelSolve`; `lazytensor/LazyTensor.py` the symbolic front end;
+`generic/generic_ops.py` everything that launches (backend creation, `custom_vjp`, the vmap guard,
+batch handling, `custom_partitioning`); `binders/keops_jax.cpp` and its `CMakeLists.txt` the FFI
+extension.
 
 ### JAX runtime path
 
@@ -397,11 +510,11 @@ trace-time validation calls fire the kernel.
 On the C++ side `g_kernel_registry` maps `(kernel_id, device_id)` to a
 `shared_ptr<KeOpsKernelInfo>` under a `shared_mutex`, fronted by a thread-local single-entry cache
 that is validated against an atomic `g_registry_version`. The handler ends with
-`cudaStreamSynchronize`.
+`cudaStreamSynchronize` (`keops_jax.cpp:600`; known bug 3 is about that line).
 
 Gradients use `jax.custom_vjp`. `make_keops_jax_op` precomputes a `Grad(formula, var, eta)` string
 per input variable up front; the backward pass compiles those on demand and stores them in
-`_grad_cache`, a bounded LRU keyed by formula content rather than `id()`.
+`_grad_cache`, a bounded LRU (512 entries) keyed by formula content rather than `id()`.
 
 Batched (3D) inputs reuse the KeOps ranges mechanism, `use_ranges=True`, not a separate kernel.
 
@@ -415,7 +528,8 @@ maps those ids to positional indices before the formula is compiled.
 
 ## Key interfaces
 
-All three take formulas over `Vi`, `Vj` and `Pm` variables. Verified against NumPy on 2026-09-03.
+All three take formulas over `Vi`, `Vj` and `Pm` variables. Verified against NumPy on `dior` on
+2026-09-09 (forward for the first two, solve residual for the third, and a finite `jax.grad`).
 
 LazyTensor, the symbolic front end:
 
@@ -463,11 +577,12 @@ and `generic_max` wrap Genred and are exported from `pykeops.jax`.
   `get_keops_dll.py`, and the `nvcc=... includes=...` pair the JAX backend resolved.
 - `KEOPS_CACHE_FOLDER`, compiled-artifact cache. Defaults to `~/.cache/keops2.3`.
 - `KEOPS_TEST_FLOAT64=1` together with `JAX_ENABLE_X64=1` for float64 test mode.
-  `run_tests.py --float64` sets both.
+  `run_tests.py --float64` sets both; `test_utils.is_float64_mode()` reads the first.
 - `CUDA_PATH`, `CUDA_ARCH`, `CXX`, `CXXFLAGS` feed keopscore's config detection. `CUDA_PATH` (or
   `CUDA_HOME`) is also the top-priority override for the JAX backend's nvcc *and* its headers, both
   taken from `$CUDA_PATH/{bin/nvcc,include}`; leave it unset to get the environment's own CUDA
   wheels, which is what keeps KeOps aligned with JAX.
+- `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` on `dior`; see Environment.
 
 `pykeops.jax` sets `PYKEOPS_JAX_MODE=1` on first use, but nothing reads it.
 
@@ -515,9 +630,10 @@ Three neighbouring shapes now raise instead of computing something wrong:
 
 Note on the older note in this file: only the LazyTensor front end raised
 `Incompatible batch dimensions` for the `(2,)` vs `(3,)` case, on either backend.
-`check_broadcasting` lives in `pykeops/common/lazy_tensor.py:424` and Genred never
-called it, and `do_checks` is 0 in `keopscore/include/Sizes.h`, so the torch
-Genred path silently accepted that pair too.
+`check_broadcasting` is defined in `pykeops/pykeops/common/utils.py:81` and called
+from `pykeops/pykeops/common/lazy_tensor.py:424`; Genred never called it, and
+`do_checks` is 0 in `keopscore/include/Sizes.h`, so the torch Genred path silently
+accepted that pair too.
 
 ### 1b. A parameter that varies along the batch (still open)
 
@@ -571,7 +687,8 @@ The idea was to make the handler's closing `cudaStreamSynchronize` optional behi
 `JAX_KEOPS_ASYNC=1`, replacing its one real job (fencing the ranges launcher's thread-local pinned
 staging buffer) with a per-device CUDA event. The gate on it was: measure how much host-side Python
 gsed could hide, and drop the idea if the answer is around 10%. That measurement has now been run
-and the answer is **0.95%**, so it is not being done.
+and the answer is **0.95%**, so it is not being done. The design, the test ladder and the probe
+that produced the numbers are in the untracked `PLAN_JAX_ASYNC_DISPATCH.md` at the root.
 
 Over 197 steps of `stage1_varifold.yaml` at one card's share of its 4-GPU batch: blocking step call
 518.01 ms, hideable Python 4.99 ms median (p95 5.69). gsed's step is 518 ms where the pairwise
